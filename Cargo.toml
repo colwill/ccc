@@ -1,0 +1,33 @@
+[package]
+name = "codecache"
+version = "0.1.0"
+edition = "2021"
+author = "github.com/colwill"
+description = "Generate a ContextCodeCache (.ccc) directory for your project"
+license = "MIT"
+
+[[bin]]
+name = "ccc"
+path = "src/main.rs"
+
+[lib]
+name = "codecache"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+anyhow = "1"
+chrono = "0.4"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tiktoken-rs = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2

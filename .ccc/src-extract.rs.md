@@ -1,0 +1,91 @@
+# extract.rs.md (20260701-13-08-47) UTC
+# source: src/extract.rs [rust]
+# const
+    - L301@MARKERS:&[&str]
+# funcs
+    - L39:8@extract:Option<Extracted> // parse `src` as `lang` and extract its symbols returns `None` if the source
+    - L90:4@visit
+    - L138:4@extract_func:Option<Func> // extract a function definition; returns `None` for anonymous functions we
+    - L152:4@func_name:Option<(String, Node<'a>)>
+    - L168:4@func_return:Option<String>
+    - L183:4@extract_consts
+    - L260:4@extract_call:Option<(String, usize)> // returns (callee simple name, call-site line) for a call node
+    - L268:4@simple_callee_name:Option<String> // reduce a call target expression to a bare function/method name
+    - L303:4@maybe_note
+    - L325:4@preceding_comment:Option<String> // nearest comment immediately preceding a function definition, used as its
+    - L359:4@text:&'a str
+    - L364:4@pos:(usize, usize) // 1-based (line, column) of a node's start
+    - L370:4@oneline:String // collapse all runs of whitespace to single spaces and trim
+    - L374:4@truncate:String
+    - L384:4@strip_comment:String // strip common comment delimiters from a raw comment token
+    - L407:8@rust_extraction
+    - L431:8@go_const_block_and_call
+    - L445:8@ts_arrow_is_a_func
+    - L458:8@note_marker_word_boundary
+# refs
+    - extract@L54 calls L90:4@visit
+    - visit@L96 calls L138:4@extract_func:Option<Func>
+    - visit@L108 calls L183:4@extract_consts
+    - visit@L111 calls L260:4@extract_call:Option<(String, usize)>
+    - visit@L124 calls L303:4@maybe_note
+    - visit@L129 calls L90:4@visit
+    - extract_func@L139 calls L152:4@func_name:Option<(String, Node<'a>)>
+    - extract_func@L140 calls L364:4@pos:(usize, usize)
+    - extract_func@L141 calls L168:4@func_return:Option<String>
+    - extract_func@L142 calls L325:4@preceding_comment:Option<String>
+    - func_name@L154 calls L370:4@oneline:String
+    - func_name@L154 calls L359:4@text:&'a str
+    - func_name@L161 calls L370:4@oneline:String
+    - func_name@L161 calls L359:4@text:&'a str
+    - func_return@L171 calls L370:4@oneline:String
+    - func_return@L171 calls L359:4@text:&'a str
+    - extract_consts@L189 calls L370:4@oneline:String
+    - extract_consts@L189 calls L359:4@text:&'a str
+    - extract_consts@L191 calls L364:4@pos:(usize, usize)
+    - extract_consts@L192 calls L370:4@oneline:String
+    - extract_consts@L192 calls L359:4@text:&'a str
+    - extract_consts@L202 calls L370:4@oneline:String
+    - extract_consts@L202 calls L359:4@text:&'a str
+    - extract_consts@L204 calls L364:4@pos:(usize, usize)
+    - extract_consts@L205 calls L370:4@oneline:String
+    - extract_consts@L205 calls L359:4@text:&'a str
+    - extract_consts@L229 calls L370:4@oneline:String
+    - extract_consts@L229 calls L359:4@text:&'a str
+    - extract_consts@L233 calls L364:4@pos:(usize, usize)
+    - extract_consts@L234 calls L370:4@oneline:String
+    - extract_consts@L234 calls L359:4@text:&'a str
+    - extract_consts@L244 calls L370:4@oneline:String
+    - extract_consts@L244 calls L359:4@text:&'a str
+    - extract_consts@L249 calls L364:4@pos:(usize, usize)
+    - extract_consts@L250 calls L370:4@oneline:String
+    - extract_consts@L250 calls L359:4@text:&'a str
+    - extract_call@L262 calls L268:4@simple_callee_name:Option<String>
+    - extract_call@L263 calls L364:4@pos:(usize, usize)
+    - simple_callee_name@L271 calls L370:4@oneline:String
+    - simple_callee_name@L271 calls L359:4@text:&'a str
+    - simple_callee_name@L276 calls L370:4@oneline:String
+    - simple_callee_name@L276 calls L359:4@text:&'a str
+    - simple_callee_name@L280 calls L370:4@oneline:String
+    - simple_callee_name@L280 calls L359:4@text:&'a str
+    - simple_callee_name@L284 calls L370:4@oneline:String
+    - simple_callee_name@L284 calls L359:4@text:&'a str
+    - simple_callee_name@L288 calls L370:4@oneline:String
+    - simple_callee_name@L288 calls L359:4@text:&'a str
+    - simple_callee_name@L292 calls L370:4@oneline:String
+    - simple_callee_name@L292 calls L359:4@text:&'a str
+    - simple_callee_name@L296 calls L268:4@simple_callee_name:Option<String>
+    - maybe_note@L304 calls L359:4@text:&'a str
+    - maybe_note@L305 calls L384:4@strip_comment:String
+    - maybe_note@L313 calls L370:4@oneline:String
+    - maybe_note@L318 calls L364:4@pos:(usize, usize)
+    - maybe_note@L319 calls L374:4@truncate:String
+    - preceding_comment@L346 calls L384:4@strip_comment:String
+    - preceding_comment@L346 calls L359:4@text:&'a str
+    - preceding_comment@L349 calls L370:4@oneline:String
+    - preceding_comment@L353 calls L374:4@truncate:String
+    - rust_extraction@L413 calls L39:8@extract:Option<Extracted>
+    - go_const_block_and_call@L436 calls L39:8@extract:Option<Extracted>
+    - ts_arrow_is_a_func@L448 calls L39:8@extract:Option<Extracted>
+    - note_marker_word_boundary@L464 calls L39:8@extract:Option<Extracted>
+# note
+    - @L459 "notes" must not trigger, but a real TODO must
