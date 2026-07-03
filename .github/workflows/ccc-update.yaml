@@ -1,7 +1,7 @@
 name: Update ContextCodeCache
 
 # keeps the committed `.ccc/` in sync with the source 
-# and opens a pull request authored by CCC-bot if changed
+# and opens a pull request authored by ContextCodeCache-Bot if changed
 
 on:
   push:
@@ -28,7 +28,7 @@ on:
     - cron: '0 6 * * 1'     # Mondays 06:00 UTC — safety net in case a push slips through
 
 permissions:
-  contents: write           # push the CCC-bot branch
+  contents: write           # push the ContextCodeCache-Bot branch
   pull-requests: write      # open / update the PR
 
 concurrency:
@@ -92,16 +92,16 @@ jobs:
             ./target/release/ccc scan --tokens "$root"
           done
 
-      - name: Open pull request from CCC-bot
+      - name: Open pull request from ContextCodeCache-Bot
         if: steps.check.outputs.stale == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          # For the PR to be *opened by* a real "CCC-bot" account
+          # For the PR to be *opened by* a real "ContextCodeCache-Bot" account
           # token: ${{ secrets.CCC_BOT_TOKEN }}
-          branch: ccc-bot/update-cache
+          branch: ContextCodeCache-Bot/update-cache
           delete-branch: true
-          author: 'CCC-bot <ccc-bot@users.noreply.github.com>'
-          committer: 'CCC-bot <ccc-bot@users.noreply.github.com>'
+          author: 'ContextCodeCache-Bot <ContextCodeCache-Bot@users.noreply.github.com>'
+          committer: 'ContextCodeCache-Bot <ContextCodeCache-Bot@users.noreply.github.com>'
           commit-message: 'chore(ccc): regenerate ContextCodeCache'
           title: 'chore(ccc): refresh ContextCodeCache'
           body: |
