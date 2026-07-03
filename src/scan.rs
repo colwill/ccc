@@ -5,7 +5,7 @@ use crate::model::{Counts, FileCache};
 use crate::{extract, naming, render};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -111,12 +111,28 @@ pub fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
 
 /// parse every discovered file into a `FileCache`, sorted by path
 pub fn build_caches(root: &Path, files: &[PathBuf]) -> Vec<FileCache> {
-    let mut caches: Vec<FileCache> = files
-        .iter()
-        .filter_map(|p| build_one(root, p))
-        .collect();
+    let mut caches: Vec<FileCache> = files.iter().filter_map(|p| build_one(root, p)).collect();
     caches.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    disambiguate_cache_names(&mut caches);
     caches
+}
+
+/// fixes bug where cache_name wasnt unique oops
+fn disambiguate_cache_names(caches: &mut [FileCache]) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for c in caches.iter() {
+        *counts.entry(c.cache_name.as_str()).or_default() += 1;
+    }
+    let collisions: BTreeSet<String> = counts
+        .into_iter()
+        .filter(|&(_, n)| n > 1)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    for c in caches.iter_mut() {
+        if collisions.contains(&c.cache_name) {
+            c.cache_name = naming::cache_name_disambiguated(&c.rel_path);
+        }
+    }
 }
 
 fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
@@ -153,8 +169,7 @@ pub fn scan(root: &Path) -> Result<ScanReport> {
     let rendered = render_all(root, &caches, &ts);
 
     let ccc = root.join(".ccc");
-    fs::create_dir_all(&ccc)
-        .with_context(|| format!("creating {}", ccc.display()))?;
+    fs::create_dir_all(&ccc).with_context(|| format!("creating {}", ccc.display()))?;
     clear_generated(&ccc)?;
     crate::tokenize::clear(&ccc)?;
     for (name, content) in &rendered {

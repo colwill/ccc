@@ -10,6 +10,9 @@ Please ⭐ if you find this useful 💚
 
 ## Install / build
 
+Requires **Rust ≥ 1.77** (the tree-sitter 0.25 stack; some transitive deps use
+edition 2024) also needs a recent cargo.
+
 ```sh
 cargo build --release          # binary @ target/release/ccc
 ./target/release/ccc install   # copy it onto your PATH (Linux)
@@ -73,10 +76,18 @@ Each per-file entry follows this format:
     - @L13 NOTE: uses the truncated PI above, so results are approximate.
 ```
 
-- **const** - module-level constants/statics: `L<line>@<name>:<type>`
+- **const** - file-level constants/statics: `L<line>@<name>:<type>`. Since not
+  every language marks constants, this uses each language's convention: Rust
+  `const`/`static` and Go `const`/`var` specs; Python only `SHOUTING_SNEK_CASE`
+  module bindings; JS/TS only `const` declarations (not `let`/`var`). Class/`impl`
+  attributes in Python and JS/TS are treated as members, not file consts.
 - **funcs** - definitions: `L<line>:<col>@<name>:<return_type> // doc summary`
-- **refs** - calls resolved to a function defined in the same file:
-  `<caller>@L<line> calls L<line>:<col>@<func>:<return_type>`
+- **refs** - intra-file call graph, resolved by scope (not just by name):
+  `<caller>@L<line> calls L<line>:<col>@<func>:<return_type>`. A bare `foo()`
+  binds to a same-file free function `foo`; a receiver call (`self.foo()`,
+  `this.foo()`, or a Go `recv.Foo()`) binds to a method `foo` on the enclosing
+  type. Calls on any other receiver (`other.foo()`) need type information to
+  resolve, so no edge is emitted rather than guessing one from the name.
 - **note** - marker comments (TODO, FIXME, XXX, HACK, BUG, NOTE, SAFETY)
 
 A worked example lives in [example/](example/) with its generated
@@ -84,7 +95,7 @@ A worked example lives in [example/](example/) with its generated
 
 ## Token stream (pre-encoded cache)
 
-> **Not compatible with Anthropic models.** These are **approximate** [tiktoken](https://github.com/openai/tiktoken)
+> **Token stream is not compatible with Anthropic models.** These are **approximate** [tiktoken](https://github.com/openai/tiktoken)
 > IDs (an OpenAI vocabulary). Which can be used with DeepSeek V4-Pro etc.
 > Use it for a downstream model that shares the OpenAI vocab, or for rough size estimates. 
 > If using Claude, use the `.ccc` markdown as context. 

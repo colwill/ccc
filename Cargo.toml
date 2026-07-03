@@ -2,6 +2,7 @@
 name = "codecache"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.77"
 author = "github.com/colwill"
 description = "Generate a ContextCodeCache (.ccc) directory for your project"
 license = "MIT"

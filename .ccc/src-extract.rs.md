@@ -1,91 +1,130 @@
-# extract.rs.md (20260701-13-08-47) UTC
+# extract.rs.md (20260703-15-47-40) UTC
 # source: src/extract.rs [rust]
 # const
-    - L301@MARKERS:&[&str]
+    - L475@MARKERS:&[&str]
 # funcs
-    - L39:8@extract:Option<Extracted> // parse `src` as `lang` and extract its symbols returns `None` if the source
-    - L90:4@visit
-    - L138:4@extract_func:Option<Func> // extract a function definition; returns `None` for anonymous functions we
-    - L152:4@func_name:Option<(String, Node<'a>)>
-    - L168:4@func_return:Option<String>
-    - L183:4@extract_consts
-    - L260:4@extract_call:Option<(String, usize)> // returns (callee simple name, call-site line) for a call node
-    - L268:4@simple_callee_name:Option<String> // reduce a call target expression to a bare function/method name
-    - L303:4@maybe_note
-    - L325:4@preceding_comment:Option<String> // nearest comment immediately preceding a function definition, used as its
-    - L359:4@text:&'a str
-    - L364:4@pos:(usize, usize) // 1-based (line, column) of a node's start
-    - L370:4@oneline:String // collapse all runs of whitespace to single spaces and trim
-    - L374:4@truncate:String
-    - L384:4@strip_comment:String // strip common comment delimiters from a raw comment token
-    - L407:8@rust_extraction
-    - L431:8@go_const_block_and_call
-    - L445:8@ts_arrow_is_a_func
-    - L458:8@note_marker_word_boundary
+    - L52:8@caller:String // nearest enclosing function name for caller attribution
+    - L65:8@current_type:Option<(String, Option<String>)> // nearest enclosing type scope (its name and receiver token) used to
+    - L72:8@in_function:bool
+    - L76:8@in_type:bool
+    - L85:8@extract:Option<Extracted> // parse `src` as `lang` and extract its symbols returns `None` if the source
+    - L144:4@visit
+    - L200:4@type_scope:Option<(String, Option<String>)>
+    - L220:4@func_owner:Option<(String, Option<String>)> // if it is a method the enclosing type scope or for go... the method's own receiver
+    - L230:4@go_receiver:Option<(String, Option<String>)>
+    - L248:4@const_eligible:bool
+    - L262:4@extract_func:Option<Func> // extract a function definition; returns `None` for anonymous functions we
+    - L276:4@func_name:Option<(String, Node<'a>)>
+    - L292:4@func_return:Option<String>
+    - L307:4@extract_consts
+    - L393:4@is_shouting_snek:bool
+    - L399:4@has_const_keyword:bool
+    - L405:4@classify_call:Option<RawCall>
+    - L416:4@resolve_callee:Option<CallKind> // reduce a call target expression to a [`CallKind`]
+    - L465:4@self_method:Option<CallKind>
+    - L477:4@maybe_note
+    - L499:4@preceding_comment:Option<String> // nearest comment immediately preceding a function definition, used as its
+    - L543:4@text:&'a str
+    - L548:4@pos:(usize, usize) // 1-based (line, column) of a node's start
+    - L554:4@oneline:String // collapse all runs of whitespace to single spaces and trim
+    - L558:4@truncate:String
+    - L568:4@strip_comment:String // strip common comment delimiters from a raw comment token
+    - L591:8@rust_extraction
+    - L615:8@go_const_block_and_call
+    - L629:8@ts_arrow_is_a_func
+    - L640:8@note_marker_word_boundary
+    - L652:8@qualified_call_does_not_bind_to_local_name
+    - L672:8@self_method_calls_resolve_by_type
+    - L688:8@python_only_shouting_snek_is_const
+    - L700:8@js_let_is_not_a_const
 # refs
-    - extract@L54 calls L90:4@visit
-    - visit@L96 calls L138:4@extract_func:Option<Func>
-    - visit@L108 calls L183:4@extract_consts
-    - visit@L111 calls L260:4@extract_call:Option<(String, usize)>
-    - visit@L124 calls L303:4@maybe_note
-    - visit@L129 calls L90:4@visit
-    - extract_func@L139 calls L152:4@func_name:Option<(String, Node<'a>)>
-    - extract_func@L140 calls L364:4@pos:(usize, usize)
-    - extract_func@L141 calls L168:4@func_return:Option<String>
-    - extract_func@L142 calls L325:4@preceding_comment:Option<String>
-    - func_name@L154 calls L370:4@oneline:String
-    - func_name@L154 calls L359:4@text:&'a str
-    - func_name@L161 calls L370:4@oneline:String
-    - func_name@L161 calls L359:4@text:&'a str
-    - func_return@L171 calls L370:4@oneline:String
-    - func_return@L171 calls L359:4@text:&'a str
-    - extract_consts@L189 calls L370:4@oneline:String
-    - extract_consts@L189 calls L359:4@text:&'a str
-    - extract_consts@L191 calls L364:4@pos:(usize, usize)
-    - extract_consts@L192 calls L370:4@oneline:String
-    - extract_consts@L192 calls L359:4@text:&'a str
-    - extract_consts@L202 calls L370:4@oneline:String
-    - extract_consts@L202 calls L359:4@text:&'a str
-    - extract_consts@L204 calls L364:4@pos:(usize, usize)
-    - extract_consts@L205 calls L370:4@oneline:String
-    - extract_consts@L205 calls L359:4@text:&'a str
-    - extract_consts@L229 calls L370:4@oneline:String
-    - extract_consts@L229 calls L359:4@text:&'a str
-    - extract_consts@L233 calls L364:4@pos:(usize, usize)
-    - extract_consts@L234 calls L370:4@oneline:String
-    - extract_consts@L234 calls L359:4@text:&'a str
-    - extract_consts@L244 calls L370:4@oneline:String
-    - extract_consts@L244 calls L359:4@text:&'a str
-    - extract_consts@L249 calls L364:4@pos:(usize, usize)
-    - extract_consts@L250 calls L370:4@oneline:String
-    - extract_consts@L250 calls L359:4@text:&'a str
-    - extract_call@L262 calls L268:4@simple_callee_name:Option<String>
-    - extract_call@L263 calls L364:4@pos:(usize, usize)
-    - simple_callee_name@L271 calls L370:4@oneline:String
-    - simple_callee_name@L271 calls L359:4@text:&'a str
-    - simple_callee_name@L276 calls L370:4@oneline:String
-    - simple_callee_name@L276 calls L359:4@text:&'a str
-    - simple_callee_name@L280 calls L370:4@oneline:String
-    - simple_callee_name@L280 calls L359:4@text:&'a str
-    - simple_callee_name@L284 calls L370:4@oneline:String
-    - simple_callee_name@L284 calls L359:4@text:&'a str
-    - simple_callee_name@L288 calls L370:4@oneline:String
-    - simple_callee_name@L288 calls L359:4@text:&'a str
-    - simple_callee_name@L292 calls L370:4@oneline:String
-    - simple_callee_name@L292 calls L359:4@text:&'a str
-    - simple_callee_name@L296 calls L268:4@simple_callee_name:Option<String>
-    - maybe_note@L304 calls L359:4@text:&'a str
-    - maybe_note@L305 calls L384:4@strip_comment:String
-    - maybe_note@L313 calls L370:4@oneline:String
-    - maybe_note@L318 calls L364:4@pos:(usize, usize)
-    - maybe_note@L319 calls L374:4@truncate:String
-    - preceding_comment@L346 calls L384:4@strip_comment:String
-    - preceding_comment@L346 calls L359:4@text:&'a str
-    - preceding_comment@L349 calls L370:4@oneline:String
-    - preceding_comment@L353 calls L374:4@truncate:String
-    - rust_extraction@L413 calls L39:8@extract:Option<Extracted>
-    - go_const_block_and_call@L436 calls L39:8@extract:Option<Extracted>
-    - ts_arrow_is_a_func@L448 calls L39:8@extract:Option<Extracted>
-    - note_marker_word_boundary@L464 calls L39:8@extract:Option<Extracted>
+    - extract@L101 calls L144:4@visit
+    - visit@L149 calls L200:4@type_scope:Option<(String, Option<String>)>
+    - visit@L153 calls L262:4@extract_func:Option<Func>
+    - visit@L154 calls L220:4@func_owner:Option<(String, Option<String>)>
+    - visit@L180 calls L248:4@const_eligible:bool
+    - visit@L181 calls L307:4@extract_consts
+    - visit@L184 calls L405:4@classify_call:Option<RawCall>
+    - visit@L188 calls L477:4@maybe_note
+    - visit@L193 calls L144:4@visit
+    - type_scope@L203 calls L554:4@oneline:String
+    - type_scope@L203 calls L543:4@text:&'a str
+    - func_owner@L222 calls L230:4@go_receiver:Option<(String, Option<String>)>
+    - go_receiver@L238 calls L554:4@oneline:String
+    - go_receiver@L238 calls L543:4@text:&'a str
+    - go_receiver@L242 calls L554:4@oneline:String
+    - go_receiver@L242 calls L543:4@text:&'a str
+    - extract_func@L263 calls L276:4@func_name:Option<(String, Node<'a>)>
+    - extract_func@L264 calls L548:4@pos:(usize, usize)
+    - extract_func@L265 calls L292:4@func_return:Option<String>
+    - extract_func@L266 calls L499:4@preceding_comment:Option<String>
+    - func_name@L278 calls L554:4@oneline:String
+    - func_name@L278 calls L543:4@text:&'a str
+    - func_name@L285 calls L554:4@oneline:String
+    - func_name@L285 calls L543:4@text:&'a str
+    - func_return@L295 calls L554:4@oneline:String
+    - func_return@L295 calls L543:4@text:&'a str
+    - extract_consts@L313 calls L554:4@oneline:String
+    - extract_consts@L313 calls L543:4@text:&'a str
+    - extract_consts@L315 calls L548:4@pos:(usize, usize)
+    - extract_consts@L316 calls L554:4@oneline:String
+    - extract_consts@L316 calls L543:4@text:&'a str
+    - extract_consts@L324 calls L554:4@oneline:String
+    - extract_consts@L324 calls L543:4@text:&'a str
+    - extract_consts@L326 calls L393:4@is_shouting_snek:bool
+    - extract_consts@L331 calls L554:4@oneline:String
+    - extract_consts@L331 calls L543:4@text:&'a str
+    - extract_consts@L333 calls L548:4@pos:(usize, usize)
+    - extract_consts@L341 calls L399:4@has_const_keyword:bool
+    - extract_consts@L360 calls L554:4@oneline:String
+    - extract_consts@L360 calls L543:4@text:&'a str
+    - extract_consts@L366 calls L548:4@pos:(usize, usize)
+    - extract_consts@L367 calls L554:4@oneline:String
+    - extract_consts@L367 calls L543:4@text:&'a str
+    - extract_consts@L377 calls L554:4@oneline:String
+    - extract_consts@L377 calls L543:4@text:&'a str
+    - extract_consts@L382 calls L548:4@pos:(usize, usize)
+    - extract_consts@L383 calls L554:4@oneline:String
+    - extract_consts@L383 calls L543:4@text:&'a str
+    - classify_call@L407 calls L416:4@resolve_callee:Option<CallKind>
+    - classify_call@L410 calls L548:4@pos:(usize, usize)
+    - resolve_callee@L419 calls L554:4@oneline:String
+    - resolve_callee@L419 calls L543:4@text:&'a str
+    - resolve_callee@L423 calls L554:4@oneline:String
+    - resolve_callee@L423 calls L543:4@text:&'a str
+    - resolve_callee@L424 calls L465:4@self_method:Option<CallKind>
+    - resolve_callee@L428 calls L554:4@oneline:String
+    - resolve_callee@L428 calls L543:4@text:&'a str
+    - resolve_callee@L431 calls L554:4@oneline:String
+    - resolve_callee@L431 calls L543:4@text:&'a str
+    - resolve_callee@L442 calls L554:4@oneline:String
+    - resolve_callee@L442 calls L543:4@text:&'a str
+    - resolve_callee@L443 calls L465:4@self_method:Option<CallKind>
+    - resolve_callee@L448 calls L554:4@oneline:String
+    - resolve_callee@L448 calls L543:4@text:&'a str
+    - resolve_callee@L449 calls L465:4@self_method:Option<CallKind>
+    - resolve_callee@L454 calls L554:4@oneline:String
+    - resolve_callee@L454 calls L543:4@text:&'a str
+    - resolve_callee@L455 calls L465:4@self_method:Option<CallKind>
+    - resolve_callee@L460 calls L416:4@resolve_callee:Option<CallKind>
+    - self_method@L468 calls L554:4@oneline:String
+    - self_method@L468 calls L543:4@text:&'a str
+    - maybe_note@L478 calls L543:4@text:&'a str
+    - maybe_note@L479 calls L568:4@strip_comment:String
+    - maybe_note@L487 calls L554:4@oneline:String
+    - maybe_note@L492 calls L548:4@pos:(usize, usize)
+    - maybe_note@L493 calls L558:4@truncate:String
+    - preceding_comment@L530 calls L568:4@strip_comment:String
+    - preceding_comment@L530 calls L543:4@text:&'a str
+    - preceding_comment@L533 calls L554:4@oneline:String
+    - preceding_comment@L537 calls L558:4@truncate:String
+    - rust_extraction@L597 calls L85:8@extract:Option<Extracted>
+    - go_const_block_and_call@L620 calls L85:8@extract:Option<Extracted>
+    - ts_arrow_is_a_func@L632 calls L85:8@extract:Option<Extracted>
+    - note_marker_word_boundary@L646 calls L85:8@extract:Option<Extracted>
+    - qualified_call_does_not_bind_to_local_name@L660 calls L85:8@extract:Option<Extracted>
+    - self_method_calls_resolve_by_type@L681 calls L85:8@extract:Option<Extracted>
+    - python_only_shouting_snek_is_const@L691 calls L85:8@extract:Option<Extracted>
+    - js_let_is_not_a_const@L704 calls L85:8@extract:Option<Extracted>
 # note
-    - @L459 "notes" must not trigger, but a real TODO must
+    - @L641 "notes" must not trigger, but a real TODO must

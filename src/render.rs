@@ -66,7 +66,7 @@ pub fn render_file(fc: &FileCache, ts: &str) -> String {
     out
 }
 
-/// render the `CCC.md` index for the whole project
+/// render the CCC index for the whole project
 pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     let mut out = String::new();
     let root_label = root
@@ -79,39 +79,41 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
         totals.add(c.counts());
     }
 
-    // agent guide kept at the very top so any reader sees it first
-    let _ = writeln!(out, "# ContextCodeCache - agent guide");
-    let _ = writeln!(out, "#");
-    let _ = writeln!(out, "# what:  a GENERATED map of this project's source. Each source file has a");
-    let _ = writeln!(out, "#        `<module>-<file>.<ext>.md` entry listing its constants, functions");
-    let _ = writeln!(out, "#        (L<line>:<col>@name:return), intra-file call graph (refs), and");
-    let _ = writeln!(out, "#        marker notes (TODO/FIXME/...). See the `# files` list below.");
-    let _ = writeln!(out, "# why:   lets agents orient in the codebase cheaply - skim `.ccc` first to");
-    let _ = writeln!(out, "#        find where things live, then open the real source for detail.");
-    let _ = writeln!(out, "#        `tokens.bin`/`tokens.json`, if present, hold this content pre-encoded");
-    let _ = writeln!(out, "#        as APPROXIMATE tiktoken (o200k) ids - for a downstream model that");
-    let _ = writeln!(out, "#        shares that vocabulary, NOT for Claude (different tokenizer; its API");
-    let _ = writeln!(out, "#        takes text, not token ids). Feed Claude the markdown above as text.");
-    let _ = writeln!(out, "# keep-fresh: whenever you change tracked source, regenerate with");
-    let _ = writeln!(out, "#        `ccc scan` (add `--tokens` to refresh the token stream). CI runs");
-    let _ = writeln!(out, "#        `ccc check`, which fails when `.ccc` is out of date.");
-    let _ = writeln!(out, "# do-not-edit: never hand-edit files under `.ccc` - they are overwritten on");
-    let _ = writeln!(out, "#        the next scan. To change the cache, change the source, then rescan.");
-    let _ = writeln!(out, "#");
+    // agent guide kept at the very top in metadata
+    let _ = writeln!(out, "---");
+    let _ = writeln!(out, "ContextCodeCache - agent guide");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "what:  a GENERATED map of this project's source. Each source file has a");
+    let _ = writeln!(out, "        `<module>-<file>.<ext>.md` entry listing its constants, functions");
+    let _ = writeln!(out, "        (L<line>:<col>@name:return), intra-file call graph (refs), and");
+    let _ = writeln!(out, "        marker notes (TODO/FIXME/...). See the `# files` list below.");
+    let _ = writeln!(out, "why:   lets agents orient in the codebase cheaply - skim `.ccc` first to");
+    let _ = writeln!(out, "        find where things live, then open the real source for detail.");
+    let _ = writeln!(out, "        `tokens.bin`/`tokens.json`, if present, hold this content pre-encoded");
+    let _ = writeln!(out, "        as APPROXIMATE tiktoken (o200k) ids - for a downstream model that");
+    let _ = writeln!(out, "        shares that vocabulary, NOT for Claude (different tokenizer; its API");
+    let _ = writeln!(out, "        takes text, not token ids). Feed Claude the markdown above as text.");
+    let _ = writeln!(out, "keep-fresh: whenever you change tracked source, regenerate with");
+    let _ = writeln!(out, "        `ccc scan` (add `--tokens` to refresh the token stream). CI runs");
+    let _ = writeln!(out, "        `ccc check`, which fails when `.ccc` is out of date.");
+    let _ = writeln!(out, "do-not-edit: never hand-edit files under `.ccc` - they are overwritten on");
+    let _ = writeln!(out, "        the next scan. To change the cache, change the source, then rescan.");
+    let _ = writeln!(out, "---");
+    let _ = writeln!(out);
 
     let _ = writeln!(out, "# ContextCodeCache ({}) UTC", ts);
-    let _ = writeln!(out, "# project: {}", root_label);
+    let _ = writeln!(out, "### project: {}", root_label);
     let _ = writeln!(
         out,
-        "# totals: {} files, {} funcs, {} consts, {} refs, {} notes",
+        "### totals: {} files, {} funcs, {} consts, {} refs, {} notes",
         caches.len(),
         totals.funcs,
         totals.consts,
         totals.refs,
         totals.notes
     );
-    let _ = writeln!(out, "# regenerate: `ccc scan`");
-    let _ = writeln!(out, "# files");
+    let _ = writeln!(out, "### regenerate: `ccc scan`");
+    let _ = writeln!(out, "### files");
     for c in caches {
         let n = c.counts();
         let _ = writeln!(
