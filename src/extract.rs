@@ -5,7 +5,6 @@ use crate::model::{Const, Func, Note, Ref};
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
 
-/// result of walking one file's syntax tree
 pub struct Extracted {
     pub consts: Vec<Const>,
     pub funcs: Vec<Func>,
@@ -13,12 +12,21 @@ pub struct Extracted {
     pub notes: Vec<Note>,
 }
 
-/// call site discovered during the walk resolved against same-file
-/// functions after the walk completes
+enum CallKind {
+    Free(String),
+    Method { ty: String, name: String },
+}
+
 struct RawCall {
     caller: String,
     call_line: usize,
-    callee: String,
+    kind: CallKind,
+}
+
+enum Scope {
+    Func(String),
+    /// `recv` used to recognise self-calls
+    Type { name: String, recv: Option<String> },
 }
 
 struct Ctx<'a> {
@@ -28,10 +36,42 @@ struct Ctx<'a> {
     funcs: Vec<Func>,
     notes: Vec<Note>,
     calls: Vec<RawCall>,
-    /// name -> (line, col, return type) for resolving refs.
-    func_index: HashMap<String, (usize, usize, Option<String>)>,
-    /// stack of enclosing function names for caller attribution.
-    caller_stack: Vec<String>,
+    free_index: HashMap<String, (usize, usize, Option<String>)>,
+    method_index: HashMap<(String, String), (usize, usize, Option<String>)>,
+    scope_stack: Vec<Scope>,
+}
+
+impl Ctx<'_> {
+    /// nearest enclosing function name for caller attribution
+    fn caller(&self) -> String {
+        self.scope_stack
+            .iter()
+            .rev()
+            .find_map(|s| match s {
+                Scope::Func(n) => Some(n.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "<top>".to_string())
+    }
+
+    /// nearest enclosing type scope (its name and receiver token) used to
+    /// resolve self-calls to a method of that type
+    fn current_type(&self) -> Option<(String, Option<String>)> {
+        self.scope_stack.iter().rev().find_map(|s| match s {
+            Scope::Type { name, recv } => Some((name.clone(), recv.clone())),
+            _ => None,
+        })
+    }
+
+    fn in_function(&self) -> bool {
+        self.scope_stack.iter().any(|s| matches!(s, Scope::Func(_)))
+    }
+
+    fn in_type(&self) -> bool {
+        self.scope_stack
+            .iter()
+            .any(|s| matches!(s, Scope::Type { .. }))
+    }
 }
 
 /// parse `src` as `lang` and extract its symbols returns `None` if the source
@@ -48,21 +88,29 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         funcs: Vec::new(),
         notes: Vec::new(),
         calls: Vec::new(),
-        func_index: HashMap::new(),
-        caller_stack: Vec::new(),
+        free_index: HashMap::new(),
+        method_index: HashMap::new(),
+        scope_stack: Vec::new(),
     };
     visit(tree.root_node(), &mut ctx);
 
-    // resolve calls to same-file function definitions
+    // resolve calls to same-file definitions
     let mut refs = Vec::new();
     for c in &ctx.calls {
-        if let Some((line, col, ret)) = ctx.func_index.get(&c.callee) {
+        let resolved = match &c.kind {
+            CallKind::Free(name) => ctx.free_index.get(name).map(|v| (name.clone(), v)),
+            CallKind::Method { ty, name } => ctx
+                .method_index
+                .get(&(ty.clone(), name.clone()))
+                .map(|v| (name.clone(), v)),
+        };
+        if let Some((target_name, (line, col, ret))) = resolved {
             refs.push(Ref {
                 caller: c.caller.clone(),
                 call_line: c.call_line,
                 target_line: *line,
                 target_col: *col,
-                target_name: c.callee.clone(),
+                target_name,
                 target_ret: ret.clone(),
             });
         }
@@ -90,35 +138,45 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
 fn visit(node: Node, ctx: &mut Ctx) {
     let kind = node.kind();
     let lang = ctx.lang;
-    let mut pushed = false;
+    let mut pushed = 0usize;
 
-    if lang.func_kinds().contains(&kind) {
+    if let Some((name, recv)) = type_scope(node, ctx) {
+        ctx.scope_stack.push(Scope::Type { name, recv });
+        pushed += 1;
+    } else if lang.func_kinds().contains(&kind) {
         if let Some(func) = extract_func(node, ctx) {
+            let owner = func_owner(node, ctx);
+            let entry = (func.line, func.col, func.ret.clone());
+            match &owner {
+                Some((ty, _)) => {
+                    ctx.method_index
+                        .entry((ty.clone(), func.name.clone()))
+                        .or_insert(entry);
+                }
+                None => {
+                    ctx.free_index.entry(func.name.clone()).or_insert(entry);
+                }
+            }
             let name = func.name.clone();
-            ctx.func_index
-                .entry(name.clone())
-                .or_insert((func.line, func.col, func.ret.clone()));
             ctx.funcs.push(func);
-            ctx.caller_stack.push(name);
-            pushed = true;
+            // go has to be special, methods carry their receiver on the definition rather than
+            // nesting inside a type node ugh...
+            if lang == Language::Go && kind == "method_declaration" {
+                if let Some((ty, recv)) = owner {
+                    ctx.scope_stack.push(Scope::Type { name: ty, recv });
+                    pushed += 1;
+                }
+            }
+            ctx.scope_stack.push(Scope::Func(name));
+            pushed += 1;
         }
     } else if lang.const_kinds().contains(&kind) {
-        // only treat as a module-level constant when not inside a function body
-        if ctx.caller_stack.is_empty() {
+        if const_eligible(ctx) {
             extract_consts(node, ctx);
         }
     } else if lang.call_kinds().contains(&kind) {
-        if let Some((callee, line)) = extract_call(node, ctx) {
-            let caller = ctx
-                .caller_stack
-                .last()
-                .cloned()
-                .unwrap_or_else(|| "<top>".to_string());
-            ctx.calls.push(RawCall {
-                caller,
-                call_line: line,
-                callee,
-            });
+        if let Some(call) = classify_call(node, ctx) {
+            ctx.calls.push(call);
         }
     } else if lang.comment_kinds().contains(&kind) {
         maybe_note(node, ctx);
@@ -128,8 +186,68 @@ fn visit(node: Node, ctx: &mut Ctx) {
     for child in node.children(&mut cursor) {
         visit(child, ctx);
     }
-    if pushed {
-        ctx.caller_stack.pop();
+    for _ in 0..pushed {
+        ctx.scope_stack.pop();
+    }
+}
+
+fn type_scope(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
+    let name_of = |field: &str| {
+        node.child_by_field_name(field)
+            .map(|n| oneline(text(n, ctx.src)))
+    };
+    match (ctx.lang, node.kind()) {
+        (Language::Rust, "impl_item") => Some((name_of("type")?, Some("self".to_string()))),
+        (Language::Rust, "trait_item") => Some((name_of("name")?, Some("self".to_string()))),
+        (Language::Python, "class_definition") => {
+            Some((name_of("name")?, Some("self".to_string())))
+        }
+        (
+            Language::JavaScript | Language::TypeScript | Language::Tsx,
+            "class_declaration" | "class" | "abstract_class_declaration",
+        ) => Some((name_of("name")?, Some("this".to_string()))),
+        _ => None,
+    }
+}
+
+/// if it is a method the enclosing type scope or for go... the method's own receiver
+fn func_owner(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
+    if ctx.lang == Language::Go && node.kind() == "method_declaration" {
+        return go_receiver(node, ctx.src);
+    }
+    match ctx.scope_stack.last() {
+        Some(Scope::Type { name, recv }) => Some((name.clone(), recv.clone())),
+        _ => None,
+    }
+}
+
+fn go_receiver(node: Node, src: &str) -> Option<(String, Option<String>)> {
+    let recv = node.child_by_field_name("receiver")?;
+    let mut cursor = recv.walk();
+    for child in recv.children(&mut cursor) {
+        if child.kind() != "parameter_declaration" {
+            continue;
+        }
+        let ty_node = child.child_by_field_name("type")?;
+        let ty = oneline(text(ty_node, src));
+        let ty = ty.trim_start_matches(['*', '&']).trim().to_string();
+        let var = child
+            .child_by_field_name("name")
+            .map(|n| oneline(text(n, src)));
+        return Some((ty, var));
+    }
+    None
+}
+
+fn const_eligible(ctx: &Ctx) -> bool {
+    if ctx.in_function() {
+        return false;
+    }
+    match ctx.lang {
+        Language::Python | Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            !ctx.in_type()
+        }
+        Language::Rust | Language::Go => true,
     }
 }
 
@@ -197,25 +315,32 @@ fn extract_consts(node: Node, ctx: &mut Ctx) {
         Language::Python => {
             if let Some(left) = node.child_by_field_name("left") {
                 if left.kind() == "identifier" {
+                    let name = oneline(text(left, ctx.src));
+                    // Python has no real const; use the SHOUTY_SNEK_CASE
+                    if !is_shouting_snek(&name) {
+                        return;
+                    }
                     let ty = node
                         .child_by_field_name("type")
                         .map(|n| oneline(text(n, ctx.src)));
                     ctx.consts.push(Const {
                         line: pos(left).0,
-                        name: oneline(text(left, ctx.src)),
+                        name,
                         ty,
                     });
                 }
             }
         }
         Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            if node.kind() != "lexical_declaration" || !has_const_keyword(node) {
+                return;
+            }
             let mut cursor = node.walk();
             for decl in node.children(&mut cursor) {
                 if decl.kind() != "variable_declarator" {
                     continue;
                 }
                 // function-valued declarators are captured as functions instead
-                // this should be okay I guess until I find a better way to capture these
                 if let Some(v) = decl.child_by_field_name("value") {
                     if matches!(v.kind(), "arrow_function" | "function_expression") {
                         continue;
@@ -227,7 +352,9 @@ fn extract_consts(node: Node, ctx: &mut Ctx) {
                     }
                     let ty = decl.child_by_field_name("type").map(|n| {
                         let t = oneline(text(n, ctx.src));
-                        t.strip_prefix(':').map(|s| s.trim().to_string()).unwrap_or(t)
+                        t.strip_prefix(':')
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or(t)
                     });
                     ctx.consts.push(Const {
                         line: pos(name).0,
@@ -256,45 +383,86 @@ fn extract_consts(node: Node, ctx: &mut Ctx) {
     }
 }
 
-/// returns (callee simple name, call-site line) for a call node
-fn extract_call(node: Node, ctx: &Ctx) -> Option<(String, usize)> {
-    let callee = node.child_by_field_name("function")?;
-    let name = simple_callee_name(callee, ctx.src)?;
-    let line = pos(callee).0;
-    Some((name, line))
+
+fn is_shouting_snek(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && name.chars().any(|c| c.is_ascii_uppercase())
 }
 
-/// reduce a call target expression to a bare function/method name
-fn simple_callee_name(node: Node, src: &str) -> Option<String> {
+fn has_const_keyword(node: Node) -> bool {
+    let mut cursor = node.walk();
+    let is_const = node.children(&mut cursor).any(|c| c.kind() == "const");
+    is_const
+}
+
+fn classify_call(node: Node, ctx: &Ctx) -> Option<RawCall> {
+    let callee = node.child_by_field_name("function")?;
+    let kind = resolve_callee(callee, ctx)?;
+    Some(RawCall {
+        caller: ctx.caller(),
+        call_line: pos(callee).0,
+        kind,
+    })
+}
+
+/// reduce a call target expression to a [`CallKind`]
+fn resolve_callee(node: Node, ctx: &Ctx) -> Option<CallKind> {
+    let src = ctx.src;
     match node.kind() {
-        "identifier" | "field_identifier" | "property_identifier" | "type_identifier" => {
-            Some(oneline(text(node, src)))
+        "identifier" | "type_identifier" => Some(CallKind::Free(oneline(text(node, src)))),
+        // rs: `a.b()` / `self.b()`
+        "field_expression" => {
+            let obj = node.child_by_field_name("value")?;
+            let name = oneline(text(node.child_by_field_name("field")?, src));
+            self_method(obj, name, ctx)
         }
-        // rs: `a.b()`
-        "field_expression" => node
-            .child_by_field_name("field")
-            .map(|n| oneline(text(n, src))),
-        // rs: `a::b()`
-        "scoped_identifier" => node
-            .child_by_field_name("name")
-            .map(|n| oneline(text(n, src))),
-        // py: `a.b()`
-        "attribute" => node
-            .child_by_field_name("attribute")
-            .map(|n| oneline(text(n, src))),
-        // ts: `a.b()`
-        "member_expression" => node
-            .child_by_field_name("property")
-            .map(|n| oneline(text(n, src))),
-        // go: `a.b()`
-        "selector_expression" => node
-            .child_by_field_name("field")
-            .map(|n| oneline(text(n, src))),
+        // rs: `a::b()` / `Self::b()`
+        "scoped_identifier" => {
+            let name = oneline(text(node.child_by_field_name("name")?, src));
+            let path = node
+                .child_by_field_name("path")
+                .map(|n| oneline(text(n, src)));
+            if matches!(path.as_deref(), Some("Self" | "self")) {
+                ctx.current_type()
+                    .map(|(ty, _)| CallKind::Method { ty, name })
+            } else {
+                None
+            }
+        }
+        // py: `a.b()` / `self.b()`
+        "attribute" => {
+            let obj = node.child_by_field_name("object")?;
+            let name = oneline(text(node.child_by_field_name("attribute")?, src));
+            self_method(obj, name, ctx)
+        }
+        // ts/js: `a.b()` / `this.b()`
+        "member_expression" => {
+            let obj = node.child_by_field_name("object")?;
+            let name = oneline(text(node.child_by_field_name("property")?, src));
+            self_method(obj, name, ctx)
+        }
+        // go: `a.b()` / `recv.b()`
+        "selector_expression" => {
+            let obj = node.child_by_field_name("operand")?;
+            let name = oneline(text(node.child_by_field_name("field")?, src));
+            self_method(obj, name, ctx)
+        }
         // rs: `foo::<T>()`
         "generic_function" => node
             .child_by_field_name("function")
-            .and_then(|f| simple_callee_name(f, src)),
+            .and_then(|f| resolve_callee(f, ctx)),
         _ => None,
+    }
+}
+
+fn self_method(obj: Node, name: String, ctx: &Ctx) -> Option<CallKind> {
+    let (ty, recv) = ctx.current_type()?;
+    let recv = recv?;
+    if oneline(text(obj, ctx.src)) == recv {
+        Some(CallKind::Method { ty, name })
+    } else {
+        None
     }
 }
 
@@ -330,13 +498,23 @@ fn preceding_comment(node: Node, ctx: &Ctx) -> Option<String> {
         return None;
     }
     // must be directly above the definition (allow the line right before)
-    if node.start_position().row.saturating_sub(cur.end_position().row) > 1 {
+    if node
+        .start_position()
+        .row
+        .saturating_sub(cur.end_position().row)
+        > 1
+    {
         return None;
     }
     // doc comments are often a run of single-line comments (`///` in Rust)
     // walk to the topmost adjacent one so we use the summary line
     while let Some(prev) = cur.prev_sibling() {
-        if is_comment(&prev) && cur.start_position().row.saturating_sub(prev.end_position().row) <= 1
+        if is_comment(&prev)
+            && cur
+                .start_position()
+                .row
+                .saturating_sub(prev.end_position().row)
+                <= 1
         {
             cur = prev;
         } else {
@@ -447,8 +625,6 @@ mod tests {
                    function main(): void { add(1, 2); }\n";
         let ex = extract(Language::TypeScript, src).unwrap();
         // the lambda is recorded as a func, not a const.
-        // hopefully this doesnt cause problems later as a lambda should be
-        // const or in C++ terms a constexpr :S
         assert!(ex.funcs.iter().any(|f| f.name == "add"));
         assert!(!ex.consts.iter().any(|c| c.name == "add"));
         assert!(ex.refs.iter().any(|r| r.target_name == "add"));
@@ -464,5 +640,64 @@ mod tests {
         let ex = extract(Language::Rust, src).unwrap();
         assert_eq!(ex.notes.len(), 1);
         assert!(ex.notes[0].text.contains("TODO"));
+    }
+
+    #[test]
+    fn qualified_call_does_not_bind_to_local_name() {
+        // A method call `x.parse()` must NOT resolve to the free `fn parse`
+        // just because the names match; only the bare `parse()` should.
+        let src = "fn parse() -> i32 { 0 }\n\
+                   fn run(x: String) {\n\
+                       let _ = x.parse();\n\
+                       let _ = parse();\n\
+                   }\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        let hits: Vec<_> = ex
+            .refs
+            .iter()
+            .filter(|r| r.caller == "run" && r.target_name == "parse")
+            .collect();
+        // exactly one edge: the bare `parse()`, not `x.parse()`
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].call_line, 4);
+    }
+
+    #[test]
+    fn self_method_calls_resolve_by_type() {
+        // `self.helper()` resolves to the method on the same type; a same-named
+        // free function is a distinct target.
+        let src = "struct S;\n\
+                   impl S {\n\
+                       fn helper(&self) -> i32 { 1 }\n\
+                       fn run(&self) -> i32 { self.helper() }\n\
+                   }\n\
+                   fn helper() {}\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        assert!(ex.refs.iter().any(|r| r.caller == "run"
+            && r.target_name == "helper"
+            && r.target_ret.as_deref() == Some("i32")));
+    }
+
+    #[test]
+    fn python_only_shouting_snek_is_const() {
+        // nb explicit `\n` + spaces so the class body indentation survives
+        let src = "MAX_SIZE = 10\nratio = 1.5\nclass C:\n    ATTR = 3\n";
+        let ex = extract(Language::Python, src).unwrap();
+        assert!(ex.consts.iter().any(|c| c.name == "MAX_SIZE"));
+        // lowercase module var filtered out
+        assert!(!ex.consts.iter().any(|c| c.name == "ratio"));
+        // class attribute is not a module const
+        assert!(!ex.consts.iter().any(|c| c.name == "ATTR"));
+    }
+
+    #[test]
+    fn js_let_is_not_a_const() {
+        let src = "const KEEP = 1;\n\
+                   let drop = 2;\n\
+                   var also = 3;\n";
+        let ex = extract(Language::JavaScript, src).unwrap();
+        assert!(ex.consts.iter().any(|c| c.name == "KEEP"));
+        assert!(!ex.consts.iter().any(|c| c.name == "drop"));
+        assert!(!ex.consts.iter().any(|c| c.name == "also"));
     }
 }
