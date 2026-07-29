@@ -1,4 +1,4 @@
-# scan.rs.md (20260729-17-50-32) UTC
+# scan.rs.md (20260729-17-57-11) UTC
 # source: src/scan.rs [rust]
 # const
     - L13@SKIP_DIRS:&[&str]
