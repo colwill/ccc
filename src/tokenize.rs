@@ -16,8 +16,8 @@ pub const TOKENS_BIN: &str = "tokens.bin";
 pub const TOKENS_INDEX: &str = "tokens.json";
 const INDEX_VERSION: u32 = 1;
 
-/// disclaimer embedded in `tokens.json` so the stream is never mistaken for a
-/// claude-ready or exact-count artifact
+// disclaimer embedded in `tokens.json` so the stream is never mistaken for a
+// claude-ready or exact-count artifact
 const NOTE: &str = "APPROXIMATE tiktoken IDs - NOT compatible with Claude/Anthropic models. \
 Claude uses a different tokenizer, and its Messages API accepts text, not token IDs, so these \
 IDs cannot be loaded into Claude and only roughly approximate its token counts (tiktoken \
@@ -25,7 +25,7 @@ undercounts Claude tokens, more so on code). Intended for a downstream model tha
 tiktoken vocabulary, or for rough size estimates. For exact Claude token counts, use \
 Anthropic's /v1/messages/count_tokens endpoint.";
 
-/// pretrained tiktoken vocabulary
+// pretrained tiktoken vocabulary
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
     O200kBase,
@@ -48,7 +48,7 @@ impl Encoding {
         }
     }
 
-    /// load the (embedded) BPE ranks for this encoding
+    // load the (embedded) BPE ranks for this encoding
     pub fn load(self) -> Result<CoreBPE> {
         let bpe = match self {
             Encoding::O200kBase => tiktoken_rs::o200k_base(),
@@ -58,7 +58,7 @@ impl Encoding {
     }
 }
 
-/// per-file location within the token stream
+// per-file location within the token stream
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileEntry {
     pub file: String,
@@ -88,8 +88,8 @@ pub struct TokenizeReport {
     pub bin_path: PathBuf,
 }
 
-/// encode every `.md` cache file under `<root>/.ccc` into `tokens.bin` +
-/// `tokens.json`, then verify the persisted stream decodes back to the corpus
+// encode every `.md` cache file under `<root>/.ccc` into `tokens.bin` +
+// `tokens.json`, then verify the persisted stream decodes back to the corpus
 pub fn tokenize(root: &Path, enc: Encoding) -> Result<TokenizeReport> {
     let ccc = root.join(".ccc");
     ensure!(
@@ -150,8 +150,8 @@ pub fn tokenize(root: &Path, enc: Encoding) -> Result<TokenizeReport> {
     })
 }
 
-/// remove persisted token artifacts (used when regenerating the cache without
-/// re-tokenizing, so stale tokens never linger).
+// remove persisted token artifacts (used when regenerating the cache without
+// re-tokenizing, so stale tokens never linger).
 pub fn clear(ccc: &Path) -> Result<()> {
     for name in [TOKENS_BIN, TOKENS_INDEX] {
         let p = ccc.join(name);
@@ -162,7 +162,7 @@ pub fn clear(ccc: &Path) -> Result<()> {
     Ok(())
 }
 
-/// reload persisted tokens from disk and confirm they decode to the corpus
+// reload persisted tokens from disk and confirm they decode to the corpus
 fn verify_roundtrip(root: &Path, enc: Encoding, names: &[String]) -> Result<()> {
     let cache = TokenCache::load(root)?;
     let bpe = enc.load()?;
@@ -195,8 +195,8 @@ fn list_markdown(ccc: &Path) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// loaded token cache: the raw `u32` stream plus its index
-/// constructed by reading `tokens.bin` / `tokens.json` with no BPE pass
+// loaded token cache: the raw `u32` stream plus its index
+// constructed by reading `tokens.bin` / `tokens.json` with no BPE pass
 pub struct TokenCache {
     pub encoding: Encoding,
     pub tokens: Vec<u32>,
@@ -244,18 +244,18 @@ impl TokenCache {
         })
     }
 
-    /// raw token slice for one cache file (no re-tokenization)
+    // raw token slice for one cache file (no re-tokenization)
     pub fn file(&self, name: &str) -> Option<&[u32]> {
         let e = self.index.files.iter().find(|e| e.file == name)?;
         self.tokens.get(e.offset..e.offset + e.len)
     }
 
-    /// entire concatenated token stream
+    // entire concatenated token stream
     pub fn all(&self) -> &[u32] {
         &self.tokens
     }
 
-    /// decode token IDs back to text
+    // decode token IDs back to text
     pub fn decode(&self, toks: &[u32]) -> Result<String> {
         self.encoding
             .load()?

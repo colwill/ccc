@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use codecache::{CheckReport, Encoding};
+use codecache::{CheckReport, Encoding, SurfOptions, SurfReport};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -17,15 +17,15 @@ struct Cli {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
-    /// Human-readable summary (default).
+    // Human-readable summary (default).
     Text,
-    /// Machine-readable JSON: { root, up_to_date, files[], changes[] }.
+    // Machine-readable JSON: { root, up_to_date, files[], changes[] }.
     Json,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// scan a project and (re)generate the `.ccc` directory
+    // scan a project and (re)generate the `.ccc` directory
     Scan {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -34,11 +34,11 @@ enum Command {
         #[arg(long, default_value = "o200k_base")]
         encoding: String,
     },
-    /// verify `.ccc` is up to date; exit non-zero if it would change
+    // verify `.ccc` is up to date; exit non-zero if it would change
     Check {
         #[arg(default_value = ".")]
         path: PathBuf,
-        /// output format: `text` (default) or `json` (changed files as an array)
+        // output format: `text` (default) or `json` (changed files as an array)
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
@@ -48,12 +48,61 @@ enum Command {
         #[arg(long, default_value = "o200k_base")]
         encoding: String,
     },
-    /// install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
+    // surface branch changes to a continuous-testing suite: which services
+    // changed, who calls them, and what needs testing (JSON by default)
+    Surf {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // base ref to diff against (default: merge-base with origin/main,
+        // main, origin/master or master - first that exists)
+        #[arg(long)]
+        base: Option<String>,
+        // define/extend a service inline: NAME=GLOB (repeatable; merged over
+        // `.ccc/surf.json`)
+        #[arg(long = "service", value_name = "NAME=GLOB")]
+        services: Vec<String>,
+        // output format (default json - surf is built for pipelines)
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+        // exit non-zero when changed functions have no detected test reference
+        #[arg(long)]
+        fail_untested: bool,
+        // write a starter `.ccc/surf.json` inferred from top-level directories
+        #[arg(long)]
+        init: bool,
+        // also write a single-file HTML view of the report (Tailwind + HTMX
+        // live-query panel against `ccc serve`), e.g. ccc-surf-rust.html
+        #[arg(long, value_name = "FILE")]
+        html: Option<PathBuf>,
+        // render --html from an existing surf JSON report instead of running
+        // the analysis (no git needed)
+        #[arg(long, value_name = "REPORT.json", requires = "html")]
+        from: Option<PathBuf>,
+    },
+    // serve the code map over HTTP for AI agents: REST endpoints
+    // (/find /references /dependencies ...) + an MCP endpoint at /mcp
+    Serve {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // bind address (loopback by default; think twice before widening)
+        #[arg(long, default_value = "127.0.0.1")]
+        addr: String,
+        // port to listen on (0 picks a free port, printed on startup)
+        #[arg(long, default_value_t = 6767)]
+        port: u16,
+        // seconds between file-watch polls; the map auto-refreshes on change
+        #[arg(long, default_value_t = 2)]
+        watch_interval: u64,
+        // disable file watching (rescan only via POST /refresh)
+        #[arg(long)]
+        no_watch: bool,
+    },
+    // install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
     Install {
-        /// directory to install into (default: ~/.local/bin)
+        // directory to install into (default: ~/.local/bin)
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// overwrite an existing `ccc` in the target directory
+        // overwrite an existing `ccc` in the target directory
         #[arg(long)]
         force: bool,
     },
@@ -114,7 +163,125 @@ fn run() -> Result<ExitCode> {
             run_tokenize(&root, &encoding)?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Surf {
+            path,
+            base,
+            services,
+            format,
+            fail_untested,
+            init,
+            html,
+            from,
+        } => {
+            let root = canonical(&path);
+            if init {
+                let cfg = codecache::init_config(&root)?;
+                println!("Wrote {} - edit the service globs, then re-run `ccc surf`", cfg.display());
+                return Ok(ExitCode::SUCCESS);
+            }
+            // --from: render the HTML view from a saved report, no analysis
+            if let Some(from) = from {
+                let html_path = html.expect("clap enforces --from requires --html");
+                let raw = std::fs::read_to_string(&from)
+                    .with_context(|| format!("reading {}", from.display()))?;
+                let report: serde_json::Value = serde_json::from_str(&raw)
+                    .with_context(|| format!("parsing {} as a surf report", from.display()))?;
+                codecache::html::write_surf_html(&html_path, &report, &html_title(&html_path))?;
+                println!("Wrote {}", html_path.display());
+                return Ok(ExitCode::SUCCESS);
+            }
+            let service_flags = services
+                .iter()
+                .map(|s| {
+                    s.split_once('=')
+                        .map(|(n, g)| (n.trim().to_string(), g.trim().to_string()))
+                        .filter(|(n, g)| !n.is_empty() && !g.is_empty())
+                        .ok_or_else(|| anyhow!("--service wants NAME=GLOB, got '{s}'"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let opts = SurfOptions {
+                base,
+                service_flags,
+            };
+            let report = codecache::surf(&root, &path_str(&path), &opts)?;
+            if let Some(html_path) = &html {
+                let value = serde_json::to_value(&report)?;
+                codecache::html::write_surf_html(html_path, &value, &html_title(html_path))?;
+                // stderr so stdout stays pure JSON for pipelines
+                eprintln!("wrote {}", html_path.display());
+            }
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+                OutputFormat::Text => print_surf_text(&report),
+            }
+            if fail_untested && !report.untested.is_empty() {
+                eprintln!(
+                    "surf: {} changed function(s) with no detected test reference",
+                    report.untested.len()
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Serve {
+            path,
+            addr,
+            port,
+            watch_interval,
+            no_watch,
+        } => {
+            let watch = if no_watch || watch_interval == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(watch_interval))
+            };
+            let opts = codecache::ServeOptions { addr, port, watch };
+            codecache::serve(&canonical(&path), &opts)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Install { dir, force } => run_install(dir, force),
+    }
+}
+
+fn print_surf_text(r: &SurfReport) {
+    println!(
+        "surf: {} service(s), base {} ({}..{})",
+        r.services.len(),
+        r.base,
+        &r.base_sha[..r.base_sha.len().min(9)],
+        &r.head_sha[..r.head_sha.len().min(9)]
+    );
+    println!(
+        "changed: {} file(s), {} function(s)",
+        r.counts.changed_files, r.counts.changed_functions
+    );
+    for e in &r.edges {
+        let kind = if e.declared { "declared" } else { "detected" };
+        let syms: Vec<&str> = e.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        let syms = if syms.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", syms.join(", "))
+        };
+        println!("edge: {} -> {} [{kind}]{syms}", e.from, e.to);
+    }
+    println!("test: {}", r.services_to_test.join(", "));
+    for f in &r.untested {
+        println!(
+            "untested: {}::{} L{}-{} (called from: {})",
+            f.file,
+            f.function,
+            f.lines[0],
+            f.lines[1],
+            if f.called_from.is_empty() {
+                "-".to_string()
+            } else {
+                f.called_from.join(", ")
+            }
+        );
+    }
+    if !r.unassigned_files.is_empty() {
+        println!("unassigned: {}", r.unassigned_files.join(", "));
     }
 }
 
@@ -129,9 +296,9 @@ fn print_check_text(report: &CheckReport) {
     }
 }
 
-/// Emit `{ root, up_to_date, files[], changes[] }` as one JSON line. `files` is
-/// the repo-relative paths of the changed cache entries — ready to hand to
-/// another GitHub Action via `fromJSON(...)`.
+// Emit `{ root, up_to_date, files[], changes[] }` as one JSON line. `files` is
+// the repo-relative paths of the changed cache entries — ready to hand to
+// another GitHub Action via `fromJSON(...)`.
 fn print_check_json(root: &Path, report: &CheckReport) -> Result<()> {
     let ccc_rel = rel_join(root, Path::new(".ccc"));
     let changes: Vec<_> = report
@@ -160,8 +327,8 @@ fn print_check_json(root: &Path, report: &CheckReport) -> Result<()> {
     Ok(())
 }
 
-/// Join `rest` onto `root`, dropping a leading `./` so paths read cleanly
-/// (root "." + ".ccc/CCC.md" -> ".ccc/CCC.md").
+// Join `rest` onto `root`, dropping a leading `./` so paths read cleanly
+// (root "." + ".ccc/CCC.md" -> ".ccc/CCC.md").
 fn rel_join(root: &Path, rest: &Path) -> PathBuf {
     let mut p = PathBuf::new();
     for c in root.components() {
@@ -173,9 +340,18 @@ fn rel_join(root: &Path, rest: &Path) -> PathBuf {
     p
 }
 
-/// Path as a forward-slash string (stable for CI output regardless of platform).
+// Path as a forward-slash string (stable for CI output regardless of platform).
 fn path_str(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
+}
+
+// title for a generated HTML report: the output file's stem
+// (`ccc-surf-rust.html` -> `ccc-surf-rust`)
+fn html_title(p: &Path) -> String {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ccc-surf")
+        .to_string()
 }
 
 fn run_tokenize(root: &Path, encoding: &str) -> Result<()> {
@@ -197,11 +373,11 @@ fn run_tokenize(root: &Path, encoding: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy the running `ccc` binary into a directory on the user's PATH.
+// Copy the running `ccc` binary into a directory on the user's PATH.
 ///
-/// Defaults to `~/.local/bin` — the standard user-local bin dir on Linux, so no
-/// root/sudo is needed. Warns (but still succeeds) if the target dir isn't on
-/// `$PATH` so the user knows the shell won't find `ccc` until they add it.
+// Defaults to `~/.local/bin` — the standard user-local bin dir on Linux, so no
+// root/sudo is needed. Warns (but still succeeds) if the target dir isn't on
+// `$PATH` so the user knows the shell won't find `ccc` until they add it.
 fn run_install(dir: Option<PathBuf>, force: bool) -> Result<ExitCode> {
     let src = std::env::current_exe()
         .context("could not determine the path to the running ccc binary")?;
@@ -250,14 +426,14 @@ fn run_install(dir: Option<PathBuf>, force: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `~/.local/bin` — the XDG user-local binary directory on Linux.
+// `~/.local/bin` — the XDG user-local binary directory on Linux.
 fn default_bin_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| anyhow!("HOME is not set; pass --dir to choose an install directory"))?;
     Ok(PathBuf::from(home).join(".local").join("bin"))
 }
 
-/// Expand a leading `~` (or `~/`) to `$HOME`; leave other paths untouched.
+// Expand a leading `~` (or `~/`) to `$HOME`; leave other paths untouched.
 fn expand_tilde(p: &Path) -> PathBuf {
     if let Ok(rest) = p.strip_prefix("~") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -267,7 +443,7 @@ fn expand_tilde(p: &Path) -> PathBuf {
     p.to_path_buf()
 }
 
-/// True if both paths resolve to the same existing file.
+// True if both paths resolve to the same existing file.
 fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -275,7 +451,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// True if `dir` is one of the entries in `$PATH`.
+// True if `dir` is one of the entries in `$PATH`.
 fn dir_on_path(dir: &Path) -> bool {
     let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     std::env::var_os("PATH")

@@ -3,7 +3,7 @@
 use crate::languages::Language;
 use std::path::PathBuf;
 
-/// module/file-level constant or static binding.
+// module/file-level constant or static binding.
 #[derive(Debug, Clone)]
 pub struct Const {
     pub line: usize, // 1-based
@@ -11,7 +11,7 @@ pub struct Const {
     pub ty: Option<String>,
 }
 
-/// function / method definition.
+// function / method definition.
 #[derive(Debug, Clone)]
 pub struct Func {
     pub line: usize, // 1-based (position of the name token)
@@ -19,10 +19,33 @@ pub struct Func {
     pub name: String,
     pub ret: Option<String>,
     pub comment: Option<String>, // preceding doc / inline comment, one line
+    // full definition span (1-based, inclusive) - used by `surf` to map diff
+    // hunks onto functions; not rendered into `.ccc` entries
+    pub start_line: usize,
+    pub end_line: usize,
+    // true when defined inside a test scope (e.g. a Rust `mod tests`)
+    pub test_ctx: bool,
 }
 
-/// resolved call: `caller` (at `call_line`) invokes a function defined in the
-/// same file at (`target_line`, `target_col`).
+// a call site kept in "loose" form: every call in the file, resolved or not.
+// `surf` matches these against other services' definitions; they are not
+// rendered into `.ccc` entries.
+#[derive(Debug, Clone)]
+pub struct CallSite {
+    // nearest enclosing function (`<top>` at file level)
+    pub caller: String,
+    pub line: usize,
+    // rightmost identifier of the callee (`billing::charge` -> `charge`)
+    pub name: String,
+    // qualifier text left of the name, if any (`billing::charge` -> `billing`,
+    // `client.charge()` -> `client`)
+    pub qualifier: Option<String>,
+    // true when the call sits inside a test scope (e.g. a Rust `mod tests`)
+    pub test_ctx: bool,
+}
+
+// resolved call: `caller` (at `call_line`) invokes a function defined in the
+// same file at (`target_line`, `target_col`).
 #[derive(Debug, Clone)]
 pub struct Ref {
     pub caller: String,
@@ -33,17 +56,17 @@ pub struct Ref {
     pub target_ret: Option<String>,
 }
 
-/// A free-form note (TODO/FIXME/NOTE/...).
+// A free-form note (TODO/FIXME/NOTE/...).
 #[derive(Debug, Clone)]
 pub struct Note {
     pub line: usize,
     pub text: String,
 }
 
-/// everything extracted from a single source file.
+// everything extracted from a single source file.
 #[derive(Debug, Clone)]
 pub struct FileCache {
-    /// Path relative to the project root, e.g. `src/extract.rs`.
+    // Path relative to the project root, e.g. `src/extract.rs`.
     pub rel_path: PathBuf,
     pub cache_name: String,
     pub display_name: String,
@@ -52,6 +75,8 @@ pub struct FileCache {
     pub funcs: Vec<Func>,
     pub refs: Vec<Ref>,
     pub notes: Vec<Note>,
+    // all call sites (superset of `refs`), used by `surf`; not rendered
+    pub calls: Vec<CallSite>,
 }
 
 impl FileCache {

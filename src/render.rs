@@ -5,12 +5,12 @@ use crate::model::{Counts, FileCache};
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// current UTC timestamp formatted as `yyyymmdd-hh-mm-ss`
+// current UTC timestamp formatted as `yyyymmdd-hh-mm-ss`
 pub fn now_ts() -> String {
     chrono::Utc::now().format("%Y%m%d-%H-%M-%S").to_string()
 }
 
-/// render a single per-file cache entry
+// render a single per-file cache entry
 pub fn render_file(fc: &FileCache, ts: &str) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# {} ({}) UTC", fc.display_name, ts);
@@ -66,7 +66,7 @@ pub fn render_file(fc: &FileCache, ts: &str) -> String {
     out
 }
 
-/// render the CCC index for the whole project
+// render the CCC index for the whole project
 pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     let mut out = String::new();
     let root_label = root
@@ -93,6 +93,9 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     let _ = writeln!(out, "        as APPROXIMATE tiktoken (o200k) ids - for a downstream model that");
     let _ = writeln!(out, "        shares that vocabulary, NOT for Claude (different tokenizer; its API");
     let _ = writeln!(out, "        takes text, not token ids). Feed Claude the markdown above as text.");
+    let _ = writeln!(out, "query: `ccc serve` exposes this map over local HTTP - REST endpoints");
+    let _ = writeln!(out, "        (/find /references /dependencies /file /notes) plus an MCP");
+    let _ = writeln!(out, "        endpoint at /mcp - so agents can query instead of reading files.");
     let _ = writeln!(out, "keep-fresh: whenever you change tracked source, regenerate with");
     let _ = writeln!(out, "        `ccc scan` (add `--tokens` to refresh the token stream). CI runs");
     let _ = writeln!(out, "        `ccc check`, which fails when `.ccc` is out of date.");
@@ -132,8 +135,8 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     out
 }
 
-/// replace embedded generation timestamps with a fixed token so freshness
-/// checks compare content not wall-clock time
+// replace embedded generation timestamps with a fixed token so freshness
+// checks compare content not wall-clock time
 pub fn strip_timestamps(s: &str) -> String {
     s.lines().map(strip_ts_line).collect::<Vec<_>>().join("\n")
 }

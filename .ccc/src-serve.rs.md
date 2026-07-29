@@ -1,0 +1,178 @@
+# serve.rs.md (20260729-17-50-32) UTC
+# source: src/serve.rs [rust]
+# const
+    - L16@MCP_VERSIONS:&[&str]
+    - L17@MCP_LATEST:&str
+    - L19@FIND_CAP:usize
+    - L20@REFS_CAP:usize
+    - L21@EDGE_SYMBOL_CAP:usize
+    - L896@ENDPOINTS:&[&str]
+# funcs
+    - L30:8@default:Self
+    - L48:8@build:Result<MapState>
+    - L65:8@rescan:Result<(usize, usize)>
+    - L74:8@swap_in // swap in a fresh map (built outside lock by watcher)
+    - L79:8@path_of:String
+    - L84:8@find_file:Result<&FileCache, String> // find a file by relative path, cache name, or unique path suffix
+    - L133:8@def_files:BTreeMap<&str, BTreeSet<usize>> // symbol name -> indexes of files defining it (as a function)
+    - L148:4@fingerprint:Result<Fingerprint>
+    - L164:4@fingerprint_delta:usize
+    - L173:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - L187:4@spawn_watcher
+    - L218:4@q_index:Value
+    - L250:4@q_find:Result<Value, String>
+    - L303:4@q_references:Result<Value, String>
+    - L344:4@q_dependencies:Result<Value, String> // File-level dependency edges
+    - L428:4@q_file:Result<Value, String>
+    - L452:4@q_notes:Value
+    - L470:4@mcp_tools:Value
+    - L521:4@mcp_initialize:Value
+    - L549:4@mcp_text:Value
+    - L554:4@mcp_tool_call:Result<Value, (i64, String)>
+    - L593:4@mcp_resources_list:Value
+    - L612:4@mcp_resources_read:Result<Value, (i64, String)>
+    - L633:4@mcp_handle:Option<Value>
+    - L658:4@url_decode:String // percent-decoder for query components (`%2F`, `+` as space)
+    - L681:4@parse_query:(String, BTreeMap<String, String>)
+    - L693:4@origin_ok:bool // only loopback origins - plus "null", the Origin a browser sends for pages
+    - L716:4@ok:Reply
+    - L723:4@bad:Reply
+    - L732:4@html_ok:Reply // fragment endpoints always answer 200 with self-describing HTML (soft
+    - L743:4@esc:String
+    - L750:4@frag_err:String
+    - L754:4@frag_health:String
+    - L763:4@frag_loc:String // `file:line` code location chip
+    - L771:4@frag_find:String
+    - L800:4@frag_references:String
+    - L838:4@frag_dependencies:String
+    - L909:4@route:Reply
+    - L1046:8@serve:Result<()> // start the server and block
+    - L1097:4@handle_request
+    - L1160:8@fixture:MapState
+    - L1187:8@index_and_find
+    - L1201:8@references_finds_defs_and_calls
+    - L1212:8@dependencies_edges_and_per_file
+    - L1225:8@file_lookup_and_suffix
+    - L1236:8@notes_filtering
+    - L1244:8@watcher_detects_edits_adds_and_deletes
+    - L1274:8@mcp_initialize_negotiates_version
+    - L1283:8@mcp_lifecycle_and_tools
+    - L1339:8@mcp_resources_roundtrip
+    - L1356:8@json_of:&Value
+    - L1363:8@html_of:&str
+    - L1371:8@http_routing_shapes
+    - L1398:8@html_fragments_for_htmx
+    - L1424:8@origin_gate
+# refs
+    - find_file@L89 calls L79:8@path_of:String
+    - find_file@L96 calls L79:8@path_of:String
+    - find_file@L104 calls L79:8@path_of:String
+    - check_and_rebuild@L177 calls L148:4@fingerprint:Result<Fingerprint>
+    - check_and_rebuild@L181 calls L164:4@fingerprint_delta:usize
+    - spawn_watcher@L189 calls L148:4@fingerprint:Result<Fingerprint>
+    - spawn_watcher@L193 calls L173:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - mcp_tool_call@L565 calls L549:4@mcp_text:Value
+    - mcp_tool_call@L569 calls L549:4@mcp_text:Value
+    - mcp_tool_call@L575 calls L218:4@q_index:Value
+    - mcp_tool_call@L576 calls L250:4@q_find:Result<Value, String>
+    - mcp_tool_call@L581 calls L303:4@q_references:Result<Value, String>
+    - mcp_tool_call@L582 calls L344:4@q_dependencies:Result<Value, String>
+    - mcp_tool_call@L583 calls L428:4@q_file:Result<Value, String>
+    - mcp_tool_call@L584 calls L452:4@q_notes:Value
+    - mcp_tool_call@L588 calls L549:4@mcp_text:Value
+    - mcp_tool_call@L589 calls L549:4@mcp_text:Value
+    - mcp_handle@L641 calls L521:4@mcp_initialize:Value
+    - mcp_handle@L643 calls L470:4@mcp_tools:Value
+    - mcp_handle@L644 calls L554:4@mcp_tool_call:Result<Value, (i64, String)>
+    - mcp_handle@L645 calls L593:4@mcp_resources_list:Value
+    - mcp_handle@L646 calls L612:4@mcp_resources_read:Result<Value, (i64, String)>
+    - parse_query@L686 calls L658:4@url_decode:String
+    - frag_find@L774 calls L750:4@frag_err:String
+    - frag_dependencies@L876 calls L750:4@frag_err:String
+    - route@L910 calls L681:4@parse_query:(String, BTreeMap<String, String>)
+    - route@L916 calls L716:4@ok:Reply
+    - route@L916 calls L218:4@q_index:Value
+    - route@L920 calls L716:4@ok:Reply
+    - route@L930 calls L723:4@bad:Reply
+    - route@L933 calls L250:4@q_find:Result<Value, String>
+    - route@L934 calls L716:4@ok:Reply
+    - route@L935 calls L723:4@bad:Reply
+    - route@L940 calls L723:4@bad:Reply
+    - route@L943 calls L303:4@q_references:Result<Value, String>
+    - route@L944 calls L716:4@ok:Reply
+    - route@L945 calls L723:4@bad:Reply
+    - route@L950 calls L344:4@q_dependencies:Result<Value, String>
+    - route@L951 calls L716:4@ok:Reply
+    - route@L952 calls L723:4@bad:Reply
+    - route@L957 calls L723:4@bad:Reply
+    - route@L960 calls L428:4@q_file:Result<Value, String>
+    - route@L961 calls L716:4@ok:Reply
+    - route@L962 calls L723:4@bad:Reply
+    - route@L967 calls L716:4@ok:Reply
+    - route@L967 calls L452:4@q_notes:Value
+    - route@L972 calls L754:4@frag_health:String
+    - route@L972 calls L732:4@html_ok:Reply
+    - route@L977 calls L732:4@html_ok:Reply
+    - route@L977 calls L250:4@q_find:Result<Value, String>
+    - route@L978 calls L771:4@frag_find:String
+    - route@L979 calls L750:4@frag_err:String
+    - route@L984 calls L732:4@html_ok:Reply
+    - route@L984 calls L303:4@q_references:Result<Value, String>
+    - route@L985 calls L800:4@frag_references:String
+    - route@L986 calls L750:4@frag_err:String
+    - route@L992 calls L732:4@html_ok:Reply
+    - route@L992 calls L344:4@q_dependencies:Result<Value, String>
+    - route@L993 calls L838:4@frag_dependencies:String
+    - route@L994 calls L750:4@frag_err:String
+    - route@L1005 calls L716:4@ok:Reply
+    - route@L1010 calls L723:4@bad:Reply
+    - route@L1026 calls L633:4@mcp_handle:Option<Value>
+    - route@L1027 calls L716:4@ok:Reply
+    - route@L1035 calls L723:4@bad:Reply
+    - serve@L1073 calls L187:4@spawn_watcher
+    - serve@L1088 calls L1097:4@handle_request
+    - handle_request@L1110 calls L693:4@origin_ok:bool
+    - handle_request@L1112 calls L723:4@bad:Reply
+    - handle_request@L1116 calls L723:4@bad:Reply
+    - handle_request@L1118 calls L909:4@route:Reply
+    - index_and_find@L1188 calls L1160:8@fixture:MapState
+    - index_and_find@L1189 calls L218:4@q_index:Value
+    - index_and_find@L1191 calls L250:4@q_find:Result<Value, String>
+    - index_and_find@L1195 calls L250:4@q_find:Result<Value, String>
+    - references_finds_defs_and_calls@L1202 calls L1160:8@fixture:MapState
+    - references_finds_defs_and_calls@L1203 calls L303:4@q_references:Result<Value, String>
+    - dependencies_edges_and_per_file@L1213 calls L1160:8@fixture:MapState
+    - dependencies_edges_and_per_file@L1214 calls L344:4@q_dependencies:Result<Value, String>
+    - dependencies_edges_and_per_file@L1219 calls L344:4@q_dependencies:Result<Value, String>
+    - file_lookup_and_suffix@L1226 calls L1160:8@fixture:MapState
+    - file_lookup_and_suffix@L1227 calls L428:4@q_file:Result<Value, String>
+    - notes_filtering@L1237 calls L1160:8@fixture:MapState
+    - watcher_detects_edits_adds_and_deletes@L1250 calls L148:4@fingerprint:Result<Fingerprint>
+    - watcher_detects_edits_adds_and_deletes@L1255 calls L173:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - watcher_detects_edits_adds_and_deletes@L1261 calls L173:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - watcher_detects_edits_adds_and_deletes@L1266 calls L173:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - mcp_initialize_negotiates_version@L1275 calls L521:4@mcp_initialize:Value
+    - mcp_initialize_negotiates_version@L1277 calls L521:4@mcp_initialize:Value
+    - mcp_lifecycle_and_tools@L1284 calls L1160:8@fixture:MapState
+    - mcp_lifecycle_and_tools@L1291 calls L633:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L1294 calls L633:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L1310 calls L633:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L1322 calls L633:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L1330 calls L633:4@mcp_handle:Option<Value>
+    - mcp_resources_roundtrip@L1340 calls L1160:8@fixture:MapState
+    - mcp_resources_roundtrip@L1341 calls L593:4@mcp_resources_list:Value
+    - mcp_resources_roundtrip@L1351 calls L612:4@mcp_resources_read:Result<Value, (i64, String)>
+    - http_routing_shapes@L1372 calls L1160:8@fixture:MapState
+    - http_routing_shapes@L1373 calls L909:4@route:Reply
+    - http_routing_shapes@L1381 calls L909:4@route:Reply
+    - http_routing_shapes@L1390 calls L909:4@route:Reply
+    - http_routing_shapes@L1393 calls L909:4@route:Reply
+    - html_fragments_for_htmx@L1399 calls L1160:8@fixture:MapState
+    - html_fragments_for_htmx@L1401 calls L909:4@route:Reply
+    - html_fragments_for_htmx@L1403 calls L1363:8@html_of:&str
+    - html_fragments_for_htmx@L1407 calls L909:4@route:Reply
+    - html_fragments_for_htmx@L1411 calls L909:4@route:Reply
+    - html_fragments_for_htmx@L1413 calls L909:4@route:Reply
+    - html_fragments_for_htmx@L1416 calls L909:4@route:Reply
+    - html_fragments_for_htmx@L1419 calls L909:4@route:Reply
+# note

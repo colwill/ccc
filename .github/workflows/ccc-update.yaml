@@ -20,6 +20,13 @@ on:
       - '**/*.cts'
       - '**/*.tsx'
       - '**/*.go'
+      - '**/*.cpp'
+      - '**/*.cc'
+      - '**/*.cxx'
+      - '**/*.hpp'
+      - '**/*.hh'
+      - '**/*.hxx'
+      - '**/*.h'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ccc-update.yaml'
@@ -37,8 +44,8 @@ concurrency:
 
 env:
   # Project roots whose `.ccc/` this repo commits. Edit this list to match your
-  # layout (space-separated). The example project ships its own demo cache.
-  CCC_ROOTS: '. example'
+  # layout (space-separated).
+  CCC_ROOTS: '.'
 
 jobs:
   update-ccc:
@@ -118,7 +125,6 @@ jobs:
           # Only commit the generated cache — never build artifacts.
           add-paths: |
             .ccc
-            example/.ccc
 
   # Example: consume the changed-cache array in a separate job
   consume-changes:
