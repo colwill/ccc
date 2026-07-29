@@ -1,0 +1,129 @@
+name: Release ContextCodeCache
+
+# Builds the single-binary release assets that install.sh downloads, one per
+# platform, named `ccc-<os>-<arch>` (see install.sh):
+#   ccc-linux-x86_64    ccc-linux-i686        ccc-linux-aarch64
+#   ccc-linux-armv7     ccc-linux-riscv64
+#   ccc-macos-x86_64    ccc-macos-aarch64
+#   ccc-windows-x86_64.exe   ccc-windows-aarch64.exe
+# Linux targets are musl-static (built with `cross`) so they run on any distro
+# (riscv64 is glibc-dynamic — musl there lacks host tools). macOS targets both
+# build on the Apple Silicon runner: aarch64 natively, x86_64 cross-compiled —
+# Xcode's clang ships both backends. Windows targets both build on the x64
+# runner: MSVC ships an ARM64 cross-compiler. install.sh covers Linux/macOS;
+# the .exe assets are for manual download.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:        # dry-run the matrix without cutting a release
+
+permissions:
+  contents: write           # create the release and upload assets
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: ccc-linux-x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+          - asset: ccc-linux-i686
+            target: i686-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+          - asset: ccc-linux-aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+          - asset: ccc-linux-armv7
+            target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            cross: true
+          - asset: ccc-linux-riscv64
+            target: riscv64gc-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+          - asset: ccc-macos-x86_64
+            target: x86_64-apple-darwin
+            runner: macos-latest
+            cross: false
+          - asset: ccc-macos-aarch64
+            target: aarch64-apple-darwin
+            runner: macos-latest
+            cross: false
+          - asset: ccc-windows-x86_64.exe
+            target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+          - asset: ccc-windows-aarch64.exe
+            target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `cross` runs the build in a container with the right C cross-toolchain
+      # (the tree-sitter grammars compile C, so plain cargo can't cross-build
+      # the Linux targets on its own).
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/ccc"
+          case "${{ matrix.asset }}" in *.exe) src="${src}.exe" ;; esac
+          cp "$src" "${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true
