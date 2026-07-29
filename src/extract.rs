@@ -1,7 +1,7 @@
 //! tree-sitter based extraction of symbols from a single source file
 
 use crate::languages::Language;
-use crate::model::{CallSite, Const, Func, Note, Ref};
+use crate::model::{CallSite, Const, Func, Import, Note, Ref};
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
 
@@ -12,6 +12,11 @@ pub struct Extracted {
     pub notes: Vec<Note>,
     // every call site in loose (name + qualifier) form, for `surf`
     pub calls: Vec<CallSite>,
+    // qualified constant-like usages that are not calls (enum variants,
+    // module consts, scoped types), same loose form
+    pub uses: Vec<CallSite>,
+    // import/use/include statements in loose textual form
+    pub imports: Vec<Import>,
 }
 
 enum CallKind {
@@ -40,11 +45,20 @@ struct Ctx<'a> {
     calls: Vec<RawCall>,
     // every call in loose form (superset of `calls`), kept for `surf`
     loose_calls: Vec<CallSite>,
+    // qualified non-call usages, same loose form
+    uses: Vec<CallSite>,
+    // import/use/include statements
+    imports: Vec<Import>,
     free_index: HashMap<String, (usize, usize, Option<String>)>,
     method_index: HashMap<(String, String), (usize, usize, Option<String>)>,
     scope_stack: Vec<Scope>,
     // > 0 while inside a Rust `mod tests`-style container
     test_mod_depth: usize,
+    // > 0 while inside an import/use/include declaration
+    import_depth: usize,
+    // names of enclosing Python Enum-subclass definitions; members are
+    // const-like definitions typed by the innermost one
+    enum_types: Vec<String>,
 }
 
 impl Ctx<'_> {
@@ -95,10 +109,14 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         notes: Vec::new(),
         calls: Vec::new(),
         loose_calls: Vec::new(),
+        uses: Vec::new(),
+        imports: Vec::new(),
         free_index: HashMap::new(),
         method_index: HashMap::new(),
         scope_stack: Vec::new(),
         test_mod_depth: 0,
+        import_depth: 0,
+        enum_types: Vec::new(),
     };
     visit(tree.root_node(), &mut ctx);
 
@@ -136,6 +154,9 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
     ctx.notes.sort_by_key(|n| n.line);
     ctx.loose_calls
         .sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
+    ctx.uses
+        .sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
+    ctx.imports.sort_by_key(|i| i.line);
 
     Some(Extracted {
         consts: ctx.consts,
@@ -143,6 +164,8 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         refs,
         notes: ctx.notes,
         calls: ctx.loose_calls,
+        uses: ctx.uses,
+        imports: ctx.imports,
     })
 }
 
@@ -161,6 +184,33 @@ fn visit(node: Node, ctx: &mut Ctx) {
             .unwrap_or(false);
     if test_mod {
         ctx.test_mod_depth += 1;
+    }
+    let import = lang.import_kinds().contains(&kind);
+    if import {
+        if ctx.import_depth == 0 {
+            extract_import(node, ctx);
+        }
+        ctx.import_depth += 1;
+    }
+    // `class Color(Enum):` members inside are variant declarations
+    let py_enum = lang == Language::Python
+        && kind == "class_definition"
+        && node
+            .child_by_field_name("superclasses")
+            .map(|s| {
+                text(s, ctx.src)
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|seg| {
+                        matches!(seg, "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag")
+                    })
+            })
+            .unwrap_or(false);
+    if py_enum {
+        let name = node
+            .child_by_field_name("name")
+            .map(|n| oneline(text(n, ctx.src)))
+            .unwrap_or_default();
+        ctx.enum_types.push(name);
     }
 
     if let Some((name, recv)) = type_scope(node, ctx) {
@@ -201,8 +251,20 @@ fn visit(node: Node, ctx: &mut Ctx) {
             pushed += 1;
         }
     } else if lang.const_kinds().contains(&kind) {
-        if const_eligible(ctx) {
+        // python Enum members live in a class body, which const_eligible
+        // rejects - admit them when directly inside an Enum subclass
+        let py_enum_member =
+            lang == Language::Python && !ctx.enum_types.is_empty() && !ctx.in_function();
+        if const_eligible(ctx) || py_enum_member {
             extract_consts(node, ctx);
+        }
+    } else if lang.variant_kinds().contains(&kind) {
+        if !ctx.in_function() {
+            extract_variant(node, ctx);
+        }
+    } else if matches!(lang, Language::TypeScript | Language::Tsx) && kind == "enum_declaration" {
+        if !ctx.in_function() {
+            extract_ts_enum(node, ctx);
         }
     } else if lang.call_kinds().contains(&kind) {
         if let Some(call) = classify_call(node, ctx) {
@@ -219,6 +281,8 @@ fn visit(node: Node, ctx: &mut Ctx) {
         // macro bodies (`assert_eq!(charge(1), 31)`) are token trees, not
         // expressions - approximate the calls inside so `surf` sees them
         scan_macro_tokens(node, ctx);
+    } else if lang.use_kinds().contains(&kind) {
+        maybe_use(node, ctx);
     }
 
     let mut cursor = node.walk();
@@ -230,6 +294,12 @@ fn visit(node: Node, ctx: &mut Ctx) {
     }
     if test_mod {
         ctx.test_mod_depth -= 1;
+    }
+    if import {
+        ctx.import_depth -= 1;
+    }
+    if py_enum {
+        ctx.enum_types.pop();
     }
 }
 
@@ -438,7 +508,9 @@ fn extract_consts(node: Node, ctx: &mut Ctx) {
                     }
                     let ty = node
                         .child_by_field_name("type")
-                        .map(|n| oneline(text(n, ctx.src)));
+                        .map(|n| oneline(text(n, ctx.src)))
+                        // Enum members are typed by their owning class
+                        .or_else(|| ctx.enum_types.last().cloned());
                     ctx.consts.push(Const {
                         line: pos(left).0,
                         name,
@@ -599,6 +671,237 @@ fn loose_call(node: Node, ctx: &Ctx) -> Option<CallSite> {
     })
 }
 
+// index one enum variant/enumerator as a const-like definition
+fn extract_variant(node: Node, ctx: &mut Ctx) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    // rust: enum_variant < enum_variant_list < enum_item(name);
+    // cpp: enumerator < enumerator_list < enum_specifier(name)
+    let ty = node
+        .parent()
+        .and_then(|list| list.parent())
+        .and_then(|e| e.child_by_field_name("name"))
+        .map(|n| oneline(text(n, ctx.src)));
+    ctx.consts.push(Const {
+        line: pos(name).0,
+        name: oneline(text(name, ctx.src)),
+        ty,
+    });
+}
+
+// ts `enum Color { Red, Green = 2 }` - members become const-like definitions
+// typed by the enum's name
+fn extract_ts_enum(node: Node, ctx: &mut Ctx) {
+    let ty = node
+        .child_by_field_name("name")
+        .map(|n| oneline(text(n, ctx.src)));
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.children(&mut cursor) {
+        let name_node = match member.kind() {
+            "property_identifier" => Some(member),
+            "enum_assignment" => member.child_by_field_name("name"),
+            _ => None,
+        };
+        if let Some(n) = name_node {
+            ctx.consts.push(Const {
+                line: pos(n).0,
+                name: oneline(text(n, ctx.src)),
+                ty: ty.clone(),
+            });
+        }
+    }
+}
+
+// record a qualified non-call usage (`Encoding::O200kBase`, `http.StatusOK`)
+// so `references`/`find` cover enum variants and consts, not just calls. Only
+// constant-like names (leading uppercase / SHOUTING_SNEK) are kept - lowercase
+// field and property accesses would drown the map in noise.
+fn maybe_use(node: Node, ctx: &mut Ctx) {
+    if ctx.import_depth > 0 {
+        return;
+    }
+    if let Some(parent) = node.parent() {
+        // the callee of a call is already recorded as a call site
+        let is_callee = ctx.lang.call_kinds().contains(&parent.kind())
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|f| f.id() == node.id());
+        // nested paths (`a::b::C`) record only at the outermost node
+        if is_callee || ctx.lang.use_kinds().contains(&parent.kind()) {
+            return;
+        }
+    }
+    let Some((qualifier, name)) = loose_name(node, ctx) else {
+        return;
+    };
+    if qualifier.is_none() || name.is_empty() {
+        return;
+    }
+    let constant_like = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        || is_shouting_snek(&name);
+    if !constant_like {
+        return;
+    }
+    ctx.uses.push(CallSite {
+        caller: ctx.caller(),
+        line: pos(node).0,
+        name,
+        qualifier,
+        test_ctx: ctx.test_mod_depth > 0,
+    });
+}
+
+// record an import/use/include statement in loose textual form: a module path
+// plus the names it binds locally. Parsed from the statement text rather than
+// the grammar so one function covers every language; `dependencies` matches
+// module segments and bound names against project file stems, so over-collecting
+// identifiers is harmless while under-collecting loses type-only edges.
+fn extract_import(node: Node, ctx: &mut Ctx) {
+    let line = pos(node).0;
+    let stmt = oneline(text(node, ctx.src));
+    for (module, names) in parse_import(ctx.lang, &stmt) {
+        ctx.imports.push(Import {
+            line,
+            module,
+            names,
+        });
+    }
+}
+
+// split one import statement into (module, bound names) pairs.
+fn parse_import(lang: Language, stmt: &str) -> Vec<(String, Vec<String>)> {
+    let idents = |s: &str| -> Vec<String> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty() && !matches!(*w, "as" | "self" | "type" | "crate" | "super"))
+            .map(str::to_string)
+            .collect()
+    };
+    // last `::`/`.`-separated segment of a path item, resolving `a as b` to
+    // both the real name and the alias
+    let item_names = |item: &str| -> Vec<String> {
+        let item = item.trim();
+        if item.is_empty() || item == "*" {
+            return Vec::new();
+        }
+        let (path, alias) = match item.split_once(" as ") {
+            Some((p, a)) => (p.trim(), Some(a.trim())),
+            None => (item, None),
+        };
+        let mut names = idents(path).last().cloned().into_iter().collect::<Vec<_>>();
+        if let Some(a) = alias {
+            names.extend(idents(a));
+        }
+        names
+    };
+    match lang {
+        Language::Rust => {
+            let Some(s) = stmt
+                .trim_start_matches("pub")
+                .trim()
+                .strip_prefix("use")
+            else {
+                return Vec::new();
+            };
+            let s = s.trim().trim_end_matches(';').trim();
+            match s.split_once('{') {
+                Some((prefix, rest)) => {
+                    let module = prefix.trim().trim_end_matches("::").to_string();
+                    let inner = rest.rsplit_once('}').map(|(i, _)| i).unwrap_or(rest);
+                    // flatten nested groups to identifiers - module segments
+                    // that leak in only ever match real module files
+                    vec![(module, idents(inner))]
+                }
+                None => match s.strip_suffix("::*") {
+                    Some(module) => vec![(module.to_string(), Vec::new())],
+                    None => {
+                        let module = s.rsplit_once("::").map(|(m, _)| m).unwrap_or("");
+                        vec![(module.to_string(), item_names(s))]
+                    }
+                },
+            }
+        }
+        Language::Python => {
+            if let Some(s) = stmt.trim().strip_prefix("from ") {
+                let Some((module, items)) = s.split_once(" import ") else {
+                    return Vec::new();
+                };
+                let names = items
+                    .trim()
+                    .trim_matches(|c| c == '(' || c == ')')
+                    .split(',')
+                    .flat_map(item_names)
+                    .collect();
+                vec![(module.trim().to_string(), names)]
+            } else if let Some(s) = stmt.trim().strip_prefix("import ") {
+                s.split(',')
+                    .filter(|i| !i.trim().is_empty())
+                    .map(|i| {
+                        let module = i
+                            .trim()
+                            .split_once(" as ")
+                            .map(|(m, _)| m.trim())
+                            .unwrap_or(i.trim());
+                        (module.to_string(), item_names(i))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            // module is the quoted source; bound names are everything between
+            // `import` and `from` (default, namespace, and named bindings)
+            let module = stmt
+                .split(['\'', '"'])
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let bound = stmt
+                .trim()
+                .strip_prefix("import")
+                .map(|s| s.split(" from ").next().unwrap_or(s))
+                .unwrap_or("");
+            vec![(module, idents(bound))]
+        }
+        Language::Go => {
+            // one or more `alias "path/to/pkg"` specs; the bound name is the
+            // alias when present, else the last path segment
+            let mut out = Vec::new();
+            let mut parts = stmt.split('"');
+            let mut before = parts.next().unwrap_or("").to_string();
+            while let (Some(path), Some(after)) = (parts.next(), parts.next()) {
+                let alias = idents(&before).pop().filter(|a| a != "import");
+                let names = alias
+                    .map(|a| vec![a])
+                    .unwrap_or_else(|| idents(path).last().cloned().into_iter().collect());
+                out.push((path.to_string(), names));
+                before = after.to_string();
+            }
+            out
+        }
+        Language::Cpp => {
+            if let Some(s) = stmt.trim().strip_prefix("#include") {
+                let module = s
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '<' || c == '>')
+                    .to_string();
+                vec![(module, Vec::new())]
+            } else if let Some(s) = stmt.trim().strip_prefix("using") {
+                let s = s.trim().trim_start_matches("namespace").trim();
+                let s = s.trim_end_matches(';').trim();
+                let module = s.rsplit_once("::").map(|(m, _)| m).unwrap_or(s);
+                vec![(module.to_string(), item_names(s))]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
 // Approximate calls inside a Rust macro token tree: an identifier directly
 // followed by a parenthesized token tree reads as a call (`charge(1)`); the
 // qualifier is the `path::` / `recv.` chain walked back from it. Nested token
@@ -659,8 +962,8 @@ fn loose_name(node: Node, ctx: &Ctx) -> Option<(Option<String>, String)> {
                 .or_else(|| node.child_by_field_name("argument")),
             node.child_by_field_name("field")?,
         ),
-        // rs `a::b`
-        "scoped_identifier" => named(
+        // rs `a::b` (value position) / `module::Type` (type position)
+        "scoped_identifier" | "scoped_type_identifier" => named(
             node.child_by_field_name("path"),
             node.child_by_field_name("name")?,
         ),
@@ -873,6 +1176,171 @@ fn strip_comment(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_imports_are_captured() {
+        let src = "use crate::model::{CallSite, Const};\n\
+                   use crate::{extract, naming};\n\
+                   use std::path::PathBuf;\n\
+                   use crate::render as r;\n\
+                   use crate::languages::*;\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        let by_module: Vec<(&str, Vec<&str>)> = ex
+            .imports
+            .iter()
+            .map(|i| {
+                (
+                    i.module.as_str(),
+                    i.names.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_module,
+            vec![
+                ("crate::model", vec!["CallSite", "Const"]),
+                ("crate", vec!["extract", "naming"]),
+                ("std::path", vec!["PathBuf"]),
+                ("crate", vec!["render", "r"]),
+                ("crate::languages", vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn python_and_js_imports_are_captured() {
+        let py = "import os.path\n\
+                  from mypkg.util import shrink, grow as g\n";
+        let ex = extract(Language::Python, py).unwrap();
+        assert_eq!(ex.imports[0].module, "os.path");
+        assert_eq!(ex.imports[0].names, vec!["path"]);
+        assert_eq!(ex.imports[1].module, "mypkg.util");
+        assert_eq!(ex.imports[1].names, vec!["shrink", "grow", "g"]);
+
+        let js = "import def, { a, b as c } from './util/helper';\n";
+        let ex = extract(Language::JavaScript, js).unwrap();
+        assert_eq!(ex.imports[0].module, "./util/helper");
+        assert_eq!(ex.imports[0].names, vec!["def", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn go_and_cpp_imports_are_captured() {
+        let go = "package main\n\
+                  import (\n\
+                      \"fmt\"\n\
+                      alias \"path/to/pkg\"\n\
+                  )\n";
+        let ex = extract(Language::Go, go).unwrap();
+        assert_eq!(ex.imports[0].module, "fmt");
+        assert_eq!(ex.imports[0].names, vec!["fmt"]);
+        assert_eq!(ex.imports[1].module, "path/to/pkg");
+        assert_eq!(ex.imports[1].names, vec!["alias"]);
+
+        let cpp = "#include \"scan.h\"\n\
+                   #include <vector>\n\
+                   using ns::helper;\n";
+        let ex = extract(Language::Cpp, cpp).unwrap();
+        assert_eq!(ex.imports[0].module, "scan.h");
+        assert!(ex.imports[0].names.is_empty());
+        assert_eq!(ex.imports[1].module, "vector");
+        assert_eq!(ex.imports[2].module, "ns");
+        assert_eq!(ex.imports[2].names, vec!["helper"]);
+    }
+
+    #[test]
+    fn rust_qualified_usages_are_captured() {
+        let src = "use other::Thing;\n\
+                   pub enum Encoding { O200kBase, Cl100kBase }\n\
+                   fn parse(s: &str) -> Option<Encoding> {\n\
+                       match s { \"o200k\" => Some(Encoding::O200kBase), _ => None }\n\
+                   }\n\
+                   fn label(e: Encoding) -> &'static str {\n\
+                       match e { Encoding::O200kBase => \"o200k\", _ => \"other\" }\n\
+                   }\n\
+                   fn build() -> String { tiktoken::o200k_base() }\n";
+        let ex = extract(Language::Rust, src).unwrap();
+
+        // variant used as a value (call argument) and as a match pattern
+        let uses: Vec<_> = ex.uses.iter().filter(|u| u.name == "O200kBase").collect();
+        assert_eq!(uses.len(), 2);
+        assert!(uses
+            .iter()
+            .all(|u| u.qualifier.as_deref() == Some("Encoding")));
+        assert!(uses.iter().any(|u| u.caller == "parse"));
+        assert!(uses.iter().any(|u| u.caller == "label"));
+        // imports are not usages
+        assert!(!ex.uses.iter().any(|u| u.name == "Thing"));
+        // a qualified callee stays a call, and lowercase names are not uses
+        assert!(!ex.uses.iter().any(|u| u.name == "o200k_base"));
+        assert!(ex
+            .calls
+            .iter()
+            .any(|c| c.name == "o200k_base" && c.qualifier.as_deref() == Some("tiktoken")));
+        // the variant declarations are const-like definitions typed by enum
+        assert!(ex
+            .consts
+            .iter()
+            .any(|c| c.name == "O200kBase" && c.ty.as_deref() == Some("Encoding")));
+        assert!(ex
+            .consts
+            .iter()
+            .any(|c| c.name == "Cl100kBase" && c.ty.as_deref() == Some("Encoding")));
+    }
+
+    #[test]
+    fn cpp_enumerators_are_const_defs() {
+        let src = "enum class Color { Red, Green };\n";
+        let ex = extract(Language::Cpp, src).unwrap();
+        assert!(ex
+            .consts
+            .iter()
+            .any(|c| c.name == "Red" && c.ty.as_deref() == Some("Color")));
+    }
+
+    #[test]
+    fn ts_enum_members_and_usages() {
+        let src = "enum Color { Red, Green = 2 }\n\
+                   function paint(): Color { return Color.Red; }\n";
+        let ex = extract(Language::TypeScript, src).unwrap();
+        assert!(ex
+            .consts
+            .iter()
+            .any(|c| c.name == "Red" && c.ty.as_deref() == Some("Color")));
+        assert!(ex
+            .consts
+            .iter()
+            .any(|c| c.name == "Green" && c.ty.as_deref() == Some("Color")));
+        assert!(ex.uses.iter().any(|u| u.name == "Red"
+            && u.qualifier.as_deref() == Some("Color")
+            && u.caller == "paint"));
+    }
+
+    #[test]
+    fn python_enum_class_members_are_const_defs() {
+        let src = "from enum import Enum\n\
+                   class Color(Enum):\n\
+                   \x20   RED = 1\n\
+                   \x20   GREEN = 2\n\
+                   class Plain:\n\
+                   \x20   SIZE = 4\n\
+                   BORING = 3\n\
+                   def paint():\n\
+                   \x20   return Color.RED\n";
+        let ex = extract(Language::Python, src).unwrap();
+        // Enum members become const defs typed by their class
+        assert!(ex
+            .consts
+            .iter()
+            .any(|c| c.name == "RED" && c.ty.as_deref() == Some("Color")));
+        // plain class attributes stay excluded, module consts unaffected
+        assert!(!ex.consts.iter().any(|c| c.name == "SIZE"));
+        assert!(ex.consts.iter().any(|c| c.name == "BORING"));
+        // the usage pairs up via the attribute capture
+        assert!(ex
+            .uses
+            .iter()
+            .any(|u| u.name == "RED" && u.qualifier.as_deref() == Some("Color")));
+    }
 
     #[test]
     fn rust_extraction() {

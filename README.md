@@ -13,7 +13,7 @@ Please ⭐ if you find this useful 💚
 
 ## Quick Start
 
-1. Install a prebuilt binary (Linux / macOS - auto-detects OS and architecture)
+1. Install the latest github release (Linux / macOS / Windows)
 
    ```sh
    curl -fsSL https://raw.githubusercontent.com/colwill/ccc/main/install.sh | bash
@@ -95,6 +95,10 @@ curl -s localhost:6767/references?symbol=charge # definitions + every call site
 curl -s localhost:6767/dependencies?file=src/render.rs   # file-level impact
 curl -s -X POST localhost:6767/refresh          # force an immediate rescan
 ```
+
+`find` and `references` also take qualified names (`serde_json::to_string`,
+`client.charge`): call sites are filtered by qualifier, so counting one
+module's calls needs no grep or client-side filtering.
 
 The same map is exposed to **MCP** clients (streamable HTTP transport) with
 tools `index` / `find` / `references` / `dependencies` / `file` / `notes` /

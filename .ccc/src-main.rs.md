@@ -1,6 +1,14 @@
-# main.rs.md (20260729-17-50-32) UTC
+# main.rs.md (20260729-22-00-57) UTC
 # source: src/main.rs [rust]
 # const
+    - L21@Text:OutputFormat
+    - L23@Json:OutputFormat
+    - L29@Scan:Command
+    - L38@Check:Command
+    - L45@Tokenize:Command
+    - L53@Surf:Command
+    - L84@Serve:Command
+    - L101@Install:Command
 # funcs
     - L111:4@main:ExitCode
     - L121:4@run:Result<ExitCode>
