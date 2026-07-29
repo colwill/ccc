@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
 author = "github.com/colwill"
-description = "Generate a ContextCodeCache (.ccc) directory for your project"
+description = "ContextCodeCache (.ccc) generates an agent friendly local source map"
 license = "MIT"
 
 [[bin]]
@@ -26,9 +26,14 @@ tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.25"
+tree-sitter-cpp = "0.23"
 tiktoken-rs = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# already in the tree via `ignore`; used directly for surf service globs
+globset = "0.4"
+# minimal synchronous HTTP server for `ccc serve` (no async runtime)
+tiny_http = "0.12"
 
 [profile.release]
 opt-level = 2

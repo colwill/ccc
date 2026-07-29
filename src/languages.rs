@@ -11,6 +11,7 @@ pub enum Language {
     TypeScript,
     Tsx,
     Go,
+    Cpp,
 }
 
 impl Language {
@@ -23,6 +24,7 @@ impl Language {
             "ts" | "mts" | "cts" => Language::TypeScript,
             "tsx" => Language::Tsx,
             "go" => Language::Go,
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "h" => Language::Cpp,
             _ => return None,
         })
     }
@@ -35,10 +37,11 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::Tsx => "tsx",
             Language::Go => "go",
+            Language::Cpp => "cpp",
         }
     }
 
-    /// tree-sitter grammar for this language
+    // tree-sitter grammar for this language
     pub fn ts_language(self) -> TsLanguage {
         match self {
             Language::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -47,10 +50,11 @@ impl Language {
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Language::Go => tree_sitter_go::LANGUAGE.into(),
+            Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
 
-    /// kinds that represent a function/method definition
+    // kinds that represent a function/method definition
     pub fn func_kinds(self) -> &'static [&'static str] {
         match self {
             Language::Rust => &["function_item", "function_signature_item"],
@@ -63,10 +67,11 @@ impl Language {
                 "arrow_function",
             ],
             Language::Go => &["function_declaration", "method_declaration"],
+            Language::Cpp => &["function_definition"],
         }
     }
 
-    /// kinds that represent a top-level constant/variable declaration
+    // kinds that represent a top-level constant/variable declaration
     pub fn const_kinds(self) -> &'static [&'static str] {
         match self {
             Language::Rust => &["const_item", "static_item"],
@@ -75,34 +80,40 @@ impl Language {
                 &["lexical_declaration", "variable_declaration"]
             }
             Language::Go => &["const_spec", "var_spec"],
+            Language::Cpp => &["declaration"],
         }
     }
 
-    /// kinds that represent a call expression
+    // kinds that represent a call expression
     pub fn call_kinds(self) -> &'static [&'static str] {
         match self {
             Language::Rust => &["call_expression"],
             Language::Python => &["call"],
             Language::JavaScript | Language::TypeScript | Language::Tsx => &["call_expression"],
             Language::Go => &["call_expression"],
+            Language::Cpp => &["call_expression"],
         }
     }
 
-    /// node kinds that represent a comment
+    // node kinds that represent a comment
     pub fn comment_kinds(self) -> &'static [&'static str] {
         match self {
             Language::Rust => &["line_comment", "block_comment"],
             Language::Python | Language::JavaScript | Language::TypeScript | Language::Tsx
             | Language::Go => &["comment"],
+            Language::Cpp => &["comment"],
         }
     }
 
-    /// field name holding a function's return type (if the grammar has one)
+    // field name holding a function's return type (if the grammar has one)
     pub fn return_field(self) -> Option<&'static str> {
         match self {
             Language::Rust | Language::Python => Some("return_type"),
             Language::TypeScript | Language::Tsx => Some("return_type"),
             Language::Go => Some("result"),
+            // C++ carries the return type in the `type` field of a
+            // `function_definition` (pointer/ref markers live on the declarator).
+            Language::Cpp => Some("type"),
             Language::JavaScript => None,
         }
     }

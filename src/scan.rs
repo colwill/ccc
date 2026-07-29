@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// don't scan these dirs even with `.gitignore`
+// don't scan these dirs even with `.gitignore`
 const SKIP_DIRS: &[&str] = &[
     ".ccc",
     ".git",
@@ -26,7 +26,7 @@ const SKIP_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
-/// skip lage files
+// skip lage files
 const MAX_FILE_BYTES: u64 = 2_000_000;
 
 pub struct ScanReport {
@@ -40,14 +40,14 @@ pub struct CheckReport {
     pub changes: Vec<Change>,
 }
 
-/// How a committed cache file differs from what a fresh scan would produce.
+// How a committed cache file differs from what a fresh scan would produce.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChangeKind {
-    /// Present, but its content (ignoring timestamps) differs.
+    // Present, but its content (ignoring timestamps) differs.
     Modified,
-    /// A cache file a fresh scan would write is absent.
+    // A cache file a fresh scan would write is absent.
     Missing,
-    /// A committed cache file a fresh scan would no longer write.
+    // A committed cache file a fresh scan would no longer write.
     Stale,
 }
 
@@ -61,15 +61,15 @@ impl ChangeKind {
     }
 }
 
-/// A single out-of-date cache file reported by [`check`].
+// A single out-of-date cache file reported by [`check`].
 #[derive(Clone, Debug)]
 pub struct Change {
     pub kind: ChangeKind,
-    /// Cache file name inside `.ccc`, e.g. `src-main.rs.md`.
+    // Cache file name inside `.ccc`, e.g. `src-main.rs.md`.
     pub file: String,
 }
 
-/// Discover supported source files under `root`
+// Discover supported source files under `root`
 pub fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let walker = WalkBuilder::new(root)
@@ -109,7 +109,7 @@ pub fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// parse every discovered file into a `FileCache`, sorted by path
+// parse every discovered file into a `FileCache`, sorted by path
 pub fn build_caches(root: &Path, files: &[PathBuf]) -> Vec<FileCache> {
     let mut caches: Vec<FileCache> = files.iter().filter_map(|p| build_one(root, p)).collect();
     caches.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -117,7 +117,7 @@ pub fn build_caches(root: &Path, files: &[PathBuf]) -> Vec<FileCache> {
     caches
 }
 
-/// fixes bug where cache_name wasnt unique oops
+// fixes bug where cache_name wasnt unique oops
 fn disambiguate_cache_names(caches: &mut [FileCache]) {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for c in caches.iter() {
@@ -149,6 +149,7 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
         funcs: ex.funcs,
         refs: ex.refs,
         notes: ex.notes,
+        calls: ex.calls,
     })
 }
 
@@ -161,7 +162,7 @@ fn render_all(root: &Path, caches: &[FileCache], ts: &str) -> BTreeMap<String, S
     map
 }
 
-/// scan root and (re)write the `.ccc` directory
+// scan root and (re)write the `.ccc` directory
 pub fn scan(root: &Path) -> Result<ScanReport> {
     let files = collect_files(root)?;
     let caches = build_caches(root, &files);
@@ -188,7 +189,7 @@ pub fn scan(root: &Path) -> Result<ScanReport> {
     })
 }
 
-/// verify .ccc outputs for CI
+// verify .ccc outputs for CI
 pub fn check(root: &Path) -> Result<CheckReport> {
     let files = collect_files(root)?;
     let caches = build_caches(root, &files);

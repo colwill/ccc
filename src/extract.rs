@@ -1,7 +1,7 @@
 //! tree-sitter based extraction of symbols from a single source file
 
 use crate::languages::Language;
-use crate::model::{Const, Func, Note, Ref};
+use crate::model::{CallSite, Const, Func, Note, Ref};
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
 
@@ -10,6 +10,8 @@ pub struct Extracted {
     pub funcs: Vec<Func>,
     pub refs: Vec<Ref>,
     pub notes: Vec<Note>,
+    // every call site in loose (name + qualifier) form, for `surf`
+    pub calls: Vec<CallSite>,
 }
 
 enum CallKind {
@@ -25,7 +27,7 @@ struct RawCall {
 
 enum Scope {
     Func(String),
-    /// `recv` used to recognise self-calls
+    // `recv` used to recognise self-calls
     Type { name: String, recv: Option<String> },
 }
 
@@ -36,13 +38,17 @@ struct Ctx<'a> {
     funcs: Vec<Func>,
     notes: Vec<Note>,
     calls: Vec<RawCall>,
+    // every call in loose form (superset of `calls`), kept for `surf`
+    loose_calls: Vec<CallSite>,
     free_index: HashMap<String, (usize, usize, Option<String>)>,
     method_index: HashMap<(String, String), (usize, usize, Option<String>)>,
     scope_stack: Vec<Scope>,
+    // > 0 while inside a Rust `mod tests`-style container
+    test_mod_depth: usize,
 }
 
 impl Ctx<'_> {
-    /// nearest enclosing function name for caller attribution
+    // nearest enclosing function name for caller attribution
     fn caller(&self) -> String {
         self.scope_stack
             .iter()
@@ -54,8 +60,8 @@ impl Ctx<'_> {
             .unwrap_or_else(|| "<top>".to_string())
     }
 
-    /// nearest enclosing type scope (its name and receiver token) used to
-    /// resolve self-calls to a method of that type
+    // nearest enclosing type scope (its name and receiver token) used to
+    // resolve self-calls to a method of that type
     fn current_type(&self) -> Option<(String, Option<String>)> {
         self.scope_stack.iter().rev().find_map(|s| match s {
             Scope::Type { name, recv } => Some((name.clone(), recv.clone())),
@@ -74,8 +80,8 @@ impl Ctx<'_> {
     }
 }
 
-/// parse `src` as `lang` and extract its symbols returns `None` if the source
-/// cannot be parsed at all
+// parse `src` as `lang` and extract its symbols returns `None` if the source
+// cannot be parsed at all
 pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
     let mut parser = Parser::new();
     parser.set_language(&lang.ts_language()).ok()?;
@@ -88,9 +94,11 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         funcs: Vec::new(),
         notes: Vec::new(),
         calls: Vec::new(),
+        loose_calls: Vec::new(),
         free_index: HashMap::new(),
         method_index: HashMap::new(),
         scope_stack: Vec::new(),
+        test_mod_depth: 0,
     };
     visit(tree.root_node(), &mut ctx);
 
@@ -126,12 +134,15 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
     ctx.funcs.sort_by_key(|f| (f.line, f.col));
     ctx.consts.sort_by_key(|c| c.line);
     ctx.notes.sort_by_key(|n| n.line);
+    ctx.loose_calls
+        .sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
 
     Some(Extracted {
         consts: ctx.consts,
         funcs: ctx.funcs,
         refs,
         notes: ctx.notes,
+        calls: ctx.loose_calls,
     })
 }
 
@@ -139,6 +150,18 @@ fn visit(node: Node, ctx: &mut Ctx) {
     let kind = node.kind();
     let lang = ctx.lang;
     let mut pushed = 0usize;
+
+    // rust unit tests conventionally live in an inline `mod tests`; track it so
+    // call sites inside are flagged as test context for `surf`
+    let test_mod = lang == Language::Rust
+        && kind == "mod_item"
+        && node
+            .child_by_field_name("name")
+            .map(|n| text(n, ctx.src).to_ascii_lowercase().contains("test"))
+            .unwrap_or(false);
+    if test_mod {
+        ctx.test_mod_depth += 1;
+    }
 
     if let Some((name, recv)) = type_scope(node, ctx) {
         ctx.scope_stack.push(Scope::Type { name, recv });
@@ -166,6 +189,13 @@ fn visit(node: Node, ctx: &mut Ctx) {
                     ctx.scope_stack.push(Scope::Type { name: ty, recv });
                     pushed += 1;
                 }
+            } else if lang == Language::Cpp {
+                // out-of-line `Class::method` bodies aren't nested in the class,
+                // so push its type scope to resolve `this->` calls within.
+                if let Some((ty, recv)) = cpp_qualified_owner(node, ctx) {
+                    ctx.scope_stack.push(Scope::Type { name: ty, recv });
+                    pushed += 1;
+                }
             }
             ctx.scope_stack.push(Scope::Func(name));
             pushed += 1;
@@ -178,8 +208,17 @@ fn visit(node: Node, ctx: &mut Ctx) {
         if let Some(call) = classify_call(node, ctx) {
             ctx.calls.push(call);
         }
+        // independently record the loose form (kept even when the precise
+        // classifier declines) - `surf` matches these across services
+        if let Some(site) = loose_call(node, ctx) {
+            ctx.loose_calls.push(site);
+        }
     } else if lang.comment_kinds().contains(&kind) {
         maybe_note(node, ctx);
+    } else if lang == Language::Rust && kind == "token_tree" {
+        // macro bodies (`assert_eq!(charge(1), 31)`) are token trees, not
+        // expressions - approximate the calls inside so `surf` sees them
+        scan_macro_tokens(node, ctx);
     }
 
     let mut cursor = node.walk();
@@ -188,6 +227,9 @@ fn visit(node: Node, ctx: &mut Ctx) {
     }
     for _ in 0..pushed {
         ctx.scope_stack.pop();
+    }
+    if test_mod {
+        ctx.test_mod_depth -= 1;
     }
 }
 
@@ -206,19 +248,56 @@ fn type_scope(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
             Language::JavaScript | Language::TypeScript | Language::Tsx,
             "class_declaration" | "class" | "abstract_class_declaration",
         ) => Some((name_of("name")?, Some("this".to_string()))),
+        (Language::Cpp, "class_specifier" | "struct_specifier") => {
+            Some((name_of("name")?, Some("this".to_string())))
+        }
         _ => None,
     }
 }
 
-/// if it is a method the enclosing type scope or for go... the method's own receiver
+// if it is a method the enclosing type scope or for go... the method's own receiver
 fn func_owner(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
     if ctx.lang == Language::Go && node.kind() == "method_declaration" {
         return go_receiver(node, ctx.src);
+    }
+    // C++ methods are often defined out of line as `Class::method` rather than
+    // nested inside the class body, so the owner comes from the qualified name.
+    if ctx.lang == Language::Cpp {
+        if let Some(owner) = cpp_qualified_owner(node, ctx) {
+            return Some(owner);
+        }
     }
     match ctx.scope_stack.last() {
         Some(Scope::Type { name, recv }) => Some((name.clone(), recv.clone())),
         _ => None,
     }
+}
+
+// declarator chain of a C++ `function_definition`, stepping through pointer /
+// reference declarators to the innermost `function_declarator`
+fn cpp_function_declarator(node: Node) -> Option<Node> {
+    let mut cur = node.child_by_field_name("declarator")?;
+    loop {
+        match cur.kind() {
+            "function_declarator" => return Some(cur),
+            "pointer_declarator" | "reference_declarator" | "parenthesized_declarator" => {
+                cur = cur.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+// For an out-of-line C++ definition `Class::method`, the owning type (`Class`)
+// with a `this` receiver. Returns `None` for free functions and in-body methods.
+fn cpp_qualified_owner(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
+    let decl = cpp_function_declarator(node)?;
+    let name = decl.child_by_field_name("declarator")?;
+    if name.kind() == "qualified_identifier" {
+        let scope = name.child_by_field_name("scope")?;
+        return Some((oneline(text(scope, ctx.src)), Some("this".to_string())));
+    }
+    None
 }
 
 fn go_receiver(node: Node, src: &str) -> Option<(String, Option<String>)> {
@@ -244,15 +323,18 @@ fn const_eligible(ctx: &Ctx) -> bool {
         return false;
     }
     match ctx.lang {
-        Language::Python | Language::JavaScript | Language::TypeScript | Language::Tsx => {
-            !ctx.in_type()
-        }
+        // treat class/struct members as not module-level consts
+        Language::Python
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Tsx
+        | Language::Cpp => !ctx.in_type(),
         Language::Rust | Language::Go => true,
     }
 }
 
-/// extract a function definition; returns `None` for anonymous functions we
-/// cannot name
+// extract a function definition; returns `None` for anonymous functions we
+// cannot name
 fn extract_func(node: Node, ctx: &Ctx) -> Option<Func> {
     let (name, name_node) = func_name(node, ctx)?;
     let (line, col) = pos(name_node);
@@ -264,10 +346,18 @@ fn extract_func(node: Node, ctx: &Ctx) -> Option<Func> {
         name,
         ret,
         comment,
+        // whole-definition span (covers multi-line signatures and the body)
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+        test_ctx: ctx.test_mod_depth > 0,
     })
 }
 
 fn func_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
+    // C++ has no `name` field: the name is buried in the declarator chain.
+    if ctx.lang == Language::Cpp {
+        return cpp_func_name(node, ctx);
+    }
     if let Some(n) = node.child_by_field_name("name") {
         return Some((oneline(text(n, ctx.src)), n));
     }
@@ -281,6 +371,32 @@ fn func_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
         }
     }
     None
+}
+
+// C++ `function_definition` name: descend the declarator chain to the
+// `function_declarator`, then read its name (identifier / field / qualified /
+// operator / destructor).
+fn cpp_func_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
+    let decl = cpp_function_declarator(node)?;
+    cpp_declarator_name(decl.child_by_field_name("declarator")?, ctx)
+}
+
+// Resolve the various shapes a C++ declarator name can take to a display name
+// and the node to anchor its line/column on.
+fn cpp_declarator_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" | "operator_name"
+        | "destructor_name" => Some((oneline(text(node, ctx.src)), node)),
+        // `Class::method` -> use the trailing name; the scope is the owner
+        "qualified_identifier" => {
+            cpp_declarator_name(node.child_by_field_name("name")?, ctx)
+        }
+        // `foo<T>` templated definition
+        "template_function" | "template_type" => {
+            cpp_declarator_name(node.child_by_field_name("name")?, ctx)
+        }
+        _ => None,
+    }
 }
 
 fn func_return(node: Node, ctx: &Ctx) -> Option<String> {
@@ -380,6 +496,65 @@ fn extract_consts(node: Node, ctx: &mut Ctx) {
                 }
             }
         }
+        Language::Cpp => {
+            // only `const`/`constexpr`/... declarations count as consts; plain
+            // `int x = 5;` and function prototypes are skipped.
+            if !cpp_is_const_decl(node, ctx.src) {
+                return;
+            }
+            let ty = node
+                .child_by_field_name("type")
+                .map(|n| oneline(text(n, ctx.src)));
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some((name, name_node)) = cpp_const_declarator_name(child, ctx) {
+                    ctx.consts.push(Const {
+                        line: pos(name_node).0,
+                        name,
+                        ty: ty.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+// True if a C++ `declaration` carries a `const`/`constexpr`/... qualifier.
+fn cpp_is_const_decl(node: Node, src: &str) -> bool {
+    let mut cursor = node.walk();
+    let is_const = node.children(&mut cursor).any(|c| {
+        matches!(
+            text(c, src).trim(),
+            "const" | "constexpr" | "constinit" | "consteval"
+        )
+    });
+    is_const
+}
+
+// Name of a single C++ declarator within a `declaration`, if it is a plain
+// (possibly initialised) variable. Skips function prototypes and other shapes.
+fn cpp_const_declarator_name<'a>(child: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
+    let inner = match child.kind() {
+        "init_declarator" => child.child_by_field_name("declarator")?,
+        "identifier" => return Some((oneline(text(child, ctx.src)), child)),
+        _ => return None,
+    };
+    cpp_plain_name(inner, ctx)
+}
+
+// Step through pointer / reference / array declarators to a bare identifier.
+// Returns `None` on a `function_declarator` (a prototype, not a constant).
+fn cpp_plain_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
+    let mut cur = node;
+    loop {
+        match cur.kind() {
+            "identifier" => return Some((oneline(text(cur, ctx.src)), cur)),
+            "pointer_declarator" | "reference_declarator" | "array_declarator"
+            | "init_declarator" => {
+                cur = cur.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -406,14 +581,132 @@ fn classify_call(node: Node, ctx: &Ctx) -> Option<RawCall> {
     })
 }
 
-/// reduce a call target expression to a [`CallKind`]
+// record any call in loose form: rightmost identifier as the name, whatever
+// sits left of it as the qualifier. Unlike [`resolve_callee`] this never
+// requires the receiver to be `self`-like - `surf` wants the superset.
+fn loose_call(node: Node, ctx: &Ctx) -> Option<CallSite> {
+    let callee = node.child_by_field_name("function")?;
+    let (qualifier, name) = loose_name(callee, ctx)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(CallSite {
+        caller: ctx.caller(),
+        line: pos(callee).0,
+        name,
+        qualifier,
+        test_ctx: ctx.test_mod_depth > 0,
+    })
+}
+
+// Approximate calls inside a Rust macro token tree: an identifier directly
+// followed by a parenthesized token tree reads as a call (`charge(1)`); the
+// qualifier is the `path::` / `recv.` chain walked back from it. Nested token
+// trees are handled by the recursive visit.
+fn scan_macro_tokens(node: Node, ctx: &mut Ctx) {
+    for i in 0..node.child_count() {
+        let Some(id) = node.child(i) else { continue };
+        if id.kind() != "identifier" {
+            continue;
+        }
+        let Some(next) = node.child(i + 1) else { continue };
+        if next.kind() != "token_tree" || !text(next, ctx.src).starts_with('(') {
+            continue;
+        }
+        // walk back over `<ident> ::` / `<ident> .` pairs
+        let mut parts: Vec<String> = Vec::new();
+        let mut j = i;
+        while j >= 2 {
+            match (node.child(j - 2), node.child(j - 1)) {
+                (Some(q), Some(sep))
+                    if matches!(sep.kind(), "::" | ".") && q.kind() == "identifier" =>
+                {
+                    parts.push(text(q, ctx.src).to_string());
+                    j -= 2;
+                }
+                _ => break,
+            }
+        }
+        parts.reverse();
+        let qualifier = if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("::"))
+        };
+        ctx.loose_calls.push(CallSite {
+            caller: ctx.caller(),
+            line: pos(id).0,
+            name: oneline(text(id, ctx.src)),
+            qualifier,
+            test_ctx: ctx.test_mod_depth > 0,
+        });
+    }
+}
+
+// split a callee expression into (qualifier, rightmost name)
+fn loose_name(node: Node, ctx: &Ctx) -> Option<(Option<String>, String)> {
+    let src = ctx.src;
+    let named = |q: Option<Node>, n: Node| {
+        Some((q.map(|q| oneline(text(q, src))), oneline(text(n, src))))
+    };
+    match node.kind() {
+        "identifier" | "type_identifier" | "field_identifier" => {
+            Some((None, oneline(text(node, src))))
+        }
+        // rs `a.b` / cpp `a.b` `this->b`
+        "field_expression" => named(
+            node.child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("argument")),
+            node.child_by_field_name("field")?,
+        ),
+        // rs `a::b`
+        "scoped_identifier" => named(
+            node.child_by_field_name("path"),
+            node.child_by_field_name("name")?,
+        ),
+        // cpp `geo::square`
+        "qualified_identifier" => {
+            let name = node.child_by_field_name("name")?;
+            // nested qualifiers (`a::b::c`) - recurse on the name side
+            if name.kind() == "qualified_identifier" {
+                return loose_name(name, ctx);
+            }
+            named(node.child_by_field_name("scope"), name)
+        }
+        // py `a.b`
+        "attribute" => named(
+            node.child_by_field_name("object"),
+            node.child_by_field_name("attribute")?,
+        ),
+        // js/ts `a.b`
+        "member_expression" => named(
+            node.child_by_field_name("object"),
+            node.child_by_field_name("property")?,
+        ),
+        // go `a.b`
+        "selector_expression" => named(
+            node.child_by_field_name("operand"),
+            node.child_by_field_name("field")?,
+        ),
+        // rs `foo::<T>` / cpp `foo<T>`
+        "generic_function" | "template_function" => node
+            .child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("name"))
+            .and_then(|f| loose_name(f, ctx)),
+        _ => None,
+    }
+}
+
+// reduce a call target expression to a [`CallKind`]
 fn resolve_callee(node: Node, ctx: &Ctx) -> Option<CallKind> {
     let src = ctx.src;
     match node.kind() {
         "identifier" | "type_identifier" => Some(CallKind::Free(oneline(text(node, src)))),
-        // rs: `a.b()` / `self.b()`
+        // rs: `a.b()` / `self.b()`  |  cpp: `a.b()` / `this->b()` (`argument` field)
         "field_expression" => {
-            let obj = node.child_by_field_name("value")?;
+            let obj = node
+                .child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("argument"))?;
             let name = oneline(text(node.child_by_field_name("field")?, src));
             self_method(obj, name, ctx)
         }
@@ -488,8 +781,8 @@ fn maybe_note(node: Node, ctx: &mut Ctx) {
     });
 }
 
-/// nearest comment immediately preceding a function definition, used as its
-/// one-line inline/doc comment
+// nearest comment immediately preceding a function definition, used as its
+// one-line inline/doc comment
 fn preceding_comment(node: Node, ctx: &Ctx) -> Option<String> {
     let is_comment = |n: &Node| ctx.lang.comment_kinds().contains(&n.kind());
 
@@ -538,13 +831,13 @@ fn text<'a>(node: Node, src: &'a str) -> &'a str {
     &src[node.byte_range()]
 }
 
-/// 1-based (line, column) of a node's start
+// 1-based (line, column) of a node's start
 fn pos(node: Node) -> (usize, usize) {
     let p = node.start_position();
     (p.row + 1, p.column + 1)
 }
 
-/// collapse all runs of whitespace to single spaces and trim
+// collapse all runs of whitespace to single spaces and trim
 fn oneline(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -558,7 +851,7 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// strip common comment delimiters from a raw comment token
+// strip common comment delimiters from a raw comment token
 fn strip_comment(raw: &str) -> String {
     let mut s = raw.trim();
     for p in ["///", "//!", "//", "#!", "#", "/**", "/*", "*/"] {
@@ -584,8 +877,8 @@ mod tests {
     #[test]
     fn rust_extraction() {
         let src = "const MAX: usize = 10;\n\
-                   /// Doc summary.\n\
-                   /// second line.\n\
+                   // Doc summary.\n\
+                   // second line.\n\
                    fn helper(x: i32) -> i32 { x + 1 }\n\
                    fn run() { let _ = helper(MAX as i32); }\n";
         let ex = extract(Language::Rust, src).unwrap();
@@ -688,6 +981,85 @@ mod tests {
         assert!(!ex.consts.iter().any(|c| c.name == "ratio"));
         // class attribute is not a module const
         assert!(!ex.consts.iter().any(|c| c.name == "ATTR"));
+    }
+
+    #[test]
+    fn rust_macro_calls_and_test_mod_are_loose_calls() {
+        let src = "pub fn charge(c: u64) -> u64 { c }\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       #[test]\n\
+                       fn works() { assert_eq!(billing::charge(1), 1); }\n\
+                   }\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        // the call inside assert_eq! is captured, with its path qualifier,
+        // and flagged as test context via the enclosing `mod tests`
+        let call = ex
+            .calls
+            .iter()
+            .find(|c| c.name == "charge")
+            .expect("macro-wrapped call captured");
+        assert_eq!(call.qualifier.as_deref(), Some("billing"));
+        assert!(call.test_ctx);
+        // the test fn itself carries test_ctx; the top-level fn does not
+        assert!(ex.funcs.iter().any(|f| f.name == "works" && f.test_ctx));
+        assert!(ex.funcs.iter().any(|f| f.name == "charge" && !f.test_ctx));
+    }
+
+    #[test]
+    fn cpp_extraction() {
+        let src = "const double PI = 3.14159;\n\
+                   constexpr int SIDES = 4;\n\
+                   int plain = 7;\n\
+                   // Square a number.\n\
+                   int square(int x) { return x * x; }\n\
+                   int run() { return square(SIDES); }\n";
+        let ex = extract(Language::Cpp, src).unwrap();
+
+        // const / constexpr are consts; a plain (non-const) int is not.
+        assert!(ex.consts.iter().any(|c| c.name == "PI"
+            && c.ty.as_deref() == Some("double")));
+        assert!(ex.consts.iter().any(|c| c.name == "SIDES"));
+        assert!(!ex.consts.iter().any(|c| c.name == "plain"));
+
+        let square = ex.funcs.iter().find(|f| f.name == "square").unwrap();
+        assert_eq!(square.ret.as_deref(), Some("int"));
+        assert_eq!(square.comment.as_deref(), Some("Square a number."));
+
+        assert!(ex
+            .refs
+            .iter()
+            .any(|r| r.caller == "run" && r.target_name == "square"));
+    }
+
+    #[test]
+    fn cpp_out_of_line_method_and_self_call() {
+        // `Circle::area` is defined outside the class body; it must be named
+        // `area`, attributed to `Circle`, and `this->scaled()` must resolve to
+        // the same class's method.
+        let src = "class Circle {\n\
+                   public:\n\
+                       double area();\n\
+                       double twice() { return this->scaled(2.0); }\n\
+                   private:\n\
+                       double scaled(double k) { return k; }\n\
+                   };\n\
+                   double Circle::area() { return this->scaled(1.0); }\n";
+        let ex = extract(Language::Cpp, src).unwrap();
+
+        // out-of-line definition is named by its trailing identifier, not qualified
+        assert!(ex.funcs.iter().any(|f| f.name == "area"));
+        // in-body `this->scaled()` resolves to the private method
+        assert!(ex
+            .refs
+            .iter()
+            .any(|r| r.caller == "twice" && r.target_name == "scaled"));
+        // `this->scaled()` in the OUT-OF-LINE body resolves via the qualified
+        // owner scope pushed for `Circle::area`.
+        assert!(ex
+            .refs
+            .iter()
+            .any(|r| r.caller == "area" && r.target_name == "scaled"));
     }
 
     #[test]

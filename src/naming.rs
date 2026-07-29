@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path};
 
-/// name of the cache file inside `.ccc`, e.g. `src/extract.rs` -> `src-extract.rs.md`
+// name of the cache file inside `.ccc`, e.g. `src/extract.rs` -> `src-extract.rs.md`
 pub fn cache_name(rel_path: &Path) -> String {
     cache_name_inner(rel_path, None)
 }

@@ -1,9 +1,9 @@
-# model.rs.md (20260703-15-47-40) UTC
+# model.rs.md (20260729-17-50-32) UTC
 # source: src/model.rs [rust]
 # const
 # funcs
-    - L58:12@counts:Counts
-    - L77:12@add
+    - L83:12@counts:Counts
+    - L102:12@add
 # refs
 # note
-    - @L36 A free-form note (TODO/FIXME/NOTE/...).
+    - @L59 A free-form note (TODO/FIXME/NOTE/...).

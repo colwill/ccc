@@ -1,130 +1,184 @@
-# extract.rs.md (20260703-15-47-40) UTC
+# extract.rs.md (20260729-17-50-32) UTC
 # source: src/extract.rs [rust]
 # const
-    - L475@MARKERS:&[&str]
+    - L762@MARKERS:&[&str]
 # funcs
     - L52:8@caller:String // nearest enclosing function name for caller attribution
     - L65:8@current_type:Option<(String, Option<String>)> // nearest enclosing type scope (its name and receiver token) used to
     - L72:8@in_function:bool
     - L76:8@in_type:bool
     - L85:8@extract:Option<Extracted> // parse `src` as `lang` and extract its symbols returns `None` if the source
-    - L144:4@visit
-    - L200:4@type_scope:Option<(String, Option<String>)>
-    - L220:4@func_owner:Option<(String, Option<String>)> // if it is a method the enclosing type scope or for go... the method's own receiver
-    - L230:4@go_receiver:Option<(String, Option<String>)>
-    - L248:4@const_eligible:bool
-    - L262:4@extract_func:Option<Func> // extract a function definition; returns `None` for anonymous functions we
-    - L276:4@func_name:Option<(String, Node<'a>)>
-    - L292:4@func_return:Option<String>
-    - L307:4@extract_consts
-    - L393:4@is_shouting_snek:bool
-    - L399:4@has_const_keyword:bool
-    - L405:4@classify_call:Option<RawCall>
-    - L416:4@resolve_callee:Option<CallKind> // reduce a call target expression to a [`CallKind`]
-    - L465:4@self_method:Option<CallKind>
-    - L477:4@maybe_note
-    - L499:4@preceding_comment:Option<String> // nearest comment immediately preceding a function definition, used as its
-    - L543:4@text:&'a str
-    - L548:4@pos:(usize, usize) // 1-based (line, column) of a node's start
-    - L554:4@oneline:String // collapse all runs of whitespace to single spaces and trim
-    - L558:4@truncate:String
-    - L568:4@strip_comment:String // strip common comment delimiters from a raw comment token
-    - L591:8@rust_extraction
-    - L615:8@go_const_block_and_call
-    - L629:8@ts_arrow_is_a_func
-    - L640:8@note_marker_word_boundary
-    - L652:8@qualified_call_does_not_bind_to_local_name
-    - L672:8@self_method_calls_resolve_by_type
-    - L688:8@python_only_shouting_snek_is_const
-    - L700:8@js_let_is_not_a_const
+    - L149:4@visit
+    - L236:4@type_scope:Option<(String, Option<String>)>
+    - L259:4@func_owner:Option<(String, Option<String>)> // if it is a method the enclosing type scope or for go... the method's own receiver
+    - L278:4@cpp_function_declarator:Option<Node> // declarator chain of a C++ `function_definition`, stepping through pointer /
+    - L293:4@cpp_qualified_owner:Option<(String, Option<String>)> // For an out-of-line C++ definition `Class::method`, the owning type (`Class`)
+    - L303:4@go_receiver:Option<(String, Option<String>)>
+    - L321:4@const_eligible:bool
+    - L338:4@extract_func:Option<Func> // extract a function definition; returns `None` for anonymous functions we
+    - L356:4@func_name:Option<(String, Node<'a>)>
+    - L379:4@cpp_func_name:Option<(String, Node<'a>)> // C++ `function_definition` name: descend the declarator chain to the
+    - L386:4@cpp_declarator_name:Option<(String, Node<'a>)> // Resolve the various shapes a C++ declarator name can take to a display name
+    - L402:4@func_return:Option<String>
+    - L417:4@extract_consts
+    - L523:4@cpp_is_const_decl:bool // True if a C++ `declaration` carries a `const`/`constexpr`/... qualifier.
+    - L536:4@cpp_const_declarator_name:Option<(String, Node<'a>)> // Name of a single C++ declarator within a `declaration`, if it is a plain
+    - L547:4@cpp_plain_name:Option<(String, Node<'a>)> // Step through pointer / reference / array declarators to a bare identifier.
+    - L562:4@is_shouting_snek:bool
+    - L568:4@has_const_keyword:bool
+    - L574:4@classify_call:Option<RawCall>
+    - L587:4@loose_call:Option<CallSite> // record any call in loose form: rightmost identifier as the name, whatever
+    - L606:4@scan_macro_tokens // Approximate calls inside a Rust macro token tree: an identifier directly
+    - L647:4@loose_name:Option<(Option<String>, String)> // split a callee expression into (qualifier, rightmost name)
+    - L701:4@resolve_callee:Option<CallKind> // reduce a call target expression to a [`CallKind`]
+    - L752:4@self_method:Option<CallKind>
+    - L764:4@maybe_note
+    - L786:4@preceding_comment:Option<String> // nearest comment immediately preceding a function definition, used as its
+    - L830:4@text:&'a str
+    - L835:4@pos:(usize, usize) // 1-based (line, column) of a node's start
+    - L841:4@oneline:String // collapse all runs of whitespace to single spaces and trim
+    - L845:4@truncate:String
+    - L855:4@strip_comment:String // strip common comment delimiters from a raw comment token
+    - L878:8@rust_extraction
+    - L902:8@go_const_block_and_call
+    - L916:8@ts_arrow_is_a_func
+    - L927:8@note_marker_word_boundary
+    - L939:8@qualified_call_does_not_bind_to_local_name
+    - L959:8@self_method_calls_resolve_by_type
+    - L975:8@python_only_shouting_snek_is_const
+    - L987:8@rust_macro_calls_and_test_mod_are_loose_calls
+    - L1010:8@cpp_extraction
+    - L1036:8@cpp_out_of_line_method_and_self_call
+    - L1066:8@js_let_is_not_a_const
 # refs
-    - extract@L101 calls L144:4@visit
-    - visit@L149 calls L200:4@type_scope:Option<(String, Option<String>)>
-    - visit@L153 calls L262:4@extract_func:Option<Func>
-    - visit@L154 calls L220:4@func_owner:Option<(String, Option<String>)>
-    - visit@L180 calls L248:4@const_eligible:bool
-    - visit@L181 calls L307:4@extract_consts
-    - visit@L184 calls L405:4@classify_call:Option<RawCall>
-    - visit@L188 calls L477:4@maybe_note
-    - visit@L193 calls L144:4@visit
-    - type_scope@L203 calls L554:4@oneline:String
-    - type_scope@L203 calls L543:4@text:&'a str
-    - func_owner@L222 calls L230:4@go_receiver:Option<(String, Option<String>)>
-    - go_receiver@L238 calls L554:4@oneline:String
-    - go_receiver@L238 calls L543:4@text:&'a str
-    - go_receiver@L242 calls L554:4@oneline:String
-    - go_receiver@L242 calls L543:4@text:&'a str
-    - extract_func@L263 calls L276:4@func_name:Option<(String, Node<'a>)>
-    - extract_func@L264 calls L548:4@pos:(usize, usize)
-    - extract_func@L265 calls L292:4@func_return:Option<String>
-    - extract_func@L266 calls L499:4@preceding_comment:Option<String>
-    - func_name@L278 calls L554:4@oneline:String
-    - func_name@L278 calls L543:4@text:&'a str
-    - func_name@L285 calls L554:4@oneline:String
-    - func_name@L285 calls L543:4@text:&'a str
-    - func_return@L295 calls L554:4@oneline:String
-    - func_return@L295 calls L543:4@text:&'a str
-    - extract_consts@L313 calls L554:4@oneline:String
-    - extract_consts@L313 calls L543:4@text:&'a str
-    - extract_consts@L315 calls L548:4@pos:(usize, usize)
-    - extract_consts@L316 calls L554:4@oneline:String
-    - extract_consts@L316 calls L543:4@text:&'a str
-    - extract_consts@L324 calls L554:4@oneline:String
-    - extract_consts@L324 calls L543:4@text:&'a str
-    - extract_consts@L326 calls L393:4@is_shouting_snek:bool
-    - extract_consts@L331 calls L554:4@oneline:String
-    - extract_consts@L331 calls L543:4@text:&'a str
-    - extract_consts@L333 calls L548:4@pos:(usize, usize)
-    - extract_consts@L341 calls L399:4@has_const_keyword:bool
-    - extract_consts@L360 calls L554:4@oneline:String
-    - extract_consts@L360 calls L543:4@text:&'a str
-    - extract_consts@L366 calls L548:4@pos:(usize, usize)
-    - extract_consts@L367 calls L554:4@oneline:String
-    - extract_consts@L367 calls L543:4@text:&'a str
-    - extract_consts@L377 calls L554:4@oneline:String
-    - extract_consts@L377 calls L543:4@text:&'a str
-    - extract_consts@L382 calls L548:4@pos:(usize, usize)
-    - extract_consts@L383 calls L554:4@oneline:String
-    - extract_consts@L383 calls L543:4@text:&'a str
-    - classify_call@L407 calls L416:4@resolve_callee:Option<CallKind>
-    - classify_call@L410 calls L548:4@pos:(usize, usize)
-    - resolve_callee@L419 calls L554:4@oneline:String
-    - resolve_callee@L419 calls L543:4@text:&'a str
-    - resolve_callee@L423 calls L554:4@oneline:String
-    - resolve_callee@L423 calls L543:4@text:&'a str
-    - resolve_callee@L424 calls L465:4@self_method:Option<CallKind>
-    - resolve_callee@L428 calls L554:4@oneline:String
-    - resolve_callee@L428 calls L543:4@text:&'a str
-    - resolve_callee@L431 calls L554:4@oneline:String
-    - resolve_callee@L431 calls L543:4@text:&'a str
-    - resolve_callee@L442 calls L554:4@oneline:String
-    - resolve_callee@L442 calls L543:4@text:&'a str
-    - resolve_callee@L443 calls L465:4@self_method:Option<CallKind>
-    - resolve_callee@L448 calls L554:4@oneline:String
-    - resolve_callee@L448 calls L543:4@text:&'a str
-    - resolve_callee@L449 calls L465:4@self_method:Option<CallKind>
-    - resolve_callee@L454 calls L554:4@oneline:String
-    - resolve_callee@L454 calls L543:4@text:&'a str
-    - resolve_callee@L455 calls L465:4@self_method:Option<CallKind>
-    - resolve_callee@L460 calls L416:4@resolve_callee:Option<CallKind>
-    - self_method@L468 calls L554:4@oneline:String
-    - self_method@L468 calls L543:4@text:&'a str
-    - maybe_note@L478 calls L543:4@text:&'a str
-    - maybe_note@L479 calls L568:4@strip_comment:String
-    - maybe_note@L487 calls L554:4@oneline:String
-    - maybe_note@L492 calls L548:4@pos:(usize, usize)
-    - maybe_note@L493 calls L558:4@truncate:String
-    - preceding_comment@L530 calls L568:4@strip_comment:String
-    - preceding_comment@L530 calls L543:4@text:&'a str
-    - preceding_comment@L533 calls L554:4@oneline:String
-    - preceding_comment@L537 calls L558:4@truncate:String
-    - rust_extraction@L597 calls L85:8@extract:Option<Extracted>
-    - go_const_block_and_call@L620 calls L85:8@extract:Option<Extracted>
-    - ts_arrow_is_a_func@L632 calls L85:8@extract:Option<Extracted>
-    - note_marker_word_boundary@L646 calls L85:8@extract:Option<Extracted>
-    - qualified_call_does_not_bind_to_local_name@L660 calls L85:8@extract:Option<Extracted>
-    - self_method_calls_resolve_by_type@L681 calls L85:8@extract:Option<Extracted>
-    - python_only_shouting_snek_is_const@L691 calls L85:8@extract:Option<Extracted>
-    - js_let_is_not_a_const@L704 calls L85:8@extract:Option<Extracted>
+    - extract@L103 calls L149:4@visit
+    - visit@L160 calls L830:4@text:&'a str
+    - visit@L166 calls L236:4@type_scope:Option<(String, Option<String>)>
+    - visit@L170 calls L338:4@extract_func:Option<Func>
+    - visit@L171 calls L259:4@func_owner:Option<(String, Option<String>)>
+    - visit@L195 calls L293:4@cpp_qualified_owner:Option<(String, Option<String>)>
+    - visit@L204 calls L321:4@const_eligible:bool
+    - visit@L205 calls L417:4@extract_consts
+    - visit@L208 calls L574:4@classify_call:Option<RawCall>
+    - visit@L213 calls L587:4@loose_call:Option<CallSite>
+    - visit@L217 calls L764:4@maybe_note
+    - visit@L221 calls L606:4@scan_macro_tokens
+    - visit@L226 calls L149:4@visit
+    - type_scope@L239 calls L841:4@oneline:String
+    - type_scope@L239 calls L830:4@text:&'a str
+    - func_owner@L261 calls L303:4@go_receiver:Option<(String, Option<String>)>
+    - func_owner@L266 calls L293:4@cpp_qualified_owner:Option<(String, Option<String>)>
+    - cpp_qualified_owner@L294 calls L278:4@cpp_function_declarator:Option<Node>
+    - cpp_qualified_owner@L298 calls L841:4@oneline:String
+    - cpp_qualified_owner@L298 calls L830:4@text:&'a str
+    - go_receiver@L311 calls L841:4@oneline:String
+    - go_receiver@L311 calls L830:4@text:&'a str
+    - go_receiver@L315 calls L841:4@oneline:String
+    - go_receiver@L315 calls L830:4@text:&'a str
+    - extract_func@L339 calls L356:4@func_name:Option<(String, Node<'a>)>
+    - extract_func@L340 calls L835:4@pos:(usize, usize)
+    - extract_func@L341 calls L402:4@func_return:Option<String>
+    - extract_func@L342 calls L786:4@preceding_comment:Option<String>
+    - func_name@L359 calls L379:4@cpp_func_name:Option<(String, Node<'a>)>
+    - func_name@L362 calls L841:4@oneline:String
+    - func_name@L362 calls L830:4@text:&'a str
+    - func_name@L369 calls L841:4@oneline:String
+    - func_name@L369 calls L830:4@text:&'a str
+    - cpp_func_name@L380 calls L278:4@cpp_function_declarator:Option<Node>
+    - cpp_func_name@L381 calls L386:4@cpp_declarator_name:Option<(String, Node<'a>)>
+    - cpp_declarator_name@L389 calls L841:4@oneline:String
+    - cpp_declarator_name@L389 calls L830:4@text:&'a str
+    - cpp_declarator_name@L392 calls L386:4@cpp_declarator_name:Option<(String, Node<'a>)>
+    - cpp_declarator_name@L396 calls L386:4@cpp_declarator_name:Option<(String, Node<'a>)>
+    - func_return@L405 calls L841:4@oneline:String
+    - func_return@L405 calls L830:4@text:&'a str
+    - extract_consts@L423 calls L841:4@oneline:String
+    - extract_consts@L423 calls L830:4@text:&'a str
+    - extract_consts@L425 calls L835:4@pos:(usize, usize)
+    - extract_consts@L426 calls L841:4@oneline:String
+    - extract_consts@L426 calls L830:4@text:&'a str
+    - extract_consts@L434 calls L841:4@oneline:String
+    - extract_consts@L434 calls L830:4@text:&'a str
+    - extract_consts@L436 calls L562:4@is_shouting_snek:bool
+    - extract_consts@L441 calls L841:4@oneline:String
+    - extract_consts@L441 calls L830:4@text:&'a str
+    - extract_consts@L443 calls L835:4@pos:(usize, usize)
+    - extract_consts@L451 calls L568:4@has_const_keyword:bool
+    - extract_consts@L470 calls L841:4@oneline:String
+    - extract_consts@L470 calls L830:4@text:&'a str
+    - extract_consts@L476 calls L835:4@pos:(usize, usize)
+    - extract_consts@L477 calls L841:4@oneline:String
+    - extract_consts@L477 calls L830:4@text:&'a str
+    - extract_consts@L487 calls L841:4@oneline:String
+    - extract_consts@L487 calls L830:4@text:&'a str
+    - extract_consts@L492 calls L835:4@pos:(usize, usize)
+    - extract_consts@L493 calls L841:4@oneline:String
+    - extract_consts@L493 calls L830:4@text:&'a str
+    - extract_consts@L502 calls L523:4@cpp_is_const_decl:bool
+    - extract_consts@L507 calls L841:4@oneline:String
+    - extract_consts@L507 calls L830:4@text:&'a str
+    - extract_consts@L510 calls L536:4@cpp_const_declarator_name:Option<(String, Node<'a>)>
+    - extract_consts@L512 calls L835:4@pos:(usize, usize)
+    - cpp_const_declarator_name@L539 calls L841:4@oneline:String
+    - cpp_const_declarator_name@L539 calls L830:4@text:&'a str
+    - cpp_const_declarator_name@L542 calls L547:4@cpp_plain_name:Option<(String, Node<'a>)>
+    - cpp_plain_name@L551 calls L841:4@oneline:String
+    - cpp_plain_name@L551 calls L830:4@text:&'a str
+    - classify_call@L576 calls L701:4@resolve_callee:Option<CallKind>
+    - classify_call@L579 calls L835:4@pos:(usize, usize)
+    - loose_call@L589 calls L647:4@loose_name:Option<(Option<String>, String)>
+    - loose_call@L595 calls L835:4@pos:(usize, usize)
+    - scan_macro_tokens@L613 calls L830:4@text:&'a str
+    - scan_macro_tokens@L624 calls L830:4@text:&'a str
+    - scan_macro_tokens@L638 calls L835:4@pos:(usize, usize)
+    - scan_macro_tokens@L639 calls L841:4@oneline:String
+    - scan_macro_tokens@L639 calls L830:4@text:&'a str
+    - loose_name@L650 calls L841:4@oneline:String
+    - loose_name@L650 calls L830:4@text:&'a str
+    - loose_name@L654 calls L841:4@oneline:String
+    - loose_name@L654 calls L830:4@text:&'a str
+    - loose_name@L672 calls L647:4@loose_name:Option<(Option<String>, String)>
+    - loose_name@L695 calls L647:4@loose_name:Option<(Option<String>, String)>
+    - resolve_callee@L704 calls L841:4@oneline:String
+    - resolve_callee@L704 calls L830:4@text:&'a str
+    - resolve_callee@L710 calls L841:4@oneline:String
+    - resolve_callee@L710 calls L830:4@text:&'a str
+    - resolve_callee@L711 calls L752:4@self_method:Option<CallKind>
+    - resolve_callee@L715 calls L841:4@oneline:String
+    - resolve_callee@L715 calls L830:4@text:&'a str
+    - resolve_callee@L718 calls L841:4@oneline:String
+    - resolve_callee@L718 calls L830:4@text:&'a str
+    - resolve_callee@L729 calls L841:4@oneline:String
+    - resolve_callee@L729 calls L830:4@text:&'a str
+    - resolve_callee@L730 calls L752:4@self_method:Option<CallKind>
+    - resolve_callee@L735 calls L841:4@oneline:String
+    - resolve_callee@L735 calls L830:4@text:&'a str
+    - resolve_callee@L736 calls L752:4@self_method:Option<CallKind>
+    - resolve_callee@L741 calls L841:4@oneline:String
+    - resolve_callee@L741 calls L830:4@text:&'a str
+    - resolve_callee@L742 calls L752:4@self_method:Option<CallKind>
+    - resolve_callee@L747 calls L701:4@resolve_callee:Option<CallKind>
+    - self_method@L755 calls L841:4@oneline:String
+    - self_method@L755 calls L830:4@text:&'a str
+    - maybe_note@L765 calls L830:4@text:&'a str
+    - maybe_note@L766 calls L855:4@strip_comment:String
+    - maybe_note@L774 calls L841:4@oneline:String
+    - maybe_note@L779 calls L835:4@pos:(usize, usize)
+    - maybe_note@L780 calls L845:4@truncate:String
+    - preceding_comment@L817 calls L855:4@strip_comment:String
+    - preceding_comment@L817 calls L830:4@text:&'a str
+    - preceding_comment@L820 calls L841:4@oneline:String
+    - preceding_comment@L824 calls L845:4@truncate:String
+    - rust_extraction@L884 calls L85:8@extract:Option<Extracted>
+    - go_const_block_and_call@L907 calls L85:8@extract:Option<Extracted>
+    - ts_arrow_is_a_func@L919 calls L85:8@extract:Option<Extracted>
+    - note_marker_word_boundary@L933 calls L85:8@extract:Option<Extracted>
+    - qualified_call_does_not_bind_to_local_name@L947 calls L85:8@extract:Option<Extracted>
+    - self_method_calls_resolve_by_type@L968 calls L85:8@extract:Option<Extracted>
+    - python_only_shouting_snek_is_const@L978 calls L85:8@extract:Option<Extracted>
+    - rust_macro_calls_and_test_mod_are_loose_calls@L994 calls L85:8@extract:Option<Extracted>
+    - cpp_extraction@L1017 calls L85:8@extract:Option<Extracted>
+    - cpp_out_of_line_method_and_self_call@L1048 calls L85:8@extract:Option<Extracted>
+    - js_let_is_not_a_const@L1070 calls L85:8@extract:Option<Extracted>
 # note
-    - @L641 "notes" must not trigger, but a real TODO must
+    - @L928 "notes" must not trigger, but a real TODO must
