@@ -8,6 +8,7 @@ machine-readable map of the source tree including every source file; its
 constants, functions (with return types and doc summaries), intra-file call
 graph, and marker notes (TODO/FIXME/...). It is designed to give agents a
 cheap, always-fresh index of a project. 
+
 Supports: `C++`, `Rust`, `Go`, `Python`, `TypeScript` & `JavaScript`
 
 Can also generate a `.ccc` directory if you wish to commit the map.
