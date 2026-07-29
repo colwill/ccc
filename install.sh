@@ -9,8 +9,10 @@
 # your PATH with `ccc install` (defaults to ~/.local/bin; no sudo).
 # Release assets are single binaries named:  ccc-<os>-<arch>
 #   os:   linux | macos
-#   arch: x86_64 | aarch64 | armv7 (linux only)
+#   arch: x86_64 | aarch64 | armv7 | i686 | riscv64 (armv7/i686/riscv64: linux only)
 #   e.g.  ccc-linux-x86_64, ccc-macos-aarch64, ccc-linux-armv7
+# Windows assets (ccc-windows-<arch>.exe) also exist on the releases page for
+# manual download; this installer covers Linux and macOS.
 # Environment overrides:
 #   CCC_VERSION      release tag to install (default: latest)
 #   CCC_INSTALL_DIR  install directory (default: ~/.local/bin, via `ccc install --dir`)
@@ -33,9 +35,11 @@ build from source instead (cargo build --release)" ;;
 
 detect_arch() {
   case "$(uname -m)" in
-    x86_64|amd64)        echo x86_64 ;;
-    aarch64|arm64)       echo aarch64 ;;
-    armv7l|armv6l|armhf) echo armv7 ;;
+    x86_64|amd64)          echo x86_64 ;;
+    aarch64|arm64)         echo aarch64 ;;
+    armv7l|armv6l|armhf)   echo armv7 ;;
+    i386|i486|i586|i686)   echo i686 ;;
+    riscv64)               echo riscv64 ;;
     *)             fail "unsupported architecture '$(uname -m)' - build from source \
 instead (cargo build --release)" ;;
   esac
