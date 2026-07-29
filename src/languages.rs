@@ -95,6 +95,44 @@ impl Language {
         }
     }
 
+    // kinds that represent a qualified name usable as a value or type
+    // (`Encoding::O200kBase`, `http.StatusOK`) - candidates for use capture
+    pub fn use_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust => &["scoped_identifier", "scoped_type_identifier"],
+            Language::Python => &["attribute"],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => &["member_expression"],
+            Language::Go => &["selector_expression"],
+            Language::Cpp => &["qualified_identifier"],
+        }
+    }
+
+    // kinds that declare one enum variant/enumerator - indexed as const-like
+    // definitions so `references` can pair them with their usages
+    pub fn variant_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust => &["enum_variant"],
+            Language::Cpp => &["enumerator"],
+            Language::Python
+            | Language::JavaScript
+            | Language::TypeScript // ts enums are grammar-irregular - not covered yet
+            | Language::Tsx 
+            | Language::Go => &[],
+        }
+    }
+
+    // kinds whose subtree is an import/include; qualified names inside are
+    // declarations of availability, not usages
+    pub fn import_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust => &["use_declaration"],
+            Language::Python => &["import_statement", "import_from_statement"],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => &["import_statement"],
+            Language::Go => &["import_declaration"],
+            Language::Cpp => &["preproc_include", "using_declaration"],
+        }
+    }
+
     // node kinds that represent a comment
     pub fn comment_kinds(self) -> &'static [&'static str] {
         match self {

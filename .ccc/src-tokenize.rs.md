@@ -1,10 +1,12 @@
-# tokenize.rs.md (20260729-17-50-32) UTC
+# tokenize.rs.md (20260729-22-00-57) UTC
 # source: src/tokenize.rs [rust]
 # const
     - L15@TOKENS_BIN:&str
     - L16@TOKENS_INDEX:&str
     - L17@INDEX_VERSION:u32
     - L21@NOTE:&str
+    - L31@O200kBase:Encoding
+    - L32@Cl100kBase:Encoding
 # funcs
     - L36:12@parse:Option<Encoding>
     - L44:12@name:&'static str

@@ -252,9 +252,19 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
     if q.is_empty() {
         return Err("empty query".into());
     }
-    if !matches!(kind, "any" | "func" | "const" | "note") {
-        return Err(format!("kind '{kind}' not one of any|func|const|note"));
+    if !matches!(kind, "any" | "func" | "const" | "note" | "call") {
+        return Err(format!("kind '{kind}' not one of any|func|const|note|call"));
     }
+    let (want_qualifier, want_name) = split_qualified(query.trim());
+    let want_qualifier = want_qualifier.map(|s| s.to_ascii_lowercase());
+    let want_name = want_name.to_ascii_lowercase();
+    // qualified queries (`serde_json::to_string`) resolve against call sites;
+    // under `any` unqualified calls stay out so definitions aren't drowned.
+    // uses (enum variants, consts) are constant-like and rare, so they are
+    // searched under `any` even unqualified
+    let search_calls =
+        kind == "call" || (kind == "any" && want_qualifier.is_some() && !want_name.is_empty());
+    let search_uses = matches!(kind, "any" | "call") && !want_name.is_empty();
     let mut results = Vec::new();
     for c in &map.caches {
         let path = map.path_of(c);
@@ -288,6 +298,31 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
                 }
             }
         }
+        let sites = c
+            .calls
+            .iter()
+            .map(|s| ("call", s))
+            .filter(|_| search_calls)
+            .chain(c.uses.iter().map(|s| ("use", s)).filter(|_| search_uses));
+        for (site_kind, site) in sites {
+            let name_ok =
+                !want_name.is_empty() && site.name.to_ascii_lowercase().contains(&want_name);
+            let qualifier_ok = match &want_qualifier {
+                None => true,
+                Some(w) => site
+                    .qualifier
+                    .as_deref()
+                    .map(|cq| qualifier_matches(Some(&cq.to_ascii_lowercase()), w))
+                    .unwrap_or(false),
+            };
+            if name_ok && qualifier_ok {
+                results.push(json!({
+                    "kind": site_kind, "file": path, "line": site.line,
+                    "name": site.name, "qualifier": site.qualifier,
+                    "caller": site.caller, "test_ctx": site.test_ctx,
+                }));
+            }
+        }
     }
     let total = results.len();
     results.truncate(FIND_CAP);
@@ -300,31 +335,115 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
     }))
 }
 
+// `serde_json::to_string` / `client.charge` -> (Some("serde_json"), "to_string");
+// a bare name passes through as (None, name).
+fn split_qualified(symbol: &str) -> (Option<&str>, &str) {
+    let by_colons = symbol.rfind("::").map(|i| (i, i + 2));
+    let by_dot = symbol.rfind('.').map(|i| (i, i + 1));
+    let sep = match (by_colons, by_dot) {
+        (Some(a), Some(b)) => Some(if a.0 > b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    };
+    match sep {
+        Some((start, end)) if end < symbol.len() => {
+            let name = &symbol[end..];
+            let qualifier = symbol[..start].trim();
+            if qualifier.is_empty() {
+                (None, name)
+            } else {
+                (Some(qualifier), name)
+            }
+        }
+        _ => (None, symbol),
+    }
+}
+
+// a call qualifier matches when its identifier segments end with the wanted
+// segments: want `serde_json` matches `serde_json`; want `a::b` matches
+// `x::a::b` but not `b`.
+fn qualifier_matches(call_qualifier: Option<&str>, want: &str) -> bool {
+    let Some(cq) = call_qualifier else {
+        return false;
+    };
+    fn segs(s: &str) -> Vec<&str> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|seg| !seg.is_empty())
+            .collect()
+    }
+    let have = segs(cq);
+    let want = segs(want);
+    !want.is_empty() && have.len() >= want.len() && have[have.len() - want.len()..] == want[..]
+}
+
 fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     let symbol = symbol.trim();
     if symbol.is_empty() {
         return Err("empty symbol".into());
     }
+    let (qualifier, name) = split_qualified(symbol);
     let mut definitions = Vec::new();
+    let mut stem_matched_defs = Vec::new();
     let mut references = Vec::new();
     for c in &map.caches {
         let path = map.path_of(c);
+        let stem = c
+            .rel_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         for f in &c.funcs {
-            if f.name == symbol {
-                definitions.push(json!({
-                    "file": path, "line": f.line, "col": f.col,
+            if f.name == name {
+                let def = json!({
+                    "kind": "func", "file": path, "line": f.line, "col": f.col,
                     "ret": f.ret, "doc": f.comment, "span": [f.start_line, f.end_line],
-                }));
+                });
+                if qualifier.is_some_and(|q| crate::surf::qualifier_names_service(q, stem)) {
+                    stem_matched_defs.push(def.clone());
+                }
+                definitions.push(def);
             }
         }
-        for call in &c.calls {
-            if call.name == symbol {
+        for k in &c.consts {
+            if k.name == name {
+                let def = json!({
+                    "kind": "const", "file": path, "line": k.line, "type": k.ty,
+                });
+                // `money::MAX` narrows by file stem, `Encoding::O200kBase`
+                // by the owning enum recorded as the const's type
+                let narrows = qualifier.is_some_and(|q| {
+                    crate::surf::qualifier_names_service(q, stem)
+                        || k.ty
+                            .as_deref()
+                            .is_some_and(|t| crate::surf::qualifier_names_service(q, t))
+                });
+                if narrows {
+                    stem_matched_defs.push(def.clone());
+                }
+                definitions.push(def);
+            }
+        }
+        for (kind, site) in c
+            .calls
+            .iter()
+            .map(|s| ("call", s))
+            .chain(c.uses.iter().map(|s| ("use", s)))
+        {
+            let qualifier_ok = match qualifier {
+                None => true,
+                Some(q) => qualifier_matches(site.qualifier.as_deref(), q),
+            };
+            if site.name == name && qualifier_ok {
                 references.push(json!({
-                    "file": path, "line": call.line, "caller": call.caller,
-                    "qualifier": call.qualifier, "test_ctx": call.test_ctx,
+                    "kind": kind, "file": path, "line": site.line, "caller": site.caller,
+                    "qualifier": site.qualifier, "test_ctx": site.test_ctx,
                 }));
             }
         }
+    }
+    // a qualifier that names a file (`money::charge` -> lib/money.rs) narrows
+    // the definitions to that file; otherwise all bare-name definitions stay
+    if !stem_matched_defs.is_empty() {
+        definitions = stem_matched_defs;
     }
     if definitions.is_empty() && references.is_empty() {
         return Err(format!("symbol '{symbol}' not found in the map"));
@@ -333,6 +452,8 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     references.truncate(REFS_CAP);
     Ok(json!({
         "symbol": symbol,
+        "name": name,
+        "qualifier": qualifier,
         "counts": {"definitions": definitions.len(), "references": total_refs},
         "truncated": total_refs > REFS_CAP,
         "definitions": definitions,
@@ -340,47 +461,165 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     }))
 }
 
-// File-level dependency edges
+// package name from a root Cargo.toml, if any - the name code uses to
+// qualify calls through the crate facade
+fn cargo_package_name(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("name").map(str::trim_start) {
+            if let Some(v) = v.strip_prefix('=') {
+                return Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+// File-level dependency edges, resolved from imports and calls. A call only
+// produces a cross-file edge with positive evidence - its qualifier names the
+// target module, or the callee (or its qualifier) is imported from the target
+// file. Name-only matches (`.ok()` vs a local `fn ok`) are excluded: they
+// produced phantom edges when a stdlib method name collided with a project fn.
 fn q_dependencies(map: &MapState, file: Option<&str>) -> Result<Value, String> {
     let defs = map.def_files();
+    fn path_segs(s: &str) -> impl Iterator<Item = &str> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    }
+    let stems: Vec<&str> = map
+        .caches
+        .iter()
+        .map(|c| c.rel_path.file_stem().and_then(|s| s.to_str()).unwrap_or(""))
+        .collect();
+    // names a file answers to: its stem, a facade file's containing directory
+    // (pkg/__init__.py, utils/index.ts, sub/mod.rs), and - for the crate root -
+    // the Cargo package name (`codecache::scan(..)` in main.rs names lib.rs)
+    let mut stem_files: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, s) in stems.iter().enumerate() {
+        stem_files.entry(s.to_string()).or_default().push(i);
+        if matches!(*s, "__init__" | "index" | "mod") {
+            if let Some(dir) = map.caches[i]
+                .rel_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|d| d.to_str())
+            {
+                stem_files.entry(dir.to_string()).or_default().push(i);
+            }
+        }
+    }
+    if let Some(pkg) = cargo_package_name(&map.root) {
+        if let Some(i) = map
+            .caches
+            .iter()
+            .position(|c| c.rel_path.ends_with("src/lib.rs") || c.rel_path == Path::new("lib.rs"))
+        {
+            // hyphenated package names appear underscored in code
+            stem_files.entry(pkg.replace('-', "_")).or_default().push(i);
+        }
+    }
+
     // (from, to) -> symbols
     let mut edges: BTreeMap<(usize, usize), BTreeSet<String>> = BTreeMap::new();
     let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    let mut excluded: BTreeSet<String> = BTreeSet::new();
 
+    // pass 1: import edges (covering type-only dependencies the call map
+    // cannot see) and, per file, which files each bound name came from
+    let mut imports_of: Vec<BTreeMap<&str, BTreeSet<usize>>> = Vec::new();
     for (a, c) in map.caches.iter().enumerate() {
+        let mut imported: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
+        for imp in &c.imports {
+            for seg in path_segs(&imp.module) {
+                let Some(files) = stem_files.get(seg) else { continue };
+                for &b in files {
+                    if b == a {
+                        continue;
+                    }
+                    let syms = edges.entry((a, b)).or_default();
+                    if imp.names.is_empty() {
+                        syms.insert(seg.to_string());
+                    }
+                    for n in &imp.names {
+                        syms.insert(n.clone());
+                        imported.entry(n).or_default().insert(b);
+                    }
+                }
+            }
+            // bound names that themselves name a module file
+            // (`use crate::{scan, render}`, `from pkg import helpers`)
+            for n in &imp.names {
+                let Some(files) = stem_files.get(n.as_str()) else { continue };
+                for &b in files {
+                    if b == a {
+                        continue;
+                    }
+                    edges.entry((a, b)).or_default().insert(n.clone());
+                    imported.entry(n).or_default().insert(b);
+                }
+            }
+        }
+        imports_of.push(imported);
+    }
+
+    // pass 2: call edges with evidence
+    for (a, c) in map.caches.iter().enumerate() {
+        let imported = &imports_of[a];
         for call in &c.calls {
             let Some(files) = defs.get(call.name.as_str()) else { continue };
             if files.contains(&a) {
-                continue; // resolv locally
+                continue; // resolves locally
             }
-            let others: Vec<usize> = files.iter().copied().collect();
-            let target = if others.len() == 1 {
-                Some(others[0])
-            } else {
-                let by_stem: Vec<usize> = others
-                    .iter()
-                    .copied()
-                    .filter(|&b| {
-                        let stem = map.caches[b]
-                            .rel_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("");
-                        call.qualifier
-                            .as_deref()
-                            .map(|q| crate::surf::qualifier_names_service(q, stem))
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                if by_stem.len() == 1 {
-                    Some(by_stem[0])
-                } else {
-                    ambiguous.insert(call.name.clone());
-                    None
+            let qual_segs: Vec<&str> = call
+                .qualifier
+                .as_deref()
+                .map(|q| path_segs(q).filter(|s| !s.is_empty()).collect())
+                .unwrap_or_default();
+            let evidenced: Vec<usize> = files
+                .iter()
+                .copied()
+                .filter(|&b| {
+                    // the qualifier names the target module directly
+                    let by_qualifier = qual_segs.contains(&stems[b]);
+                    let name_imported = |n: &str| imported.get(n).is_some_and(|s| s.contains(&b));
+                    // the callee (or the type/module it hangs off) is imported
+                    // from the target file
+                    let by_import =
+                        name_imported(&call.name) || qual_segs.iter().any(|s| name_imported(s));
+                    // the qualifier names a facade that re-exports the callee
+                    // from the target file (`codecache::scan(..)` where lib.rs
+                    // does `pub use scan::scan`)
+                    let by_reexport = qual_segs.iter().any(|seg| {
+                        stem_files.get(*seg).is_some_and(|fs| {
+                            fs.iter().any(|&f| {
+                                f != b
+                                    && imports_of[f]
+                                        .get(call.name.as_str())
+                                        .is_some_and(|s| s.contains(&b))
+                            })
+                        })
+                    });
+                    by_qualifier || by_import || by_reexport
+                })
+                .collect();
+            match evidenced[..] {
+                [] => {
+                    excluded.insert(call.name.clone());
                 }
-            };
-            if let Some(b) = target {
-                edges.entry((a, b)).or_default().insert(call.name.clone());
+                [b] => {
+                    edges.entry((a, b)).or_default().insert(call.name.clone());
+                }
+                _ => {
+                    ambiguous.insert(call.name.clone());
+                }
             }
         }
     }
@@ -398,6 +637,9 @@ fn q_dependencies(map: &MapState, file: Option<&str>) -> Result<Value, String> {
             "files": map.caches.len(),
             "edges": edges.iter().map(edge_json).collect::<Vec<_>>(),
             "ambiguous_symbols": ambiguous.iter().take(50).collect::<Vec<_>>(),
+            // call names that matched a definition elsewhere but lacked
+            // qualifier/import evidence - surfaced so exclusions are auditable
+            "excluded_symbols": excluded.iter().take(50).collect::<Vec<_>>(),
         })),
         Some(key) => {
             let target = map.find_file(key)?;
@@ -483,22 +725,22 @@ fn mcp_tools() -> Value {
         tool("index", "Project overview: every mapped file with its function/const/ref/note counts.", json!({}), &[]),
         tool(
             "find",
-            "Search the code map for symbols by substring (case-insensitive). Returns file:line locations with return types and doc summaries.",
+            "Search the code map for symbols by substring (case-insensitive). Returns file:line locations with return types and doc summaries. A qualified query like `serde_json::to_string` or `client.charge` matches call sites (kind `call`) filtered by that qualifier.",
             json!({
-                "query": {"type": "string", "description": "substring to search for"},
-                "kind": {"type": "string", "enum": ["any", "func", "const", "note"], "description": "filter by symbol kind (default any)"},
+                "query": {"type": "string", "description": "substring to search for; qualified form (a::b / a.b) searches call sites"},
+                "kind": {"type": "string", "enum": ["any", "func", "const", "note", "call"], "description": "filter by symbol kind (default any)"},
             }),
             &["query"],
         ),
         tool(
             "references",
-            "Definitions and every call site of an exact symbol name across the project. Use before changing a function's signature.",
-            json!({"symbol": {"type": "string", "description": "exact symbol name"}}),
+            "Definitions, every call site, and qualified value usages (enum variants, consts: `Encoding::O200kBase`) of an exact symbol name across the project. Accepts qualified names (`serde_json::to_string`, `client.charge`) to count one qualifier's sites without any text search. Each hit carries the enclosing caller, qualifier, and test context. Use before changing a function's signature.",
+            json!({"symbol": {"type": "string", "description": "exact symbol name, optionally qualified (a::b or a.b)"}}),
             &["symbol"],
         ),
         tool(
             "dependencies",
-            "File-level dependency edges resolved from the call map. Without arguments: the whole project graph; with a file: what it depends on and what depends on it.",
+            "File-level dependency edges resolved from imports and calls (type-only imports included). Call edges require the call site to name the target module or use an imported symbol; name-only matches are excluded and listed in excluded_symbols. Without arguments: the whole project graph; with a file: what it depends on and what depends on it.",
             json!({"file": {"type": "string", "description": "relative path (optional)"}}),
             &[],
         ),
@@ -537,12 +779,20 @@ fn mcp_initialize(params: &Value) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "instructions": "In-memory code map of the project (the .ccc ContextCodeCache). \
+            Prefer these tools over grep or text search for symbol and call-site \
+            questions in this project: the map already indexes every definition, \
+            call site, and qualified constant-like usage (enum variants, consts), \
+            each hit is structured (file, line, enclosing caller, qualifier, test \
+            context) with no textual false positives, and qualified names like \
+            `serde_json::to_string` or `Encoding::O200kBase` are understood \
+            directly - one `references` call replaces a grep plus manual filtering. \
             Orient with `index`, locate symbols with `find`, check `references` before \
             changing a signature, `dependencies` for file-level impact, `file` for one \
             file's full map, `notes` for TODO/FIXME markers. The map auto-refreshes \
             when source files change (three seconds of lag); call `refresh` to force an \
-            immediate rescan after editing. Open real source files for exact code - \
-            this map is for navigation and impact, not authoritative content.",
+            immediate rescan after editing. Reach for text search only for non-symbol \
+            text (string literals, config). Open real source files for exact \
+            code - this map is for navigation and impact, not authoritative content.",
     })
 }
 
@@ -1169,13 +1419,17 @@ mod tests {
         fs::create_dir_all(dir.join("lib")).unwrap();
         fs::write(
             dir.join("lib/money.rs"),
-            "// Charge an amount.\npub fn charge(c: u64) -> u64 { c }\n\
+            "pub const MAX: u64 = 9;\n\
+             pub enum Mode { Fast, Slow }\n\
+             // Charge an amount.\npub fn charge(c: u64) -> u64 { c }\n\
              // TODO: support currencies\npub fn refund(c: u64) -> u64 { c }\n",
         )
         .unwrap();
         fs::write(
             dir.join("api/main.rs"),
-            "fn handle() -> u64 { money::charge(1) + helper() }\nfn helper() -> u64 { 2 }\n",
+            "fn handle() -> u64 { money::charge(1) + helper() }\nfn helper() -> u64 { 2 }\n\
+             fn cap() -> u64 { money::MAX }\n\
+             fn pick() -> u64 { let _m = money::Mode::Fast; 0 }\n",
         )
         .unwrap();
         let state = MapState::build(&dir).unwrap();
@@ -1198,6 +1452,27 @@ mod tests {
     }
 
     #[test]
+    fn find_qualified_queries_match_call_sites() {
+        let map = fixture();
+        // qualified query resolves against call sites, dot or colons
+        for query in ["money::charge", "money.charge"] {
+            let found = q_find(&map, query, "any").unwrap();
+            assert_eq!(found["count"], 1, "query {query}");
+            assert_eq!(found["results"][0]["kind"], "call");
+            assert_eq!(found["results"][0]["file"], "api/main.rs");
+            assert_eq!(found["results"][0]["qualifier"], "money");
+        }
+        // wrong qualifier matches nothing
+        assert_eq!(q_find(&map, "bogus::charge", "any").unwrap()["count"], 0);
+        // kind=call searches call sites without a qualifier
+        let calls = q_find(&map, "charge", "call").unwrap();
+        assert_eq!(calls["count"], 1);
+        assert_eq!(calls["results"][0]["caller"], "handle");
+        // unqualified `any` still returns only the definition, not the call
+        assert_eq!(q_find(&map, "charge", "any").unwrap()["count"], 1);
+    }
+
+    #[test]
     fn references_finds_defs_and_calls() {
         let map = fixture();
         let refs = q_references(&map, "charge").unwrap();
@@ -1206,6 +1481,69 @@ mod tests {
         assert_eq!(refs["references"][0]["file"], "api/main.rs");
         assert_eq!(refs["references"][0]["qualifier"], "money");
         assert!(q_references(&map, "nowhere").is_err());
+    }
+
+    #[test]
+    fn references_accepts_qualified_names() {
+        let map = fixture();
+        let refs = q_references(&map, "money::charge").unwrap();
+        assert_eq!(refs["name"], "charge");
+        assert_eq!(refs["qualifier"], "money");
+        assert_eq!(refs["counts"]["definitions"], 1);
+        assert_eq!(refs["counts"]["references"], 1);
+        assert_eq!(refs["definitions"][0]["file"], "lib/money.rs");
+        // qualifier that names no file: call sites filter to zero, but the
+        // bare-name definitions are still reported
+        let miss = q_references(&map, "bogus::charge").unwrap();
+        assert_eq!(miss["counts"]["references"], 0);
+        assert_eq!(miss["counts"]["definitions"], 1);
+        // dot-form qualifier works the same as colons
+        assert_eq!(
+            q_references(&map, "money.charge").unwrap()["counts"]["references"],
+            1
+        );
+    }
+
+    #[test]
+    fn references_and_find_cover_qualified_usages() {
+        let map = fixture();
+        // `money::MAX` in api/main.rs is a usage, not a call
+        let refs = q_references(&map, "money::MAX").unwrap();
+        assert_eq!(refs["counts"]["references"], 1);
+        assert_eq!(refs["references"][0]["kind"], "use");
+        assert_eq!(refs["references"][0]["file"], "api/main.rs");
+        assert_eq!(refs["references"][0]["caller"], "cap");
+        // the const declaration is its definition, narrowed by the qualifier
+        assert_eq!(refs["counts"]["definitions"], 1);
+        assert_eq!(refs["definitions"][0]["kind"], "const");
+        assert_eq!(refs["definitions"][0]["file"], "lib/money.rs");
+        // unqualified `find` surfaces constant-like usages alongside the const
+        let found = q_find(&map, "MAX", "any").unwrap();
+        let kinds: Vec<_> = found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert!(kinds.contains(&"const".to_string()));
+        assert!(kinds.contains(&"use".to_string()));
+    }
+
+    #[test]
+    fn enum_variants_pair_declaration_with_usages() {
+        let map = fixture();
+        // `Mode::Fast`: declaration in lib/money.rs, usage in api/main.rs
+        let refs = q_references(&map, "Mode::Fast").unwrap();
+        assert_eq!(refs["counts"]["definitions"], 1);
+        assert_eq!(refs["definitions"][0]["kind"], "const");
+        assert_eq!(refs["definitions"][0]["file"], "lib/money.rs");
+        assert_eq!(refs["definitions"][0]["type"], "Mode");
+        assert_eq!(refs["counts"]["references"], 1);
+        assert_eq!(refs["references"][0]["kind"], "use");
+        assert_eq!(refs["references"][0]["file"], "api/main.rs");
+        assert_eq!(refs["references"][0]["caller"], "pick");
+        // the deep qualifier is preserved on the usage
+        assert_eq!(refs["references"][0]["qualifier"], "money::Mode");
     }
 
     #[test]
@@ -1219,6 +1557,86 @@ mod tests {
         let per = q_dependencies(&map, Some("lib/money.rs")).unwrap();
         assert_eq!(per["depended_on_by"].as_array().unwrap().len(), 1);
         assert!(per["depends_on"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dependencies_require_evidence_and_cover_type_only_imports() {
+        let dir = std::env::temp_dir().join(format!("ccc-deps-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::create_dir_all(dir.join("api")).unwrap();
+        fs::write(
+            dir.join("lib/util.rs"),
+            "pub enum Mode { A }\n\
+             pub fn shrink(x: u64) -> u64 { x }\n\
+             pub fn truncate(s: &str) -> &str { s }\n",
+        )
+        .unwrap();
+        // `shrink(1)` is evidenced by the import; `v.truncate(2)` is a stdlib
+        // method that merely shares a name with a util fn - no edge for it.
+        // `use util::Mode` alone must still produce a (type-only) edge.
+        fs::write(
+            dir.join("api/main.rs"),
+            "use util::shrink;\n\
+             use util::Mode;\n\
+             fn a() -> u64 { shrink(1) }\n\
+             fn b(mut v: Vec<u64>) { v.truncate(2); }\n",
+        )
+        .unwrap();
+        let map = MapState::build(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        let all = q_dependencies(&map, None).unwrap();
+        let edges = all["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0]["from"], "api/main.rs");
+        assert_eq!(edges[0]["to"], "lib/util.rs");
+        let symbols: Vec<&str> = edges[0]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert!(symbols.contains(&"shrink"));
+        assert!(symbols.contains(&"Mode"));
+        assert!(!symbols.contains(&"truncate"));
+        let excluded: Vec<&str> = all["excluded_symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(excluded, vec!["truncate"]);
+    }
+
+    #[test]
+    fn dependencies_resolve_through_facade_reexports() {
+        let dir = std::env::temp_dir().join(format!("ccc-facade-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pkg")).unwrap();
+        fs::write(dir.join("pkg/impl.py"), "def work():\n    return 1\n").unwrap();
+        fs::write(dir.join("pkg/__init__.py"), "from pkg.impl import work\n").unwrap();
+        // `pkg.work()` names the facade (pkg/__init__.py), which re-exports
+        // `work` from pkg/impl.py - the call must resolve through the hop
+        fs::write(
+            dir.join("app.py"),
+            "import pkg\n\ndef go():\n    return pkg.work()\n",
+        )
+        .unwrap();
+        let map = MapState::build(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        let all = q_dependencies(&map, None).unwrap();
+        let has_edge = |from: &str, to: &str, sym: &str| {
+            all["edges"].as_array().unwrap().iter().any(|e| {
+                e["from"] == from
+                    && e["to"] == to
+                    && e["symbols"].as_array().unwrap().iter().any(|s| s == sym)
+            })
+        };
+        assert!(has_edge("app.py", "pkg/__init__.py", "pkg"));
+        assert!(has_edge("pkg/__init__.py", "pkg/impl.py", "work"));
+        assert!(has_edge("app.py", "pkg/impl.py", "work"));
     }
 
     #[test]

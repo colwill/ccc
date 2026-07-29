@@ -63,6 +63,18 @@ pub struct Note {
     pub text: String,
 }
 
+// one import/use/include statement, in loose textual form:
+// `use crate::model::{CallSite, Const}` -> module "crate::model",
+// names ["CallSite", "Const"]; `from a.b import c as d` -> module "a.b",
+// names ["c", "d"]. Used by `dependencies` to resolve file-level edges
+// (including type-only imports the call map cannot see); not rendered.
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub line: usize,
+    pub module: String,
+    pub names: Vec<String>,
+}
+
 // everything extracted from a single source file.
 #[derive(Debug, Clone)]
 pub struct FileCache {
@@ -77,6 +89,12 @@ pub struct FileCache {
     pub notes: Vec<Note>,
     // all call sites (superset of `refs`), used by `surf`; not rendered
     pub calls: Vec<CallSite>,
+    // qualified constant-like value usages that are not calls (enum variants,
+    // module consts, scoped types: `Encoding::O200kBase`, `http.StatusOK`),
+    // served by `references`/`find`; not rendered
+    pub uses: Vec<CallSite>,
+    // import/use/include statements, used by `dependencies`; not rendered
+    pub imports: Vec<Import>,
 }
 
 impl FileCache {

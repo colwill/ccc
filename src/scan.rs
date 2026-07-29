@@ -150,6 +150,8 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
         refs: ex.refs,
         notes: ex.notes,
         calls: ex.calls,
+        uses: ex.uses,
+        imports: ex.imports,
     })
 }
 
