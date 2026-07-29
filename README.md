@@ -24,8 +24,9 @@ Please ⭐ if you find this useful 💚
    ```
 
    (or build from source - `cargo build --release && ./target/release/ccc -- install`)
+2. Start the server `ccc serve`
 
-2. Integrate into your workflow `claude mcp add --transport http ccc http://127.0.0.1:6767/mcp`
+3. Integrate into your workflow `claude mcp add --transport http ccc http://127.0.0.1:6767/mcp`
 
 ## Usage
 
