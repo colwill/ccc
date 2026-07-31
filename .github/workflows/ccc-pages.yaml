@@ -1,0 +1,99 @@
+name: Publish insights to GitHub Pages
+
+# Builds the `ccc insights` page as a static site.
+# One-time setup: Settings -> Pages -> Build and deployment -> Source:
+# "GitHub Actions". The site then appears at
+# https://<owner>.github.io/<repo>/
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# never let two deploys race; let a newer commit win
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # REQUIRED: the 'test triggers' tab diffs against a base ref, and tags
+          # are needed to pick one. A shallow clone has neither.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build ccc
+        run: cargo build --release --locked
+
+      - name: Pick alt base for test triggers
+        id: base
+        run: |
+          # use ref history and take the first that
+          # actually moved some functions, so the page always demonstrates what
+          # a real working tree looks like against origin/main.
+          #
+          # `ccc insights` is the source of truth here: a docs-only commit
+          # changes files without changing any function, and would still leave
+          # the tab empty.
+          candidates=(
+            "$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+            "HEAD~5" "HEAD~20" "HEAD~50"
+            "$(git rev-list --max-parents=0 HEAD | tail -1)"
+          )
+          chosen=""
+          for ref in "${candidates[@]}"; do
+            [ -z "$ref" ] && continue
+            git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null || continue
+            n="$(./target/release/ccc insights . --base "$ref" \
+                 | jq '.test_triggers.counts.changed_functions // 0')"
+            echo "  $ref -> ${n} changed function(s)"
+            if [ "${n:-0}" -gt 0 ]; then chosen="$ref"; break; fi
+          done
+          echo "ref=${chosen}" >> "$GITHUB_OUTPUT"
+          if [ -n "$chosen" ]; then
+            echo "Test triggers will diff against $chosen"
+          else
+            echo "Nothing moved against any candidate; using the default base"
+          fi
+
+      - name: Generate the insights page
+        run: |
+          if [ -n "${{ steps.base.outputs.ref }}" ]; then
+            ./target/release/ccc insights . \
+              --html public/index.html \
+              --base "${{ steps.base.outputs.ref }}"
+          else
+            ./target/release/ccc insights . --html public/index.html
+          fi
+          ls -lh public/index.html
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

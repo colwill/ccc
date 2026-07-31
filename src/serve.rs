@@ -6,12 +6,12 @@
 //! parsed map in whenever source changes - `/refresh` forces it immediately.
 
 use crate::model::{FileCache, Counts};
-use crate::{render, scan};
+use crate::{insights, render, scan};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 const MCP_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 const MCP_LATEST: &str = "2025-06-18";
@@ -24,6 +24,8 @@ pub struct ServeOptions {
     pub addr: String,
     pub port: u16,
     pub watch: Option<std::time::Duration>,
+    // serve the human-facing `/insights` UI alongside the agent endpoints
+    pub html: bool,
 }
 
 impl Default for ServeOptions {
@@ -32,6 +34,7 @@ impl Default for ServeOptions {
             addr: "127.0.0.1".into(),
             port: 6767,
             watch: Some(std::time::Duration::from_secs(2)),
+            html: false,
         }
     }
 }
@@ -42,6 +45,20 @@ struct MapState {
     ts: String,
     caches: Vec<FileCache>,
     watch_secs: Option<u64>,
+    // `/insights` is opt-in (`--html`): it is a human UI, not an agent endpoint
+    html: bool,
+    // Six MCP tools are views onto one analysis pass. Computing it per call
+    // would repeat the whole graph build for each; this keeps one result per
+    // (map generation, base ref). Behind a Mutex so it can be filled while
+    // holding only a read lock on the map.
+    analysis: Mutex<Option<Analysis>>,
+}
+
+struct Analysis {
+    // the map generation this was computed from
+    ts: String,
+    base: Option<String>,
+    report: Arc<Value>,
 }
 
 impl MapState {
@@ -59,6 +76,8 @@ impl MapState {
             ts: render::now_ts(),
             caches,
             watch_secs: None,
+            html: false,
+            analysis: Mutex::new(None),
         })
     }
 
@@ -67,6 +86,7 @@ impl MapState {
         let files = scan::collect_files(&self.root)?;
         self.caches = scan::build_caches(&self.root, &files);
         self.ts = render::now_ts();
+        self.invalidate();
         Ok((before, self.caches.len()))
     }
 
@@ -74,6 +94,45 @@ impl MapState {
     fn swap_in(&mut self, caches: Vec<FileCache>) {
         self.caches = caches;
         self.ts = render::now_ts();
+        self.invalidate();
+    }
+
+    // `ts` alone would do it, but it has one-second resolution - two rescans
+    // inside the same second would otherwise serve a stale analysis.
+    fn invalidate(&self) {
+        if let Ok(mut slot) = self.analysis.lock() {
+            *slot = None;
+        }
+    }
+
+    // The insights analysis for this map, computed at most once per
+    // (generation, base). `base` is the git ref the change set diffs against.
+    fn analysis(&self, base: Option<&str>) -> Arc<Value> {
+        let want = base.map(str::to_string);
+        let mut slot = match self.analysis.lock() {
+            Ok(s) => s,
+            // a panic in another thread must not take the endpoint down; just
+            // pay for a fresh pass
+            Err(p) => p.into_inner(),
+        };
+        if let Some(a) = slot.as_ref() {
+            if a.ts == self.ts && a.base == want {
+                return Arc::clone(&a.report);
+            }
+        }
+        let report = Arc::new(insights::insights(
+            &self.caches,
+            &self.root,
+            &self.root_label,
+            &self.ts,
+            base,
+        ));
+        *slot = Some(Analysis {
+            ts: self.ts.clone(),
+            base: want,
+            report: Arc::clone(&report),
+        });
+        report
     }
 
     fn path_of(&self, cache: &FileCache) -> String {
@@ -397,7 +456,7 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
                     "kind": "func", "file": path, "line": f.line, "col": f.col,
                     "ret": f.ret, "doc": f.comment, "span": [f.start_line, f.end_line],
                 });
-                if qualifier.is_some_and(|q| crate::surf::qualifier_names_service(q, stem)) {
+                if qualifier.is_some_and(|q| crate::changes::qualifier_names_service(q, stem)) {
                     stem_matched_defs.push(def.clone());
                 }
                 definitions.push(def);
@@ -411,10 +470,10 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
                 // `money::MAX` narrows by file stem, `Encoding::O200kBase`
                 // by the owning enum recorded as the const's type
                 let narrows = qualifier.is_some_and(|q| {
-                    crate::surf::qualifier_names_service(q, stem)
+                    crate::changes::qualifier_names_service(q, stem)
                         || k.ty
                             .as_deref()
-                            .is_some_and(|t| crate::surf::qualifier_names_service(q, t))
+                            .is_some_and(|t| crate::changes::qualifier_names_service(q, t))
                 });
                 if narrows {
                     stem_matched_defs.push(def.clone());
@@ -746,8 +805,11 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "file",
-            "The full map entry for one source file: constants, functions (with spans), intra-file call graph, notes, and the rendered .ccc markdown.",
-            json!({"path": {"type": "string", "description": "relative path, cache name, or unique path suffix"}}),
+            "The map entry for one source file: the rendered .ccc markdown (constants, functions with return types and doc summaries, notes). Pass structured=true instead when you need definition spans and the intra-file call graph.",
+            json!({
+                "path": {"type": "string", "description": "relative path, cache name, or unique path suffix"},
+                "structured": {"type": "boolean", "description": "return spans and the intra-file call graph instead of the rendered markdown (default false)"},
+            }),
             &["path"],
         ),
         tool(
@@ -757,6 +819,69 @@ fn mcp_tools() -> Value {
             &[],
         ),
         tool("refresh", "Rescan the source tree into memory. Call after editing source files.", json!({}), &[]),
+
+        // analysis tools. All six are views onto one pass, computed once
+        // per (map generation, base), paged.
+        tool(
+            "changes",
+            "What this branch changed, diffed against a base ref: changed functions with the tests that name them, which services need testing, service edges, and the calls the resolver refused to attribute. Includes uncommitted edits and untracked files by default. This is the change set the `test_triggers` tool refers to.",
+            json!({
+                "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
+                "limit": {"type": "integer", "description": "changed functions per page (default 40, max 500)"},
+                "offset": {"type": "integer", "description": "changed functions to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
+            "test_triggers",
+            "Which tests to run for the changes on this branch, and which are missing. Tests are matched to changed functions through the call graph, so a change deep in the stack still surfaces the tests above it; `distance` is how many call hops away each one sits. Returns a runnable command per language. Call this before running a suite, and after editing, to find what a change puts at risk.",
+            json!({
+                "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
+                "limit": {"type": "integer", "description": "triggered tests and gaps per page (default 25, max 500)"},
+                "offset": {"type": "integer", "description": "triggered tests and gaps to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
+            "test_targets",
+            "Functions ranked by how much a missing test would cost, each with the kind of test the measurements justify (smoke-test, integration-test, contract-test, perf-test, load-test), the reasoning behind that choice, and language-specific advice. Ranked by complexity, call depth, loop depth, call sites, cross-service callers, and whether anything names the function today.",
+            json!({
+                "kind": {"type": "string", "enum": ["smoke-test", "integration-test", "contract-test", "perf-test", "load-test"], "description": "only targets recommending this kind"},
+                "limit": {"type": "integer", "description": "targets per page (default 15, max 500)"},
+                "offset": {"type": "integer", "description": "targets to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
+            "lints",
+            "Syntax-level findings: leaked resources, unrollable loops, inline candidates, deep nesting and similar. Every finding cites the measurement it came from, and every rule ships its own limits - there is no type or data-flow information behind these, so verify before acting.",
+            json!({
+                "rule": {"type": "string", "description": "only findings from this rule (see the rules section of any result)"},
+                "limit": {"type": "integer", "description": "findings per page (default 40, max 500)"},
+                "offset": {"type": "integer", "description": "findings to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
+            "hot",
+            "Call-graph shape: the most-called functions, the widest fan-outs, the most complex, the deepest call chains, and recursion cycles. Structural, not measured - it ranks by graph shape, not execution frequency, so treat it as where to look rather than where time goes.",
+            json!({
+                "view": {"type": "string", "enum": ["most_called", "widest", "most_complex", "deepest_chains", "cycles"], "description": "one view (default: all five)"},
+                "limit": {"type": "integer", "description": "rows per view (default 15, max 500)"},
+                "offset": {"type": "integer", "description": "rows to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
+            "services",
+            "The service map and the call edges between services, with the call sites that carry each hop. Services come from `.ccc/map.json` when present, top-level directories otherwise. An edge is `declared` if the config lists it, `detected` if calls were resolved across it - both are reported, since a declared HTTP or queue link resolves no calls by design.",
+            json!({
+                "service": {"type": "string", "description": "drill into one service: its definition plus every edge touching it"},
+                "limit": {"type": "integer", "description": "edges per page (default 25, max 500)"},
+                "offset": {"type": "integer", "description": "edges to skip (default 0)"},
+            }),
+            &[],
+        ),
     ]})
 }
 
@@ -791,14 +916,865 @@ fn mcp_initialize(params: &Value) -> Value {
             file's full map, `notes` for TODO/FIXME markers. The map auto-refreshes \
             when source files change (three seconds of lag); call `refresh` to force an \
             immediate rescan after editing. Reach for text search only for non-symbol \
-            text (string literals, config). Open real source files for exact \
-            code - this map is for navigation and impact, not authoritative content.",
+            text (string literals, config). \
+            Six further tools analyse the map rather than index it: `changes` for what \
+            this branch touched, `test_triggers` for which tests that makes necessary \
+            (call it before running a suite and after editing), `test_targets` for \
+            where a missing test would cost most and which kind to write, `lints` for \
+            syntax-level findings, `hot` for call-graph shape, `services` for the \
+            service map and the calls crossing it. These are heuristics over a syntax \
+            tree - no type inference, data flow or runtime profile - so each result \
+            carries the evidence behind it and the limits of the rule that produced \
+            it; read those before acting. They are paged, not truncated: when a result \
+            says `showing 1-40 of 152`, pass `offset` to walk the rest. \
+            Results are markdown; the same data is available as JSON from this \
+            server's HTTP endpoints (/index, /find, /references, /dependencies, /file, \
+            /notes, /insights.json) when something needs to parse it. Open real source \
+            files for exact code - this map is for navigation and impact, not \
+            authoritative content.",
     })
 }
 
-fn mcp_text(v: &Value, is_error: bool) -> Value {
-    let text = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+fn mcp_md(text: &str, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+}
+
+// markdown rendering of tool results
+// MCP results are text content blocks, so the map is rendered as markdown
+// rather than pretty JSON: the same information for ~40-50% fewer tokens
+
+fn jstr(v: &Value, k: &str) -> String {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+fn jnum(v: &Value, k: &str) -> i64 {
+    v.get(k).and_then(|x| x.as_i64()).unwrap_or(0)
+}
+
+fn jbool(v: &Value, k: &str) -> bool {
+    v.get(k).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+fn jarr(v: &Value, k: &str) -> Vec<Value> {
+    v.get(k)
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+// comma-joined string array (`symbols`, `ambiguous_symbols`, ...)
+fn jnames(v: &Value, k: &str) -> String {
+    jarr(v, k)
+        .iter()
+        .filter_map(|x| x.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// a section body, or `(none)` when empty
+fn md_section(out: &mut String, title: &str, body: &str) {
+    out.push_str(&format!("\n## {title}\n"));
+    out.push_str(if body.is_empty() { "(none)\n" } else { body });
+}
+
+// one map hit - covers every kind `find` and `references` emit (func, const,
+// note, call, use), printing only the fields that kind carries
+fn md_hit(r: &Value) -> String {
+    let mut line = format!("{}:{}", jstr(r, "file"), jnum(r, "line"));
+    if let Some(col) = r.get("col").and_then(|x| x.as_i64()) {
+        line.push_str(&format!(":{col}"));
+    }
+    line.push_str(&format!(" {}", jstr(r, "kind")));
+    let name = jstr(r, "name");
+    if !name.is_empty() {
+        line.push_str(&format!(" {name}"));
+    }
+    if let Some(ty) = r.get("type").and_then(|x| x.as_str()) {
+        line.push_str(&format!(": {ty}"));
+    }
+    if let Some(ret) = r.get("ret").and_then(|x| x.as_str()) {
+        line.push_str(&format!(" -> {ret}"));
+    }
+    if let Some(span) = r.get("span").and_then(|x| x.as_array()) {
+        if let [a, b] = &span[..] {
+            line.push_str(&format!(" span {a}-{b}"));
+        }
+    }
+    if let Some(q) = r.get("qualifier").and_then(|x| x.as_str()) {
+        line.push_str(&format!(" qualifier={q}"));
+    }
+    let caller = jstr(r, "caller");
+    if !caller.is_empty() {
+        line.push_str(&format!(" in {caller}"));
+    }
+    if jbool(r, "test_ctx") {
+        line.push_str(" (test)");
+    }
+    let text = jstr(r, "text");
+    if !text.is_empty() {
+        line.push_str(&format!(" {text}"));
+    }
+    if let Some(doc) = r.get("doc").and_then(|x| x.as_str()) {
+        line.push_str(&format!(" - {doc}"));
+    }
+    line.push('\n');
+    line
+}
+
+fn md_index(v: &Value) -> String {
+    let t = v.get("totals").cloned().unwrap_or_default();
+    let mut out = format!(
+        "# {} - {} files (generated {})\n{} funcs, {} consts, {} refs, {} notes\n\n\
+         | file | lang | funcs | consts | refs | notes |\n|---|---|---|---|---|---|\n",
+        jstr(v, "root"),
+        jnum(&t, "files"),
+        jstr(v, "generated"),
+        jnum(&t, "funcs"),
+        jnum(&t, "consts"),
+        jnum(&t, "refs"),
+        jnum(&t, "notes"),
+    );
+    for f in jarr(v, "files") {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            jstr(&f, "path"),
+            jstr(&f, "language"),
+            jnum(&f, "funcs"),
+            jnum(&f, "consts"),
+            jnum(&f, "refs"),
+            jnum(&f, "notes"),
+        ));
+    }
+    out
+}
+
+fn md_dependencies(v: &Value) -> String {
+    let edges = |key: &str| -> String {
+        jarr(v, key)
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} -> {}: {}\n",
+                    jstr(e, "from"),
+                    jstr(e, "to"),
+                    jnames(e, "symbols")
+                )
+            })
+            .collect()
+    };
+    // per-file shape carries `file`; the whole-project shape carries `edges`
+    if v.get("file").is_some() {
+        let mut out = format!("# dependencies for {}\n", jstr(v, "file"));
+        md_section(&mut out, "depends on", &edges("depends_on"));
+        md_section(&mut out, "depended on by", &edges("depended_on_by"));
+        return out;
+    }
+    let mut out = format!(
+        "# dependencies - {} files, {} edges\n\n{}",
+        jnum(v, "files"),
+        jarr(v, "edges").len(),
+        edges("edges"),
+    );
+    let ambiguous = jnames(v, "ambiguous_symbols");
+    if !ambiguous.is_empty() {
+        out.push_str(&format!(
+            "\nambiguous (defined in more than one file, no evidence to pick one): {ambiguous}\n"
+        ));
+    }
+    let excluded = jnames(v, "excluded_symbols");
+    if !excluded.is_empty() {
+        out.push_str(&format!(
+            "\nexcluded (name matches a definition elsewhere, but the call site \
+             neither qualifies it nor imports it): {excluded}\n"
+        ));
+    }
+    out
+}
+
+fn md_find(v: &Value) -> String {
+    let shown = jarr(v, "results");
+    let mut out = format!(
+        "# find \"{}\" (kind {}) - {} result(s){}\n\n",
+        jstr(v, "query"),
+        jstr(v, "kind"),
+        jnum(v, "count"),
+        if jbool(v, "truncated") {
+            format!(", showing {}", shown.len())
+        } else {
+            String::new()
+        },
+    );
+    for r in &shown {
+        out.push_str(&md_hit(r));
+    }
+    out
+}
+
+fn md_references(v: &Value) -> String {
+    let counts = v.get("counts").cloned().unwrap_or_default();
+    let mut out = format!(
+        "# references {} - {} definition(s), {} reference(s){}\n",
+        jstr(v, "symbol"),
+        jnum(&counts, "definitions"),
+        jnum(&counts, "references"),
+        if jbool(v, "truncated") {
+            format!(", showing {}", jarr(v, "references").len())
+        } else {
+            String::new()
+        },
+    );
+    let hits = |key: &str| -> String { jarr(v, key).iter().map(md_hit).collect() };
+    md_section(&mut out, "definitions", &hits("definitions"));
+    md_section(&mut out, "references", &hits("references"));
+    out
+}
+
+fn md_notes(v: &Value) -> String {
+    let marker = jstr(v, "marker");
+    let mut out = format!(
+        "# notes{} - {}\n\n",
+        if marker.is_empty() {
+            String::new()
+        } else {
+            format!(" ({marker})")
+        },
+        jnum(v, "count"),
+    );
+    for x in jarr(v, "notes") {
+        out.push_str(&format!(
+            "{}:{} {}\n",
+            jstr(&x, "file"),
+            jnum(&x, "line"),
+            jstr(&x, "text")
+        ));
+    }
+    out
+}
+
+// the structured half of a `file` result: spans and the intra-file call graph,
+// without the rendered markdown that restates them
+fn md_file_structured(v: &Value) -> String {
+    let mut out = format!(
+        "# {} ({})\ncache entry: {}\n",
+        jstr(v, "path"),
+        jstr(v, "language"),
+        jstr(v, "cache_name"),
+    );
+    let consts: String = jarr(v, "consts")
+        .iter()
+        .map(|k| {
+            format!(
+                "{} {}{}\n",
+                jnum(k, "line"),
+                jstr(k, "name"),
+                k.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| format!(": {t}"))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    let funcs: String = jarr(v, "funcs")
+        .iter()
+        .map(|f| {
+            let mut l = format!("{}:{} {}", jnum(f, "line"), jnum(f, "col"), jstr(f, "name"));
+            if let Some(ret) = f.get("ret").and_then(|x| x.as_str()) {
+                l.push_str(&format!(" -> {ret}"));
+            }
+            if let Some(span) = f.get("span").and_then(|x| x.as_array()) {
+                if let [a, b] = &span[..] {
+                    l.push_str(&format!(" span {a}-{b}"));
+                }
+            }
+            if let Some(doc) = f.get("doc").and_then(|x| x.as_str()) {
+                l.push_str(&format!(" - {doc}"));
+            }
+            l.push('\n');
+            l
+        })
+        .collect();
+    let refs: String = jarr(v, "refs")
+        .iter()
+        .map(|r| {
+            format!(
+                "{} {} -> {}:{}\n",
+                jnum(r, "call_line"),
+                jstr(r, "caller"),
+                jstr(r, "target"),
+                jnum(r, "target_line"),
+            )
+        })
+        .collect();
+    let notes: String = jarr(v, "notes")
+        .iter()
+        .map(|n| format!("{} {}\n", jnum(n, "line"), jstr(n, "text")))
+        .collect();
+    md_section(&mut out, "consts (line name: type)", &consts);
+    md_section(&mut out, "funcs (line:col name -> ret)", &funcs);
+    md_section(&mut out, "calls (line caller -> target:line)", &refs);
+    md_section(&mut out, "notes (line text)", &notes);
+    out
+}
+
+// The analysis sections are large - `test_targets` alone runs to six figures of
+// JSON on a medium repo. Handing an agent a silently truncated list is the
+// failure mode to avoid: it reads as "that was everything". So every
+// list-shaped tool takes the same window and always says what it left out.
+#[derive(Clone, Copy)]
+struct Page {
+    offset: usize,
+    limit: usize,
+}
+
+impl Page {
+    fn from(args: &Value, default_limit: usize) -> Page {
+        let n = |k: &str, d: usize| {
+            args.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(d)
+        };
+        Page {
+            offset: n("offset", 0),
+            limit: n("limit", default_limit).clamp(1, 500),
+        }
+    }
+
+    // the window, plus the line that accounts for everything outside it
+    fn apply<'a>(&self, items: &'a [Value]) -> (&'a [Value], String) {
+        let total = items.len();
+        let start = self.offset.min(total);
+        let end = (start + self.limit).min(total);
+        let window = &items[start..end];
+        let note = if total == 0 {
+            String::new()
+        } else if start == 0 && end == total {
+            format!("({total} total)\n")
+        } else {
+            let more = if end < total {
+                format!(", pass offset={end} for the next page")
+            } else {
+                String::new()
+            };
+            format!("(showing {}-{end} of {total}{more})\n", start + 1)
+        };
+        (window, note)
+    }
+}
+
+// `file:line`, the form every other tool here emits
+fn at(v: &Value) -> String {
+    format!("{}:{}", jstr(v, "file"), jnum(v, "line"))
+}
+
+// With no `.ccc/map.json`, `changes` names the implicit whole-root service
+// `.`, which on its own tells a reader nothing.
+fn svc(name: &str) -> &str {
+    if name == "." {
+        "whole project"
+    } else {
+        name
+    }
+}
+
+fn svc_names(v: &Value, k: &str) -> String {
+    jarr(v, k)
+        .iter()
+        .filter_map(|x| x.as_str())
+        .map(svc)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// Evidence, not an index: a helper named by forty tests would otherwise fill
+// the result with names that add nothing after the first few.
+fn jnames_capped(v: &Value, k: &str, cap: usize) -> String {
+    let all = jarr(v, k);
+    let shown: Vec<&str> = all.iter().filter_map(|x| x.as_str()).take(cap).collect();
+    let mut s = shown.join(", ");
+    if all.len() > cap {
+        s.push_str(&format!(" (+{} more)", all.len() - cap));
+    }
+    s
+}
+
+// The change set is unavailable outside a git repo, on a shallow clone, or with
+// no base ref. Say which, rather than render an empty list that reads as
+// "nothing changed".
+fn md_unavailable(what: &str, v: &Value) -> Option<String> {
+    if jbool(v, "available") || v.get("available").is_none() {
+        return None;
+    }
+    Some(format!(
+        "# {what}\nunavailable: {}\n\n{}\n",
+        jstr(v, "reason"),
+        jstr(v, "hint")
+    ))
+}
+
+fn md_changes(v: &Value, page: Page) -> String {
+    if let Some(why) = md_unavailable("changes", v) {
+        return why;
+    }
+    let c = v.get("counts").cloned().unwrap_or(json!({}));
+    let short = |k: &str| jstr(v, k).chars().take(9).collect::<String>();
+    let mut out = format!(
+        "# changes\nbase {} ({}..{}) - {} service(s)\n{} file(s), {} function(s) changed, {} untested\nservices to test: {}\n",
+        jstr(v, "base"),
+        short("base_sha"),
+        short("head_sha"),
+        jarr(v, "services").len(),
+        jnum(&c, "changed_files"),
+        jnum(&c, "changed_functions"),
+        jarr(v, "untested").len(),
+        {
+            let s = svc_names(v, "services_to_test");
+            if s.is_empty() { "(none)".into() } else { s }
+        },
+    );
+
+    let funcs = jarr(v, "changed_functions");
+    let (window, note) = page.apply(&funcs);
+    let body: String = window
+        .iter()
+        .map(|f| {
+            let lines = jarr(f, "lines");
+            let span = match &lines[..] {
+                [a, b] => format!("{a}-{b}"),
+                _ => jnum(f, "line").to_string(),
+            };
+            let tested = jarr(f, "tested_by");
+            format!(
+                "{}:{} {} [{}] {}\n",
+                jstr(f, "file"),
+                span,
+                jstr(f, "function"),
+                svc_names(f, "services"),
+                if tested.is_empty() {
+                    "UNTESTED".to_string()
+                } else {
+                    format!("tested_by: {}", jnames_capped(f, "tested_by", 5))
+                },
+            )
+        })
+        .collect();
+    md_section(&mut out, &format!("changed functions {note}"), &body);
+
+    let edges: String = jarr(v, "edges")
+        .iter()
+        .map(|e| {
+            let mut tags = Vec::new();
+            if jbool(e, "declared") {
+                tags.push("declared");
+            }
+            if jbool(e, "detected") {
+                tags.push("detected");
+            }
+            format!(
+                "{} -> {} [{}] {}\n",
+                svc(&jstr(e, "from")),
+                svc(&jstr(e, "to")),
+                tags.join("+"),
+                jarr(e, "symbols")
+                    .iter()
+                    .filter_map(|s| s.get("symbol").and_then(|x| x.as_str()))
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect();
+    md_section(&mut out, "service edges", &edges);
+
+    // calls the resolver refused to attribute: the honest counterpart to the
+    // edges above, and the first place to look when an edge is missing
+    let unresolved: String = jarr(v, "unresolved_calls")
+        .iter()
+        .take(40)
+        .map(|u| {
+            format!(
+                "{} {} at {} - candidates: {}\n",
+                svc(&jstr(u, "from")),
+                jstr(u, "symbol"),
+                at(u),
+                {
+                    let c = svc_names(u, "candidates");
+                    if c.is_empty() { "none".into() } else { c }
+                }
+            )
+        })
+        .collect();
+    md_section(&mut out, "unresolved calls", &unresolved);
+    out
+}
+
+fn md_triggers(v: &Value, targets: &Value, page: Page) -> String {
+    if let Some(why) = md_unavailable("test triggers", v) {
+        return why;
+    }
+    let c = v.get("counts").cloned().unwrap_or(json!({}));
+    let mut out = format!(
+        "# test triggers\nbase {} - {} of {} test(s) trigger, {} directly, {} gap(s)\n{} function(s) changed in {} file(s); {} uncommitted\n",
+        jstr(v, "base"),
+        jnum(&c, "tests_to_run"),
+        jnum(v, "total_tests"),
+        jnum(&c, "direct"),
+        jnum(&c, "gaps"),
+        jnum(&c, "changed_functions"),
+        jnum(&c, "changed_files"),
+        jnum(&c, "uncommitted_files"),
+    );
+    if jbool(v, "full_suite_advised") {
+        out.push_str(
+            "the trigger set covers most of the suite - run everything, a long name filter is slower and more fragile\n",
+        );
+    }
+
+    // A name filter selecting 80 tests runs to kilobytes, and pasting it is
+    // worse than running the suite. Never truncate it - a half-copied command
+    // silently selects the wrong tests - so past the budget, describe it and
+    // point at the endpoint that serves it whole.
+    const MAX_COMMAND: usize = 1200;
+    let cmds: String = jarr(v, "commands")
+        .iter()
+        .map(|x| {
+            let cmd = jstr(x, "command");
+            if cmd.len() > MAX_COMMAND {
+                format!(
+                    "({}: a filter naming {} tests, {} chars - omitted)\n  \
+                     Run the whole suite instead; the exact command is in /insights.json \
+                     under test_triggers.commands.\n",
+                    jstr(x, "language"),
+                    jnum(x, "selects"),
+                    cmd.len(),
+                )
+            } else {
+                format!(
+                    "$ {cmd}\n  ({}, selects {}) {}\n",
+                    jstr(x, "language"),
+                    jnum(x, "selects"),
+                    jstr(x, "caveat")
+                )
+            }
+        })
+        .collect();
+    md_section(&mut out, "commands", &cmds);
+
+    let run = jarr(v, "run");
+    let (window, note) = page.apply(&run);
+    let body: String = window
+        .iter()
+        .map(|r| {
+            let d = jnum(r, "distance");
+            format!(
+                "{:<7} {} {} - {}\n",
+                if d == 0 {
+                    "direct".to_string()
+                } else {
+                    format!("{d} hop{}", if d > 1 { "s" } else { "" })
+                },
+                at(r),
+                jstr(r, "test"),
+                jstr(r, "reason")
+            )
+        })
+        .collect();
+    md_section(&mut out, &format!("run {note}"), &body);
+
+    // Each gap is a `target` id into `test_targets`; the recommendation lives
+    // there and is looked up rather than restated.
+    let rows = jarr(targets, "targets");
+    let by_id: BTreeMap<String, &Value> = rows.iter().map(|t| (jstr(t, "id"), t)).collect();
+    let all_gaps = jarr(v, "add");
+    // gaps get the same window as the run list - on a large branch there are
+    // more of them than tests, and an unpaged list would dwarf everything above
+    let (gap_window, gap_note) = page.apply(&all_gaps);
+    let gaps: String = gap_window
+        .iter()
+        .map(|a| {
+            let id = jstr(a, "target");
+            match by_id.get(&id) {
+                Some(t) => format!(
+                    "[{}] {} {} - {}\n",
+                    jstr(t, "kind"),
+                    at(t),
+                    jstr(t, "function"),
+                    jstr(t, "suggest")
+                ),
+                None => format!("{id} - nothing covers it\n"),
+            }
+        })
+        .collect();
+    md_section(&mut out, &format!("missing coverage {gap_note}"), &gaps);
+    out.push_str(&format!("\n{}\n", jstr(v, "note")));
+    out
+}
+
+fn md_targets(v: &Value, kind: Option<&str>, page: Page) -> String {
+    let s = v.get("summary").cloned().unwrap_or(json!({}));
+    let by_kind = s
+        .get("by_kind")
+        .and_then(|b| b.as_object())
+        .map(|b| {
+            b.iter()
+                .map(|(k, n)| format!("{k} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let mut out = format!(
+        "# test targets\n{} function(s) ranked, {} with no test naming them\nby kind: {by_kind}\n",
+        jnum(&s, "functions"),
+        jnum(&s, "untested"),
+    );
+
+    let all = jarr(v, "targets");
+    let rows: Vec<Value> = match kind {
+        Some(k) => all
+            .iter()
+            .filter(|t| jstr(t, "kind") == k || jarr(t, "also").iter().any(|a| a == k))
+            .cloned()
+            .collect(),
+        None => all,
+    };
+    let (window, note) = page.apply(&rows);
+    let body: String = window
+        .iter()
+        .map(|t| {
+            let why = jarr(t, "why")
+                .iter()
+                .map(|w| jstr(w, "detail"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let mut l = format!(
+                "[{}] {} {} ({}) priority {}{}\n  {}\n",
+                jstr(t, "kind"),
+                at(t),
+                jstr(t, "function"),
+                svc(&jstr(t, "service")),
+                jnum(t, "priority"),
+                if jbool(t, "covered") { "" } else { " UNTESTED" },
+                jstr(t, "suggest"),
+            );
+            if !why.is_empty() {
+                l.push_str(&format!("  because: {why}\n"));
+            }
+            for sem in jarr(t, "semantics").iter().filter_map(|x| x.as_str()) {
+                l.push_str(&format!("  - {sem}\n"));
+            }
+            l
+        })
+        .collect();
+    md_section(&mut out, &format!("targets {note}"), &body);
+
+    // the rubric is what makes a `kind` actionable rather than a label
+    let rubric: String = jarr(v, "rubric")
+        .iter()
+        .map(|r| {
+            format!(
+                "{} - {} (chosen when {})\n",
+                jstr(r, "kind"),
+                jstr(r, "for"),
+                jstr(r, "chosen_when")
+            )
+        })
+        .collect();
+    md_section(&mut out, "kinds", &rubric);
+    out.push_str(&format!("\n{}\n", jstr(v, "note")));
+    out
+}
+
+fn md_lints(v: &Value, rule: Option<&str>, page: Page) -> Result<String, String> {
+    let catalogue = jarr(v, "rules");
+    // A misspelled rule that quietly returns nothing reads as "clean". Refuse
+    // it and name the rules that exist.
+    if let Some(r) = rule {
+        if !catalogue.iter().any(|c| jstr(c, "rule") == r) {
+            return Err(format!(
+                "unknown rule '{r}'; expected one of {}",
+                catalogue
+                    .iter()
+                    .map(|c| jstr(c, "rule"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    let all = jarr(v, "findings");
+    let rows: Vec<Value> = match rule {
+        Some(r) => all.iter().filter(|f| jstr(f, "rule") == r).cloned().collect(),
+        None => all,
+    };
+    let mut out = format!("# lints\n{} finding(s)\n", rows.len());
+    if jbool(v, "truncated") {
+        out.push_str("the finding list hit its cap - narrow it with `rule`\n");
+    }
+    let (window, note) = page.apply(&rows);
+    let body: String = window
+        .iter()
+        .map(|f| {
+            format!(
+                "[{}] {} {} in `{}` - {}\n  {}\n",
+                jstr(f, "severity"),
+                jstr(f, "rule"),
+                at(f),
+                jstr(f, "function"),
+                jstr(f, "message"),
+                jstr(f, "hint"),
+            )
+        })
+        .collect();
+    md_section(&mut out, &format!("findings {note}"), &body);
+
+    // Every rule ships its own limits. They are the difference between a
+    // finding worth acting on and one worth ignoring, so they travel with it -
+    // but only for the rules actually in play.
+    let rules: String = catalogue
+        .iter()
+        .filter(|r| rule.is_none() || rule == Some(jstr(r, "rule").as_str()))
+        .map(|r| {
+            format!(
+                "{} ({}) - {}\n  evidence: {}\n  limits: {}\n",
+                jstr(r, "rule"),
+                jstr(r, "severity"),
+                jstr(r, "what"),
+                jstr(r, "evidence"),
+                jstr(r, "limits"),
+            )
+        })
+        .collect();
+    md_section(&mut out, "rules", &rules);
+    out.push_str(&format!("\n{}\n", jstr(v, "note")));
+    Ok(out)
+}
+
+const HOT_VIEWS: &[&str] = &[
+    "most_called",
+    "widest",
+    "most_complex",
+    "deepest_chains",
+    "cycles",
+];
+
+fn md_hot(v: &Value, view: Option<&str>, page: Page) -> String {
+    let mut out = String::from("# hot paths\n");
+    let wanted: Vec<&str> = match view {
+        Some(x) => vec![x],
+        None => HOT_VIEWS.to_vec(),
+    };
+    for name in wanted {
+        let rows = jarr(v, name);
+        let (window, note) = page.apply(&rows);
+        let body: String = window
+            .iter()
+            .map(|r| match name {
+                "deepest_chains" => format!(
+                    "depth {} ({} call sites): {}\n",
+                    jnum(r, "depth"),
+                    jnum(r, "call_sites"),
+                    jarr(r, "chain")
+                        .iter()
+                        .map(|c| jstr(c, "name"))
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                ),
+                "cycles" => format!(
+                    "{}\n",
+                    jarr(r, "chain")
+                        .iter()
+                        .map(|c| jstr(c, "name"))
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                ),
+                _ => format!(
+                    "{} {} callers={} sites={} calls={} cx={} loops={} lines={}{}\n",
+                    at(r),
+                    jstr(r, "name"),
+                    jnum(r, "callers"),
+                    jnum(r, "call_sites"),
+                    jnum(r, "calls"),
+                    jnum(r, "complexity"),
+                    jnum(r, "loop_depth"),
+                    jnum(r, "lines"),
+                    if jbool(r, "recursive") { " recursive" } else { "" },
+                ),
+            })
+            .collect();
+        md_section(&mut out, &format!("{} {note}", name.replace('_', " ")), &body);
+    }
+    out.push_str(&format!("\n{}\n", jstr(v, "note")));
+    out
+}
+
+fn md_services(v: &Value, only: Option<&str>, page: Page) -> String {
+    let mut out = format!("# services\nsource: {}\n", jstr(v, "source"));
+    let svcs = jarr(v, "services");
+    let body: String = svcs
+        .iter()
+        .filter(|s| only.is_none() || only == Some(jstr(s, "name").as_str()))
+        .map(|s| {
+            format!(
+                "{} - {} file(s), {} function(s) [{}]\n",
+                svc(&jstr(s, "name")),
+                jnum(s, "files"),
+                jnum(s, "funcs"),
+                jnames(s, "globs"),
+            )
+        })
+        .collect();
+    md_section(&mut out, &format!("services ({})", svcs.len()), &body);
+
+    let edges: Vec<Value> = jarr(v, "edges")
+        .into_iter()
+        .filter(|e| {
+            only.is_none()
+                || only == Some(jstr(e, "from").as_str())
+                || only == Some(jstr(e, "to").as_str())
+        })
+        .collect();
+    let (window, note) = page.apply(&edges);
+    let body: String = window
+        .iter()
+        .map(|e| {
+            let mut tags = Vec::new();
+            if jbool(e, "declared") {
+                tags.push("declared");
+            }
+            if jbool(e, "detected") {
+                tags.push("detected");
+            }
+            if jbool(e, "declared") && !jbool(e, "detected") {
+                tags.push("no calls found");
+            }
+            let mut l = format!(
+                "{} -> {} [{}] {} call site(s)\n",
+                svc(&jstr(e, "from")),
+                svc(&jstr(e, "to")),
+                tags.join(", "),
+                jnum(e, "count"),
+            );
+            // the call sites are the drill-down: what actually carries the hop
+            for s in jarr(e, "sites").iter().take(6) {
+                l.push_str(&format!(
+                    "  {}:{} {} -> {} ({}:{})\n",
+                    jstr(s, "caller_file"),
+                    jnum(s, "caller_line"),
+                    jstr(s, "caller"),
+                    jstr(s, "symbol"),
+                    jstr(s, "target_file"),
+                    jnum(s, "target_line"),
+                ));
+            }
+            l
+        })
+        .collect();
+    md_section(&mut out, &format!("edges {note}"), &body);
+
+    let unassigned = jnames(v, "unassigned_files");
+    if !unassigned.is_empty() && only.is_none() {
+        md_section(&mut out, "unassigned files", &format!("{unassigned}\n"));
+    }
+    out
 }
 
 fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64, String)> {
@@ -812,31 +1788,93 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
     if name == "refresh" {
         let mut map = state.write().expect("map lock poisoned");
         return match map.rescan() {
-            Ok((before, after)) => Ok(mcp_text(
-                &json!({"files_before": before, "files_after": after, "generated": map.ts}),
+            Ok((before, after)) => Ok(mcp_md(
+                &format!(
+                    "rescanned: {before} -> {after} files (generated {})",
+                    map.ts
+                ),
                 false,
             )),
-            Err(e) => Ok(mcp_text(&json!({"error": e.to_string()}), true)),
+            Err(e) => Ok(mcp_md(&format!("error: {e}"), true)),
         };
     }
 
     let map = state.read().expect("map lock poisoned");
-    let out: Result<Value, String> = match name {
-        "index" => Ok(q_index(&map)),
+    // `file` returns the rendered markdown by default; `structured: true` swaps
+    // it for spans plus the intra-file call graph. One representation per call -
+    // returning both duplicated the same content at roughly 3x the tokens.
+    let structured = args
+        .get("structured")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let out: Result<String, String> = match name {
+        "index" => Ok(md_index(&q_index(&map))),
         "find" => q_find(
             &map,
             &arg("query").unwrap_or_default(),
             arg("kind").as_deref().unwrap_or("any"),
-        ),
-        "references" => q_references(&map, &arg("symbol").unwrap_or_default()),
-        "dependencies" => q_dependencies(&map, arg("file").as_deref()),
-        "file" => q_file(&map, &arg("path").unwrap_or_default()),
-        "notes" => Ok(q_notes(&map, arg("marker").as_deref())),
+        )
+        .map(|v| md_find(&v)),
+        "references" => q_references(&map, &arg("symbol").unwrap_or_default()).map(|v| md_references(&v)),
+        "dependencies" => q_dependencies(&map, arg("file").as_deref()).map(|v| md_dependencies(&v)),
+        "file" => q_file(&map, &arg("path").unwrap_or_default()).map(|v| {
+            if structured {
+                md_file_structured(&v)
+            } else {
+                jstr(&v, "markdown")
+            }
+        }),
+        "notes" => Ok(md_notes(&q_notes(&map, arg("marker").as_deref()))),
+        "changes" => {
+            let a = map.analysis(arg("base").as_deref());
+            Ok(md_changes(&a["changes"], Page::from(&args, 40)))
+        }
+        "test_triggers" => {
+            let a = map.analysis(arg("base").as_deref());
+            Ok(md_triggers(
+                &a["test_triggers"],
+                &a["test_targets"],
+                Page::from(&args, 25),
+            ))
+        }
+        "test_targets" => {
+            let a = map.analysis(None);
+            Ok(md_targets(
+                &a["test_targets"],
+                arg("kind").as_deref(),
+                Page::from(&args, 15),
+            ))
+        }
+        "lints" => {
+            let a = map.analysis(None);
+            md_lints(&a["lints"], arg("rule").as_deref(), Page::from(&args, 40))
+        }
+        "hot" => {
+            let view = arg("view");
+            match view.as_deref() {
+                Some(v) if !HOT_VIEWS.contains(&v) => Err(format!(
+                    "unknown view '{v}'; expected one of {}",
+                    HOT_VIEWS.join(", ")
+                )),
+                _ => {
+                    let a = map.analysis(None);
+                    Ok(md_hot(&a["hot"], view.as_deref(), Page::from(&args, 15)))
+                }
+            }
+        }
+        "services" => {
+            let a = map.analysis(None);
+            Ok(md_services(
+                &a["services"],
+                arg("service").as_deref(),
+                Page::from(&args, 25),
+            ))
+        }
         _ => return Err((-32602, format!("unknown tool '{name}'"))),
     };
     Ok(match out {
-        Ok(v) => mcp_text(&v, false),
-        Err(e) => mcp_text(&json!({"error": e}), true),
+        Ok(text) => mcp_md(&text, false),
+        Err(e) => mcp_md(&format!("error: {e}"), true),
     })
 }
 
@@ -939,7 +1977,7 @@ fn parse_query(url: &str) -> (String, BTreeMap<String, String>) {
 }
 
 // only loopback origins - plus "null", the Origin a browser sends for pages
-// opened from file:// (the generated `ccc surf --html` report)
+// opened from file:// (the generated `ccc changes --html` report)
 fn origin_ok(origin: Option<&str>) -> bool {
     let Some(origin) = origin else { return true };
     if origin == "null" {
@@ -986,8 +2024,7 @@ fn html_ok(html: String) -> Reply {
     }
 }
 
-// ------------------------------------------------- HTML fragments (HTMX) ----
-// tiny Tailwind-styled snippets consumed by the `ccc surf --html` report's
+// tiny Tailwind-styled snippets consumed by the `ccc changes --html` report's
 // live-query panel; same q_* data, HTML instead of JSON
 
 fn esc(s: &str) -> String {
@@ -1151,6 +2188,8 @@ const ENDPOINTS: &[&str] = &[
     "GET /file?path=<path>",
     "GET /notes[?marker=TODO]",
     "GET /health",
+    "GET /insights.json[?base=<ref>] (the whole analysis payload)",
+    "GET /insights (human UI over the same data; needs --html)",
     "POST /refresh",
     "POST /mcp (Model Context Protocol, JSON-RPC)",
     "GET /fragment/{find,references,dependencies,health} (HTML for HTMX)",
@@ -1215,6 +2254,22 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
         ("GET", "/notes") => {
             let map = state.read().expect("map lock poisoned");
             ok(q_notes(&map, get("marker")))
+        }
+        ("GET", "/insights.json") => {
+            let map = state.read().expect("map lock poisoned");
+            ok((*map.analysis(get("base"))).clone())
+        }
+        // human-facing insights UI; off unless `ccc serve --html`
+        ("GET", "/insights") => {
+            let map = state.read().expect("map lock poisoned");
+            if !map.html {
+                return bad(
+                    404,
+                    "insights UI is disabled; restart with `ccc serve --html` \
+                     (the data is at /insights.json either way)",
+                );
+            }
+            html_ok(crate::html::render_insights_html(&map.root_label, None))
         }
         // HTML fragments for the HTMX live-query panel (always 200, errors inline)
         ("GET", "/fragment/health") => {
@@ -1298,6 +2353,7 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     {
         let mut map = state.write().expect("map lock poisoned");
         map.watch_secs = opts.watch.map(|d| d.as_secs());
+        map.html = opts.html;
         if map.caches.is_empty() {
             eprintln!("warning: no supported source files under {}", root.display());
         }
@@ -1317,6 +2373,9 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     }
     println!("listening on http://{addr}  (MCP endpoint: http://{addr}/mcp)");
     println!("endpoints: {}", ENDPOINTS.join(" | "));
+    if opts.html {
+        println!("insights UI: http://{addr}/insights");
+    }
     match opts.watch {
         Some(interval) => {
             println!("watching for changes every {}s", interval.as_secs().max(1));
@@ -1547,6 +2606,81 @@ mod tests {
     }
 
     #[test]
+    fn mcp_results_are_markdown_not_json() {
+        let state = RwLock::new(fixture());
+        let call = |name: &str, args: Value| -> String {
+            let v = mcp_handle(
+                &state,
+                &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                        "params": {"name": name, "arguments": args}}),
+            )
+            .unwrap();
+            assert_eq!(v["result"]["isError"], false);
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let idx = call("index", json!({}));
+        assert!(idx.starts_with('#'), "{idx}");
+        assert!(!idx.contains("\"path\":"), "still JSON: {idx}");
+        assert!(idx.contains("| lib/money.rs | rust |"), "{idx}");
+
+        let deps = call("dependencies", json!({}));
+        assert!(deps.contains("api/main.rs -> lib/money.rs: charge"), "{deps}");
+
+        let refs = call("references", json!({"symbol": "charge"}));
+        assert!(refs.contains("## definitions"), "{refs}");
+        assert!(refs.contains("lib/money.rs:4"), "{refs}");
+
+        // markdown renders the same facts for a fraction of the JSON cost (the
+        // table header is fixed overhead, so the margin widens with file count)
+        let as_json = serde_json::to_string_pretty(&q_index(&fixture())).unwrap();
+        assert!(
+            idx.len() * 3 < as_json.len() * 2,
+            "markdown {} vs json {}",
+            idx.len(),
+            as_json.len()
+        );
+    }
+
+    #[test]
+    fn file_tool_returns_one_representation_per_call() {
+        let state = RwLock::new(fixture());
+        let call = |args: Value| -> String {
+            let v = mcp_handle(
+                &state,
+                &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                        "params": {"name": "file", "arguments": args}}),
+            )
+            .unwrap();
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // default: the rendered .ccc markdown, nothing else
+        let md = call(json!({"path": "lib/money.rs"}));
+        assert!(md.contains("# source: lib/money.rs [rust]"), "{md}");
+        assert!(!md.contains("## funcs (line:col"), "{md}");
+
+        // structured: spans and the call graph, without restating the markdown
+        let st = call(json!({"path": "lib/money.rs", "structured": true}));
+        assert!(st.contains("## funcs (line:col name -> ret)"), "{st}");
+        assert!(st.contains("span"), "{st}");
+        assert!(!st.contains("# source:"), "{st}");
+
+        // neither ships both halves the way the old JSON result did
+        let both = serde_json::to_string_pretty(&q_file(&fixture(), "lib/money.rs").unwrap())
+            .unwrap()
+            .len();
+        assert!(md.len() < both / 2, "markdown {} vs json {both}", md.len());
+        assert!(st.len() < both / 2, "structured {} vs json {both}", st.len());
+    }
+
+    #[test]
     fn dependencies_edges_and_per_file() {
         let map = fixture();
         let all = q_dependencies(&map, None).unwrap();
@@ -1722,7 +2856,23 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["index", "find", "references", "dependencies", "file", "notes", "refresh"]
+            vec![
+                // the code map
+                "index",
+                "find",
+                "references",
+                "dependencies",
+                "file",
+                "notes",
+                "refresh",
+                // views onto the one analysis pass
+                "changes",
+                "test_triggers",
+                "test_targets",
+                "lints",
+                "hot",
+                "services",
+            ]
         );
         // tools/call find
         let call = mcp_handle(
@@ -1812,6 +2962,125 @@ mod tests {
         assert_eq!(pre.status, 204);
     }
 
+    // Call every analysis tool the way an agent would, and check the two
+    // things that make one usable: it renders as markdown rather than raw
+    // JSON, and a list it cannot fit says how to get the rest.
+    #[test]
+    fn analysis_tools_render_markdown_and_page_rather_than_truncate() {
+        let state = RwLock::new(fixture());
+        let call = |name: &str, args: Value| -> (bool, String) {
+            let v = mcp_handle(
+                &state,
+                &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                        "params": {"name": name, "arguments": args}}),
+            )
+            .unwrap();
+            (
+                v["result"]["isError"].as_bool().unwrap_or(false),
+                v["result"]["content"][0]["text"].as_str().unwrap().to_string(),
+            )
+        };
+
+        // The fixture has no git repo, so the two git-relative tools must
+        // explain themselves instead of rendering an empty list.
+        for name in ["changes", "test_triggers"] {
+            let (err, out) = call(name, json!({}));
+            assert!(!err, "{name}: {out}");
+            assert!(out.contains("unavailable"), "{name}: {out}");
+            assert!(out.contains("fetch-depth"), "{name} must say how to fix it: {out}");
+        }
+
+        // The other four work off the map alone.
+        for name in ["test_targets", "lints", "hot", "services"] {
+            let (err, out) = call(name, json!({}));
+            assert!(!err, "{name}: {out}");
+            assert!(out.starts_with('#'), "{name} is not markdown: {out}");
+            assert!(!out.contains("\":"), "{name} leaked raw JSON: {out}");
+        }
+
+        // Paging: a window smaller than the list says how to reach the rest,
+        // and `offset` actually moves it.
+        let (_, first) = call("test_targets", json!({"limit": 1}));
+        assert!(first.contains("showing 1-1 of"), "{first}");
+        assert!(first.contains("pass offset=1"), "{first}");
+        let (_, second) = call("test_targets", json!({"limit": 1, "offset": 1}));
+        assert!(second.contains("showing 2-2 of"), "{second}");
+        assert_ne!(
+            first, second,
+            "offset returned the same window - paging is not wired up"
+        );
+
+        // A filter that matches nothing must not read as "nothing to report".
+        let (err, out) = call("lints", json!({"rule": "no-such-rule"}));
+        assert!(err, "an unknown rule silently returned findings: {out}");
+        assert!(out.contains("expected one of"), "{out}");
+        let (err, out) = call("hot", json!({"view": "no-such-view"}));
+        assert!(err, "an unknown view silently returned rows: {out}");
+        assert!(out.contains("expected one of"), "{out}");
+
+        // A rule that exists but has no hits is a real, empty answer.
+        let (err, out) = call("lints", json!({"rule": "leak-risk"}));
+        assert!(!err, "{out}");
+        assert!(out.contains("leak-risk"), "the rule's limits travel with it: {out}");
+    }
+
+    // Six tools over one analysis pass: computing it per call would repeat the
+    // whole graph build each time.
+    #[test]
+    fn the_analysis_is_computed_once_per_generation_and_base() {
+        let map = fixture();
+        let first = map.analysis(None);
+        let again = map.analysis(None);
+        assert!(Arc::ptr_eq(&first, &again), "the analysis was recomputed");
+
+        // a different base is a different question
+        let other = map.analysis(Some("HEAD~1"));
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        // and a rescan must not serve the previous map's analysis
+        let mut map = map;
+        map.ts = "later".into();
+        map.invalidate();
+        assert!(!Arc::ptr_eq(&first, &map.analysis(None)));
+    }
+
+    #[test]
+    fn insights_ui_is_opt_in() {
+        let state = RwLock::new(fixture());
+        assert_eq!(route(&state, "GET", "/insights", b"").status, 404);
+        let off = route(&state, "GET", "/insights", b"");
+        assert!(json_of(&off)["error"].as_str().unwrap().contains("--html"));
+        assert_eq!(route(&state, "GET", "/insights.json", b"").status, 200);
+
+        state.write().unwrap().html = true;
+        let page = route(&state, "GET", "/insights", b"");
+        assert_eq!(page.status, 200);
+        let ReplyBody::Html(body) = &page.body else {
+            panic!("the UI must be served as HTML");
+        };
+        assert!(body.contains("ccc insights"));
+        assert!(body.contains("/insights.json"));
+
+        let data = route(&state, "GET", "/insights.json", b"");
+        assert_eq!(data.status, 200);
+        let v = json_of(&data);
+        assert_eq!(v["schema"], crate::insights::SCHEMA);
+        // the fixture's cross-file call resolves, so the graph is not empty
+        assert!(v["totals"]["functions"].as_u64().unwrap() >= 5);
+        assert!(v["totals"]["edges"].as_u64().unwrap() >= 1);
+        // every tab the page renders has a section to render from
+        for key in ["flame", "hot", "services", "lints", "languages"] {
+            assert!(!v[key].is_null(), "insights payload missing {key}");
+        }
+        // findings never ship without the caveat the UI prints beside them
+        assert!(v["lints"]["note"].as_str().unwrap().contains("heuristics"));
+        // the page reports how long the analysis took, beside when it ran
+        assert!(v["took_ns"].as_u64().unwrap() > 0);
+        assert!(!v["generated"].as_str().unwrap().is_empty());
+        // the flame view is grouped, so per-service trees have somewhere to go
+        assert!(!v["flame"]["groups"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn html_fragments_for_htmx() {
         let state = RwLock::new(fixture());
@@ -1843,7 +3112,7 @@ mod tests {
         assert!(origin_ok(None));
         assert!(origin_ok(Some("http://localhost:3000")));
         assert!(origin_ok(Some("http://127.0.0.1")));
-        // file:// pages (the generated surf HTML report) send Origin: null
+        // file:// pages (the generated changes HTML report) send Origin: null
         assert!(origin_ok(Some("null")));
         assert!(!origin_ok(Some("https://evil.example.com")));
         assert!(!origin_ok(Some("http://nullable.example.com")));

@@ -1,5 +1,6 @@
 <p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="ContextCodeCache Logo"></a></p>
 
+[![Release ContextCodeCache](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
 
 
 # ContextCodeCache (`ccc`)
@@ -26,7 +27,13 @@ Please ⭐ if you find this useful 💚
    (or build from source - `cargo build --release && ./target/release/ccc -- install`)
 2. Start the server `ccc serve`
 
-3. Integrate into your workflow `claude mcp add --transport http ccc http://127.0.0.1:6767/mcp`
+3. Integrate the MCP server into your workflow 
+  
+    a. claude: `claude mcp add --transport http ccc http://127.0.0.1:6767/mcp`
+    
+    b. copilot: `copilot mcp add`
+
+4. Instruct your model to use the MCP tool `ccc`
 
 ## Usage
 
@@ -36,8 +43,11 @@ ccc scan [PATH] --tokens     # also pre-encode the cache into a token stream
 ccc check [PATH]             # exit non-zero if .ccc is stale - for CI
 ccc check [PATH] --format json   # same, but print changed cache files as JSON
 ccc tokenize [PATH]          # pre-encode an existing .ccc into tokens.bin + tokens.json
-ccc surf [PATH]              # what changed vs the base branch + which services to test (JSON)
-ccc serve [PATH]             # HTTP server: agents query the in-memory map (REST + MCP)
+ccc changes [PATH]              # what changed vs the base branch + which services to test (JSON)
+ccc serve [PATH]             # MCP server: agents query the in-memory map (REST + MCP)
+ccc serve [PATH] --html      # render the insights UI at /insights
+ccc insights [PATH]          # the insights analysis as JSON (call graph, triggers, lints)
+ccc insights [PATH] --html F # as one self-contained page
 ccc install [--dir DIR]      # install the ccc binary onto your PATH (Linux)
 ```
 
@@ -101,40 +111,103 @@ curl -s localhost:6767/dependencies?file=src/render.rs   # file-level impact
 curl -s -X POST localhost:6767/refresh          # force an immediate rescan
 ```
 
-`find` and `references` also take qualified names (`serde_json::to_string`,
-`client.charge`): call sites are filtered by qualifier, so counting one
-module's calls needs no grep or client-side filtering.
+### Insights UI for humans (`ccc serve --html`)
 
-The same map is exposed to **MCP** clients (streamable HTTP transport) with
-tools `index` / `find` / `references` / `dependencies` / `file` / `notes` /
-`refresh`, plus each cache entry as a markdown resource:
+The agent endpoints answer questions; `--html` adds a page for *reading the
+shape of the codebase* at **http://127.0.0.1:6767/insights**. It is off by
+default - it is a human surface, not an agent one - and it fetches
+`/insights.json` from the running server, so it tracks the watcher live.
 
 ```sh
-claude mcp add --transport http ccc http://127.0.0.1:6767/mcp
+ccc serve --html      # then open http://127.0.0.1:6767/insights
+curl -s localhost:6767/insights.json      # the same data, for scripting
+
+ccc insights                    # the same analysis as JSON, no server
+ccc insights --html page.html   # ...as one self-contained page, for static hosting
 ```
 
-Loopback-only by default, no filesystem reads at query time, `POST /refresh`
-to rescan. Full endpoint/tool reference: [docs/SERVE.md](docs/SERVE.md).
+### Test triggers - what this change puts at risk
 
+It diffs the branch against its base (the merge-base with `origin/main` by default)
+**including uncommitted edits and untracked files**, maps the changed functions 
+onto the call graph, and reports:
 
-## Surfacing changes to a continuous-testing suite (`ccc surf`)
+- **Run these tests.** A change does not only invalidate the tests that name the
+  changed function: any test exercising something *upstream* runs through it.
+  So the impacted set is the changed functions plus everything that transitively
+  calls them, and a test triggers if it references any member. `distance` is how
+  many call hops away the test landed - `direct` (0) first, since those are the
+  most likely to fail.
+- **A runnable command per language**, so a CI job can paste it:
+  `cargo test -- <names>` · `go test -run '^(A|B)$' ./pkg` · `pytest -k "a or b"`
+  · `npx jest -t "…"` · `ctest -R '…'`. Each carries a caveat where the
+  selector is imprecise. When the trigger set covers 80%+ of the suite the tab
+  says so - at that share a long name filter is slower and more fragile than
+  just running everything.
+- **Missing coverage.** Changed functions no test reaches, each with the kind of
+  test the signals justify. A CI gate can fail on this list.
 
-`ccc surf` tells a pipeline **what changed and what needs testing**. It diffs
+The same data is at `/insights.json` under `test_triggers`, so a pipeline can
+consume it directly. `ccc changes --worktree` applies the same working-tree diff
+on the command line.
+
+```sh
+curl -s localhost:6767/insights.json | jq -r '.test_triggers.commands[].command'
+curl -s localhost:6767/insights.json | jq '.test_triggers.counts'
+```
+
+**What it cannot know.** Tests are matched to changes by name through the call
+graph, so this is the set *worth running* - not proof that running it covers the
+change. A test that exercises code without naming it, or reaches it through
+dynamic dispatch, is invisible. Outside a git repo, or without a base ref, the
+tab says why rather than rendering an empty list that reads as "nothing to run".
+
+**Test targets** scores each kind and takes the strongest, so a recursive AST
+walker with 31 call-outs is an *integration* target while a function with three
+nested loops is a *performance* one:
+
+| kind | chosen when |
+|---|---|
+| `smoke-test` | Nothing stronger applies - typically an entry point nothing calls. |
+| `integration-test` | It orchestrates others: `call-outs x4 + call depth x3 + complexity`. |
+| `contract-test` | Callers in a **different service** - the boundary others depend on (`25` per calling service). |
+| `perf-test` | `loop depth² x10` (nested iteration is superlinear), plus call depth when recursive. |
+| `load-test` | Call sites in the **top decile** *and* it loops or acquires resources. |
+
+Language semantics sharpen the advice rather than the kind: a `Result`/`error`
+return asks for the error path, an `Option` for the empty case, an acquired
+resource for release on both paths, and an untyped language is told that a
+contract test is the only thing pinning its argument shapes.
+
+Coverage here means **a test mentions the function by name** - not that its
+behaviour is asserted, and not that the recommended *kind* of test exists. The
+default filter shows only functions no test mentions at all.
+
+**Read this before trusting the findings.** ccc's map is a tree-sitter symbol
+and call index: there is no type inference, no data flow, and no runtime
+profile. So the flame view is a *static* call tree, not a sampled profile;
+"hot" means structurally central, not frequently executed; and the language
+rules are heuristics
+
+## Surfacing changes to a continuous-testing suite (`ccc changes`)
+
+`ccc changes` tells a pipeline **what changed and what needs testing**. It diffs
 the branch against a base ref (the merge-base with `origin/main` by default),
 maps the diff down to function granularity, groups files into named *services*
-(from `.ccc/surf.json`), and detects cross-service call edges - so when
+(from `.ccc/map.json`), and detects cross-service call edges - so when
 Service A calls Service B and B changes, both land in the test set:
 
 ```sh
-ccc surf --init          # scaffold .ccc/surf.json from your top-level dirs
-ccc surf                 # one line of JSON: services_to_test, edges, untested, ...
-ccc surf --format text   # human-readable summary
-ccc surf --fail-untested # gate: exit 1 when changed functions lack test references
+ccc changes --init          # scaffold .ccc/map.json from your top-level dirs
+ccc changes                 # one line of JSON: services_to_test, edges, untested, ...
+ccc changes --format text   # human-readable summary
+ccc changes --fail-untested # gate: exit 1 when changed functions lack test references
+ccc changes --worktree      # include uncommitted edits and untracked files in the diff
 ```
 
 ```jsonc
 {
-  "schema": "ccc-surf/1",
+  "schema": "ccc-changes/1",
   "services_to_test": ["billing","gateway"], 
   "edges":
   [
@@ -147,25 +220,51 @@ ccc surf --fail-untested # gate: exit 1 when changed functions lack test referen
         {
           "symbol": "charge",
           "file": "gateway/src/main.rs",
-          "line": 1
+          "line": 1,
+          "via": "receiver-type",
+          "kind": "call"
         }
       ]
+    }
+  ],
+  "changed_functions":
+  [
+    {
+      "file": "billing/src/charge.rs",
+      "function": "charge",
+      "lines": [2,4],
+      "tested": true,
+      "tested_by": ["test_charge","TestCharge"],
+      "called_from": ["gateway"]
     }
   ],
   "untested":
   [
     {
       "file": "billing/src/charge.rs",
-      "function": "charge",
-      "lines": [2,4],
-      "called_from": ["gateway"]
+      "function": "fee",
+      "lines": [6,7],
+      "tested": false,
+      "tested_by": [],
+      "called_from": []
     }
   ], 
   "...":"..."
 }
 ```
 
-## Example `.ccc/surf.json`
+`tested_by` names the test functions that call a changed function, so a review
+can tell "covered by one smoke test" from "covered by twelve" without running
+anything. Test functions are recognised by path (`tests/`, `*_test.go`,
+`*.spec.ts`, ...), by Rust `mod tests`, by name (`test_charge`, `TestCharge`,
+`BenchmarkCharge`), and - for jest/mocha/vitest suites, whose tests are
+anonymous callbacks - by their label, reported as `it("charges a fee")`. It
+lists direct callers only, is matched on the bare function name like the rest of
+`changes`'s resolution, and is capped at 25 entries. `tested` can be true with an
+empty `tested_by` when the only reference came from test-file top level rather
+than from inside a named test.
+
+## Example `.ccc/map.json`
 
 ```json
 {
@@ -180,25 +279,7 @@ ccc surf --fail-untested # gate: exit 1 when changed functions lack test referen
 }
 ```
 
-Dependencies the static analysis cannot see (HTTP/RPC/queues) are declared in
-`surf.json` under `deps`. The full JSON schema, exit codes, GitHub Actions and
-GitLab CI integration guides, and the detection rules live in
-[docs/SURF.md](docs/SURF.md); a ready-to-adapt PR workflow is bundled at
-[.github/workflows/ccc-surf.yaml](.github/workflows/ccc-surf.yaml).
-
-The test suite covers **every supported language** (python, javascript,
-typescript + tsx, go, cpp, rust): each test builds an `api -> lib` pair - or
-the richer three-service demo with a detected `gateway -> billing` edge, a
-declared `gateway -> auth` HTTP dep, and an untested change - in a throwaway
-git repo and asserts the exact report, so the behavior can never drift from
-the implementation.
-
-`ccc surf --html ccc-surf-<name>.html` also writes a **single-file HTML view**
-of the report - Tailwind-styled, report embedded, with an HTMX "live query"
-panel that hits a running `ccc serve` for find/references/dependencies.
-
-
-## Specification
+## Markdown Output Specification
 
 ```
 .ccc/

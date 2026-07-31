@@ -11,6 +11,57 @@ pub struct Const {
     pub ty: Option<String>,
 }
 
+// named type definition `struct`/`enum`/`class`/`interface`/`trait`/alias.
+#[derive(Debug, Clone)]
+pub struct TypeDef {
+    pub line: usize,
+    pub name: String,
+    pub kind: String, // struct | enum | class | interface | trait | alias | union | protocol
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopInfo {
+    pub line: usize,
+    pub kind: String, // for | while | do | loop | comprehension
+    pub depth: usize,
+    pub trip: Option<usize>,
+}
+
+// a call that acquires or releases a resource, for the leak heuristic.
+#[derive(Debug, Clone)]
+pub struct ResourceOp {
+    pub line: usize,
+    pub name: String,
+    pub pair: &'static str,
+    pub acquire: bool,
+    // inside a `with`/`defer`, so the release is automatic
+    pub guarded: bool,
+}
+
+// structural measurements of one function body.
+#[derive(Debug, Clone, Default)]
+pub struct FuncMetrics {
+    pub body_lines: usize,
+    pub params: usize,
+    pub branches: usize,
+    pub nodes: usize,
+    pub loops: Vec<LoopInfo>,
+    pub resources: Vec<ResourceOp>,
+    // the function calls itself by name
+    pub recursive: bool,
+}
+
+impl FuncMetrics {
+    // cyclomatic-style score: one path, plus one per decision point and loop
+    pub fn complexity(&self) -> usize {
+        1 + self.branches + self.loops.len()
+    }
+
+    pub fn max_loop_depth(&self) -> usize {
+        self.loops.iter().map(|l| l.depth).max().unwrap_or(0)
+    }
+}
+
 // function / method definition.
 #[derive(Debug, Clone)]
 pub struct Func {
@@ -19,17 +70,19 @@ pub struct Func {
     pub name: String,
     pub ret: Option<String>,
     pub comment: Option<String>, // preceding doc / inline comment, one line
-    // full definition span (1-based, inclusive) - used by `surf` to map diff
-    // hunks onto functions; not rendered into `.ccc` entries
     pub start_line: usize,
     pub end_line: usize,
     // true when defined inside a test scope (e.g. a Rust `mod tests`)
     pub test_ctx: bool,
+    // the type this is a method of, when it is one (Rust `impl T`, a Go
+    // receiver, a C++/TS class). Together with `name` this addresses a method
+    // precisely enough to resolve a call through its receiver's type.
+    pub owner: Option<String>,
+    pub param_types: Vec<String>,
+    pub metrics: FuncMetrics,
 }
 
 // a call site kept in "loose" form: every call in the file, resolved or not.
-// `surf` matches these against other services' definitions; they are not
-// rendered into `.ccc` entries.
 #[derive(Debug, Clone)]
 pub struct CallSite {
     // nearest enclosing function (`<top>` at file level)
@@ -37,9 +90,8 @@ pub struct CallSite {
     pub line: usize,
     // rightmost identifier of the callee (`billing::charge` -> `charge`)
     pub name: String,
-    // qualifier text left of the name, if any (`billing::charge` -> `billing`,
-    // `client.charge()` -> `client`)
     pub qualifier: Option<String>,
+    pub recv_type: Option<String>,
     // true when the call sits inside a test scope (e.g. a Rust `mod tests`)
     pub test_ctx: bool,
 }
@@ -63,11 +115,7 @@ pub struct Note {
     pub text: String,
 }
 
-// one import/use/include statement, in loose textual form:
-// `use crate::model::{CallSite, Const}` -> module "crate::model",
-// names ["CallSite", "Const"]; `from a.b import c as d` -> module "a.b",
-// names ["c", "d"]. Used by `dependencies` to resolve file-level edges
-// (including type-only imports the call map cannot see); not rendered.
+// one import/use/include statement, in loose form
 #[derive(Debug, Clone)]
 pub struct Import {
     pub line: usize,
@@ -83,18 +131,19 @@ pub struct FileCache {
     pub cache_name: String,
     pub display_name: String,
     pub language: Language,
+    // total lines in the source file, for project-size reporting
+    pub lines: usize,
     pub consts: Vec<Const>,
     pub funcs: Vec<Func>,
     pub refs: Vec<Ref>,
     pub notes: Vec<Note>,
-    // all call sites (superset of `refs`), used by `surf`; not rendered
+    // all call sites (superset of `refs`), used by `changes`; not rendered
     pub calls: Vec<CallSite>,
-    // qualified constant-like value usages that are not calls (enum variants,
-    // module consts, scoped types: `Encoding::O200kBase`, `http.StatusOK`),
-    // served by `references`/`find`; not rendered
+    // qualified constant-like value usages that are not calls
     pub uses: Vec<CallSite>,
-    // import/use/include statements, used by `dependencies`; not rendered
     pub imports: Vec<Import>,
+    pub types: Vec<TypeDef>,
+    pub modules: Vec<String>,
 }
 
 impl FileCache {
