@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use codecache::{CheckReport, Encoding, SurfOptions, SurfReport};
+use codecache::{CheckReport, Encoding, ChangesOptions, ChangesReport};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -49,8 +49,10 @@ enum Command {
         encoding: String,
     },
     // surface branch changes to a continuous-testing suite: which services
-    // changed, who calls them, and what needs testing (JSON by default)
-    Surf {
+    // changed, who calls them, and what needs testing (JSON by default).
+    // `surf` was the original name; kept so existing scripts keep working.
+    #[command(alias = "surf")]
+    Changes {
         #[arg(default_value = ".")]
         path: PathBuf,
         // base ref to diff against (default: merge-base with origin/main,
@@ -58,23 +60,27 @@ enum Command {
         #[arg(long)]
         base: Option<String>,
         // define/extend a service inline: NAME=GLOB (repeatable; merged over
-        // `.ccc/surf.json`)
+        // `.ccc/map.json`)
         #[arg(long = "service", value_name = "NAME=GLOB")]
         services: Vec<String>,
-        // output format (default json - surf is built for pipelines)
+        // output format (default json - changes is built for pipelines)
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
         // exit non-zero when changed functions have no detected test reference
         #[arg(long)]
         fail_untested: bool,
-        // write a starter `.ccc/surf.json` inferred from top-level directories
+        // write a starter `.ccc/map.json` inferred from top-level directories
         #[arg(long)]
         init: bool,
+        // include uncommitted edits and untracked files in the diff. CI wants
+        // the committed view (the default); a local run usually wants this
+        #[arg(long)]
+        worktree: bool,
         // also write a single-file HTML view of the report (Tailwind + HTMX
-        // live-query panel against `ccc serve`), e.g. ccc-surf-rust.html
+        // live-query panel against `ccc serve`), e.g. ccc-changes-rust.html
         #[arg(long, value_name = "FILE")]
         html: Option<PathBuf>,
-        // render --html from an existing surf JSON report instead of running
+        // render --html from an existing changes JSON report instead of running
         // the analysis (no git needed)
         #[arg(long, value_name = "REPORT.json", requires = "html")]
         from: Option<PathBuf>,
@@ -96,6 +102,19 @@ enum Command {
         // disable file watching (rescan only via POST /refresh)
         #[arg(long)]
         no_watch: bool,
+        // also serve the human-facing insights UI at /insights
+        #[arg(long)]
+        html: bool,
+    },
+    // analyse the project and emit the insights payload
+    Insights {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long, value_name = "FILE")]
+        html: Option<PathBuf>,
+        // base ref for the test-trigger diff
+        #[arg(long)]
+        base: Option<String>,
     },
     // install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
     Install {
@@ -163,30 +182,32 @@ fn run() -> Result<ExitCode> {
             run_tokenize(&root, &encoding)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Surf {
+        Command::Changes {
             path,
             base,
             services,
             format,
             fail_untested,
             init,
+            worktree,
             html,
             from,
         } => {
             let root = canonical(&path);
             if init {
                 let cfg = codecache::init_config(&root)?;
-                println!("Wrote {} - edit the service globs, then re-run `ccc surf`", cfg.display());
+                println!("Wrote {} - edit the service globs, then re-run `ccc changes`", cfg.display());
                 return Ok(ExitCode::SUCCESS);
             }
-            // --from: render the HTML view from a saved report, no analysis
+
+            // render the HTML view from a saved report, no analysis
             if let Some(from) = from {
                 let html_path = html.expect("clap enforces --from requires --html");
                 let raw = std::fs::read_to_string(&from)
                     .with_context(|| format!("reading {}", from.display()))?;
                 let report: serde_json::Value = serde_json::from_str(&raw)
-                    .with_context(|| format!("parsing {} as a surf report", from.display()))?;
-                codecache::html::write_surf_html(&html_path, &report, &html_title(&html_path))?;
+                    .with_context(|| format!("parsing {} as a changes report", from.display()))?;
+                codecache::html::write_changes_html(&html_path, &report, &html_title(&html_path))?;
                 println!("Wrote {}", html_path.display());
                 return Ok(ExitCode::SUCCESS);
             }
@@ -199,24 +220,25 @@ fn run() -> Result<ExitCode> {
                         .ok_or_else(|| anyhow!("--service wants NAME=GLOB, got '{s}'"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let opts = SurfOptions {
+            let opts = ChangesOptions {
+                worktree,
                 base,
                 service_flags,
             };
-            let report = codecache::surf(&root, &path_str(&path), &opts)?;
+            let report = codecache::changes(&root, &path_str(&path), &opts)?;
             if let Some(html_path) = &html {
                 let value = serde_json::to_value(&report)?;
-                codecache::html::write_surf_html(html_path, &value, &html_title(html_path))?;
+                codecache::html::write_changes_html(html_path, &value, &html_title(html_path))?;
                 // stderr so stdout stays pure JSON for pipelines
                 eprintln!("wrote {}", html_path.display());
             }
             match format {
                 OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
-                OutputFormat::Text => print_surf_text(&report),
+                OutputFormat::Text => print_changes_text(&report),
             }
             if fail_untested && !report.untested.is_empty() {
                 eprintln!(
-                    "surf: {} changed function(s) with no detected test reference",
+                    "changes: {} changed function(s) with no detected test reference",
                     report.untested.len()
                 );
                 return Ok(ExitCode::FAILURE);
@@ -229,23 +251,41 @@ fn run() -> Result<ExitCode> {
             port,
             watch_interval,
             no_watch,
+            html,
         } => {
             let watch = if no_watch || watch_interval == 0 {
                 None
             } else {
                 Some(std::time::Duration::from_secs(watch_interval))
             };
-            let opts = codecache::ServeOptions { addr, port, watch };
+            let opts = codecache::ServeOptions { addr, port, watch, html };
             codecache::serve(&canonical(&path), &opts)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Insights { path, html, base } => {
+            let root = canonical(&path);
+            let label = root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(".")
+                .to_string();
+            let report = codecache::insights::analyse(&root, &label, base.as_deref())?;
+            match html {
+                Some(file) => {
+                    codecache::html::write_insights_html(&file, &label, &report)?;
+                    println!("wrote {}", file.display());
+                }
+                None => println!("{}", serde_json::to_string(&report)?),
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Install { dir, force } => run_install(dir, force),
     }
 }
 
-fn print_surf_text(r: &SurfReport) {
+fn print_changes_text(r: &ChangesReport) {
     println!(
-        "surf: {} service(s), base {} ({}..{})",
+        "changes: {} service(s), base {} ({}..{})",
         r.services.len(),
         r.base,
         &r.base_sha[..r.base_sha.len().min(9)],
@@ -256,8 +296,19 @@ fn print_surf_text(r: &SurfReport) {
         r.counts.changed_files, r.counts.changed_functions
     );
     for e in &r.edges {
-        let kind = if e.declared { "declared" } else { "detected" };
-        let syms: Vec<&str> = e.symbols.iter().map(|s| s.symbol.as_str()).collect();
+        // declared and detected are independent: declaring a dep never skips
+        // the analysis, so an edge is often both
+        let kind = match (e.declared, e.detected) {
+            (true, true) => "declared+detected",
+            (true, false) => "declared, no calls found",
+            _ => "detected",
+        };
+        // name the evidence, so a reader can judge the edge
+        let syms: Vec<String> = e
+            .symbols
+            .iter()
+            .map(|s| format!("{} via {}", s.symbol, s.via))
+            .collect();
         let syms = if syms.is_empty() {
             String::new()
         } else {
@@ -266,6 +317,16 @@ fn print_surf_text(r: &SurfReport) {
         println!("edge: {} -> {} [{kind}]{syms}", e.from, e.to);
     }
     println!("test: {}", r.services_to_test.join(", "));
+    for f in r.changed_functions.iter().filter(|f| !f.tested_by.is_empty()) {
+        println!(
+            "covered: {}::{} L{}-{} (tested by: {})",
+            f.file,
+            f.function,
+            f.lines[0],
+            f.lines[1],
+            f.tested_by.join(", ")
+        );
+    }
     for f in &r.untested {
         println!(
             "untested: {}::{} L{}-{} (called from: {})",
@@ -277,6 +338,21 @@ fn print_surf_text(r: &SurfReport) {
                 "-".to_string()
             } else {
                 f.called_from.join(", ")
+            }
+        );
+    }
+    for u in &r.unresolved_calls {
+        println!(
+            "unresolved: {}::{} at {}:{} [{}]{}",
+            u.from,
+            u.symbol,
+            u.file,
+            u.line,
+            u.reason,
+            if u.candidates.is_empty() {
+                String::new()
+            } else {
+                format!(" candidates: {}", u.candidates.join(", "))
             }
         );
     }
@@ -346,11 +422,11 @@ fn path_str(p: &Path) -> String {
 }
 
 // title for a generated HTML report: the output file's stem
-// (`ccc-surf-rust.html` -> `ccc-surf-rust`)
+// (`ccc-changes-rust.html` -> `ccc-changes-rust`)
 fn html_title(p: &Path) -> String {
     p.file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("ccc-surf")
+        .unwrap_or("ccc-changes")
         .to_string()
 }
 

@@ -1,6 +1,6 @@
-name: Surf changed services
+name: Test changed services
 
-# Example continuous-testing wiring for `ccc surf` (see docs/SURF.md).
+# Example continuous-testing wiring for `ccc changes`.
 # On every PR it diffs the branch against the target branch, works out which
 # services changed and which services call them, then fans a test job out per
 # impacted service. Replace the test step's `run:` with your real entrypoint.
@@ -12,21 +12,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: ccc-surf-${{ github.ref }}
+  group: ccc-changes-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  surf:
+  changes:
     runs-on: ubuntu-latest
     outputs:
-      services: ${{ steps.surf.outputs.services }}
-      any: ${{ steps.surf.outputs.any }}
-      untested: ${{ steps.surf.outputs.untested }}
+      services: ${{ steps.changes.outputs.services }}
+      any: ${{ steps.changes.outputs.any }}
+      untested: ${{ steps.changes.outputs.untested }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # REQUIRED: surf diffs against the merge-base with the target branch;
+          # REQUIRED: changes diffs against the merge-base with the target branch;
           # a shallow clone has no merge-base.
           fetch-depth: 0
 
@@ -43,12 +43,12 @@ jobs:
       #   services - JSON array of services to test (changed + their callers)
       #   any      - 'true' when that array is non-empty
       #   untested - number of changed functions with no detected test reference
-      - name: Surf the diff
-        id: surf
+      - name: Analyse the diff
+        id: changes
         run: |
-          report="$(./target/release/ccc surf --base "origin/${{ github.base_ref }}")"
+          report="$(./target/release/ccc changes --base "origin/${{ github.base_ref }}")"
           {
-            echo "## ccc surf"
+            echo "## ccc changes"
             echo '```json'
             jq . <<<"$report"
             echo '```'
@@ -60,13 +60,13 @@ jobs:
   # One test leg per impacted service. Replace the run step with your suite
   # (cargo test -p, npm --workspace, go test ./..., a Make target, ...).
   test:
-    needs: surf
-    if: needs.surf.outputs.any == 'true'
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: ${{ fromJSON(needs.surf.outputs.services) }}
+        service: ${{ fromJSON(needs.changes.outputs.services) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,10 +77,10 @@ jobs:
   # reference. Drop this job (or make it non-required) if you only want the
   # signal, not the enforcement.
   untested-gate:
-    needs: surf
-    if: needs.surf.outputs.untested != '0'
+    needs: changes
+    if: needs.changes.outputs.untested != '0'
     runs-on: ubuntu-latest
     steps:
       - name: Report untested changes
         run: |
-          echo "::warning::${{ needs.surf.outputs.untested }} changed function(s) have no detected test reference (see the surf job summary)"
+          echo "::warning::${{ needs.changes.outputs.untested }} changed function(s) have no detected test reference (see the changes job summary)"

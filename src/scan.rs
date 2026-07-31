@@ -145,6 +145,7 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
         display_name: naming::display_name(&rel),
         rel_path: rel,
         language: lang,
+        lines: src.lines().count(),
         consts: ex.consts,
         funcs: ex.funcs,
         refs: ex.refs,
@@ -152,6 +153,8 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
         calls: ex.calls,
         uses: ex.uses,
         imports: ex.imports,
+        types: ex.types,
+        modules: ex.modules,
     })
 }
 

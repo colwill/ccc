@@ -1,22 +1,31 @@
 //! tree-sitter based extraction of symbols from a single source file
 
 use crate::languages::Language;
-use crate::model::{CallSite, Const, Func, Import, Note, Ref};
+use crate::model::{
+    CallSite, Const, Func, FuncMetrics, Import, LoopInfo, Note, Ref, ResourceOp, TypeDef,
+};
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
+
+// `CallSite::caller` for a call that sits outside any function
+pub(crate) const TOP_LEVEL: &str = "<top>";
 
 pub struct Extracted {
     pub consts: Vec<Const>,
     pub funcs: Vec<Func>,
     pub refs: Vec<Ref>,
     pub notes: Vec<Note>,
-    // every call site in loose (name + qualifier) form, for `surf`
+    // every call site in loose (name + qualifier) form, for `changes`
     pub calls: Vec<CallSite>,
     // qualified constant-like usages that are not calls (enum variants,
     // module consts, scoped types), same loose form
     pub uses: Vec<CallSite>,
     // import/use/include statements in loose textual form
     pub imports: Vec<Import>,
+    // named type definitions, for `changes`'s type-directed resolution
+    pub types: Vec<TypeDef>,
+    // module identities declared here (go `package`, c++ `namespace`, rust `mod`)
+    pub modules: Vec<String>,
 }
 
 enum CallKind {
@@ -43,16 +52,23 @@ struct Ctx<'a> {
     funcs: Vec<Func>,
     notes: Vec<Note>,
     calls: Vec<RawCall>,
-    // every call in loose form (superset of `calls`), kept for `surf`
+    // every call in loose form (superset of `calls`), kept for `changes`
     loose_calls: Vec<CallSite>,
     // qualified non-call usages, same loose form
     uses: Vec<CallSite>,
     // import/use/include statements
     imports: Vec<Import>,
+    types: Vec<TypeDef>,
+    modules: Vec<String>,
+    // variable name -> declared type, one frame per lexical scope. Lets a
+    // method call be attributed to its receiver's type instead of guessed at
+    // from the method name alone.
+    type_env: Vec<HashMap<String, String>>,
     free_index: HashMap<String, (usize, usize, Option<String>)>,
     method_index: HashMap<(String, String), (usize, usize, Option<String>)>,
     scope_stack: Vec<Scope>,
-    // > 0 while inside a Rust `mod tests`-style container
+    // > 0 while inside a test scope: a Rust `mod tests`-style container or a
+    // BDD test-registration callback (`test("...", () => { ... })`)
     test_mod_depth: usize,
     // > 0 while inside an import/use/include declaration
     import_depth: usize,
@@ -71,7 +87,20 @@ impl Ctx<'_> {
                 Scope::Func(n) => Some(n.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| "<top>".to_string())
+            .unwrap_or_else(|| TOP_LEVEL.to_string())
+    }
+
+    // declared type of a variable, searching innermost scope outwards
+    fn type_of(&self, var: &str) -> Option<String> {
+        self.type_env.iter().rev().find_map(|f| f.get(var).cloned())
+    }
+
+    fn bind(&mut self, var: String, ty: String) {
+        if let Some(frame) = self.type_env.last_mut() {
+            if !ty.is_empty() && !var.is_empty() {
+                frame.insert(var, ty);
+            }
+        }
     }
 
     // nearest enclosing type scope (its name and receiver token) used to
@@ -111,6 +140,9 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         loose_calls: Vec::new(),
         uses: Vec::new(),
         imports: Vec::new(),
+        types: Vec::new(),
+        modules: Vec::new(),
+        type_env: vec![HashMap::new()],
         free_index: HashMap::new(),
         method_index: HashMap::new(),
         scope_stack: Vec::new(),
@@ -164,6 +196,8 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         refs,
         notes: ctx.notes,
         calls: ctx.loose_calls,
+        types: ctx.types,
+        modules: ctx.modules,
         uses: ctx.uses,
         imports: ctx.imports,
     })
@@ -175,14 +209,18 @@ fn visit(node: Node, ctx: &mut Ctx) {
     let mut pushed = 0usize;
 
     // rust unit tests conventionally live in an inline `mod tests`; track it so
-    // call sites inside are flagged as test context for `surf`
+    // call sites inside are flagged as test context for `changes`
     let test_mod = lang == Language::Rust
         && kind == "mod_item"
         && node
             .child_by_field_name("name")
             .map(|n| text(n, ctx.src).to_ascii_lowercase().contains("test"))
             .unwrap_or(false);
-    if test_mod {
+    // BDD suites name their tests with a string, not an identifier
+    // (`test("charge", () => { ... })`) - the callback is the test body, so it
+    // is a test scope whose "name" is that label.
+    let bdd_label = bdd_test_label(node, ctx);
+    if test_mod || bdd_label.is_some() {
         ctx.test_mod_depth += 1;
     }
     let import = lang.import_kinds().contains(&kind);
@@ -212,6 +250,32 @@ fn visit(node: Node, ctx: &mut Ctx) {
             .unwrap_or_default();
         ctx.enum_types.push(name);
     }
+    // type definitions and module identities are indexed independently of the
+    // dispatch below, because several of their node kinds (a Rust `trait_item`,
+    // a C++ `class_specifier`, a TS `class_declaration`) are also type scopes
+    // and would otherwise be swallowed by that branch
+    if let Some(kind) = lang.type_kinds().iter().find(|(k, _)| *k == kind).map(|(_, v)| *v) {
+        if let Some(name) = node.child_by_field_name("name") {
+            ctx.types.push(TypeDef {
+                line: pos(node).0,
+                name: oneline(text(name, ctx.src)),
+                kind: kind.to_string(),
+            });
+        }
+    }
+    if lang.module_kinds().contains(&kind) {
+        // a go `package_clause` has no `name` field; its identifier child is it
+        let name = node
+            .child_by_field_name("name")
+            .or_else(|| node.named_child(0))
+            .map(|n| oneline(text(n, ctx.src)));
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            if !ctx.modules.contains(&name) {
+                ctx.modules.push(name);
+            }
+        }
+    }
+    bind_declaration(node, ctx);
 
     if let Some((name, recv)) = type_scope(node, ctx) {
         ctx.scope_stack.push(Scope::Type { name, recv });
@@ -249,6 +313,10 @@ fn visit(node: Node, ctx: &mut Ctx) {
             }
             ctx.scope_stack.push(Scope::Func(name));
             pushed += 1;
+        } else if let Some(label) = &bdd_label {
+            // anonymous callback, but the suite gave it a name
+            ctx.scope_stack.push(Scope::Func(label.clone()));
+            pushed += 1;
         }
     } else if lang.const_kinds().contains(&kind) {
         // python Enum members live in a class body, which const_eligible
@@ -271,7 +339,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
             ctx.calls.push(call);
         }
         // independently record the loose form (kept even when the precise
-        // classifier declines) - `surf` matches these across services
+        // classifier declines) - `changes` matches these across services
         if let Some(site) = loose_call(node, ctx) {
             ctx.loose_calls.push(site);
         }
@@ -279,20 +347,32 @@ fn visit(node: Node, ctx: &mut Ctx) {
         maybe_note(node, ctx);
     } else if lang == Language::Rust && kind == "token_tree" {
         // macro bodies (`assert_eq!(charge(1), 31)`) are token trees, not
-        // expressions - approximate the calls inside so `surf` sees them
+        // expressions - approximate the calls inside so `changes` sees them
         scan_macro_tokens(node, ctx);
     } else if lang.use_kinds().contains(&kind) {
         maybe_use(node, ctx);
+    }
+
+    // one type-environment frame per scope, so a `let x: T` in an inner block
+    // cannot leak its binding out to the enclosing function
+    if pushed > 0 {
+        ctx.type_env.push(HashMap::new());
+        if lang.func_kinds().contains(&kind) {
+            bind_signature(node, ctx);
+        }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         visit(child, ctx);
     }
+    if pushed > 0 {
+        ctx.type_env.pop();
+    }
     for _ in 0..pushed {
         ctx.scope_stack.pop();
     }
-    if test_mod {
+    if test_mod || bdd_label.is_some() {
         ctx.test_mod_depth -= 1;
     }
     if import {
@@ -410,6 +490,14 @@ fn extract_func(node: Node, ctx: &Ctx) -> Option<Func> {
     let (line, col) = pos(name_node);
     let ret = func_return(node, ctx);
     let comment = preceding_comment(node, ctx);
+    let metrics = func_metrics(node, &name, ctx);
+    let owner = func_owner(node, ctx).map(|(t, _)| normalize_type(&t));
+    let param_types = param_pairs(node, ctx)
+        .into_iter()
+        .filter_map(|(_, t)| t)
+        .map(|t| normalize_type(&t))
+        .filter(|t| !t.is_empty())
+        .collect();
     Some(Func {
         line,
         col,
@@ -420,7 +508,446 @@ fn extract_func(node: Node, ctx: &Ctx) -> Option<Func> {
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
         test_ctx: ctx.test_mod_depth > 0,
+        owner,
+        param_types,
+        metrics,
     })
+}
+
+// Reduce a declared type to the bare name a definition can be looked up by:
+// strips reference/pointer/mutability sigils, unwraps the common single-type
+// containers, drops generic arguments, and keeps the last path segment.
+// `&mut Option<billing::Client<'a>>` -> `Client`.
+pub fn normalize_type(raw: &str) -> String {
+    // containers whose single type argument is the type actually being used
+    const WRAPPERS: &[&str] = &[
+        "Option", "Result", "Vec", "Box", "Rc", "Arc", "RefCell", "Cell", "Mutex", "RwLock",
+        "shared_ptr", "unique_ptr", "weak_ptr", "vector", "optional", "Promise", "Array",
+        "ReadonlyArray", "Partial", "Readonly",
+    ];
+    let mut s = raw.trim().to_string();
+    for _ in 0..8 {
+        let before = s.clone();
+        s = s
+            .trim()
+            .trim_start_matches([':', '&', '*', '(', ' '])
+            .trim_end_matches([';', '?', ')', ' ', ','])
+            .trim()
+            .to_string();
+        for kw in ["mut ", "const ", "readonly ", "dyn ", "impl ", "static ", "final "] {
+            if let Some(rest) = s.strip_prefix(kw) {
+                s = rest.trim().to_string();
+            }
+        }
+        // `T[]` / `[]T` (go slices) are still uses of T
+        s = s.trim_end_matches("[]").trim().to_string();
+        if let Some(rest) = s.strip_prefix("[]") {
+            s = rest.trim().to_string();
+        }
+        // unwrap a container down to its first type argument
+        if let Some((head, rest)) = s.split_once('<') {
+            let head_name = head.rsplit(["::", "."].as_slice()[0]).next().unwrap_or(head);
+            if WRAPPERS.contains(&head_name.trim()) {
+                let inner = rest.strip_suffix('>').unwrap_or(rest);
+                // first argument, ignoring lifetimes
+                let first = inner
+                    .split(',')
+                    .map(str::trim)
+                    .find(|a| !a.starts_with('\'') && !a.is_empty())
+                    .unwrap_or(inner);
+                s = first.to_string();
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    // drop any remaining generic arguments, then keep the last path segment
+    if let Some((head, _)) = s.split_once('<') {
+        s = head.to_string();
+    }
+    for sep in ["::", ".", "->"] {
+        if let Some((_, last)) = s.rsplit_once(sep) {
+            s = last.to_string();
+        }
+    }
+    s.trim().to_string()
+}
+
+// (parameter name, declared type) for each parameter of a definition. Either
+// side may be absent: an unannotated JS parameter has no type, a C++
+// `void f(int)` has no name.
+fn param_pairs(node: Node, ctx: &Ctx) -> Vec<(Option<String>, Option<String>)> {
+    let kinds = ctx.lang.param_list_kinds();
+    let mut list = None;
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if kinds.contains(&n.kind()) {
+            list = Some(n);
+            break;
+        }
+        let mut c = n.walk();
+        stack.extend(n.children(&mut c));
+    }
+    let Some(list) = list else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut cursor = list.walk();
+    for p in list.named_children(&mut cursor) {
+        if p.kind().contains("comment") {
+            continue;
+        }
+        let name = p
+            .child_by_field_name("pattern")
+            .or_else(|| p.child_by_field_name("name"))
+            .or_else(|| p.child_by_field_name("declarator"))
+            .map(|n| oneline(text(n, ctx.src)))
+            // a bare identifier parameter (go `x` in `x, y int`, js `x`)
+            .or_else(|| (p.kind() == "identifier").then(|| oneline(text(p, ctx.src))));
+        let ty = p
+            .child_by_field_name("type")
+            .map(|n| oneline(text(n, ctx.src)))
+            // rust/ts self-parameters name their own type via the impl scope
+            .or_else(|| {
+                p.kind().contains("self").then(|| {
+                    ctx.current_type().map(|(t, _)| t).unwrap_or_default()
+                })
+            });
+        let name = name.map(|n| {
+            // `&self` / `mut x` / `*p` reduce to the bound identifier
+            n.trim_start_matches(['&', '*', ' '])
+                .trim_start_matches("mut ")
+                .trim()
+                .to_string()
+        });
+        out.push((name.filter(|n| !n.is_empty()), ty.filter(|t| !t.is_empty())));
+    }
+    out
+}
+
+// Bind a definition's parameters and receiver into the current scope, so calls
+// in the body can be attributed to the right type.
+fn bind_signature(node: Node, ctx: &mut Ctx) {
+    for (name, ty) in param_pairs(node, ctx) {
+        if let (Some(name), Some(ty)) = (name, ty) {
+            let ty = normalize_type(&ty);
+            ctx.bind(name, ty);
+        }
+    }
+    // go carries the receiver outside the parameter list; rust/c++/ts reach
+    // their own type through `self`/`this`
+    if let Some((ty, recv)) = func_owner(node, ctx) {
+        if let Some(recv) = recv {
+            ctx.bind(recv, normalize_type(&ty));
+        }
+        ctx.bind("self".into(), normalize_type(&ty));
+        ctx.bind("this".into(), normalize_type(&ty));
+    }
+}
+
+// Bind a local variable declaration: `let c: Client`, `c := Client{}`,
+// `const c = new Client()`, `Client c;`. Only declared or directly-constructed
+// types are recorded - an inferred `let c = make_client()` stays unknown
+// rather than being guessed at.
+fn bind_declaration(node: Node, ctx: &mut Ctx) {
+    let kind = node.kind();
+    let interesting = matches!(
+        kind,
+        "let_declaration"            // rust
+            | "short_var_declaration" // go `x := ...`
+            | "var_spec"              // go `var x T`
+            | "const_spec"
+            | "variable_declarator"   // js/ts
+            | "declaration"           // c++
+            | "field_declaration"
+    );
+    if !interesting {
+        return;
+    }
+    let src = ctx.src;
+    let name_of = |n: Node| oneline(text(n, src));
+
+    // an explicit annotation always wins over an inferred initialiser
+    let declared = node
+        .child_by_field_name("type")
+        .map(name_of)
+        .filter(|t| !t.is_empty());
+    // otherwise look at the initialiser for a direct construction
+    let value = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("declarator"))
+        .map(name_of);
+    let ty = declared.or_else(|| value.as_deref().and_then(constructed_type));
+    let Some(ty) = ty else { return };
+    let ty = normalize_type(&ty);
+    if ty.is_empty() {
+        return;
+    }
+
+    // the bound name(s): a pattern, a name, or a c++ declarator
+    let mut names = Vec::new();
+    for field in ["pattern", "name", "declarator", "left"] {
+        if let Some(n) = node.child_by_field_name(field) {
+            names.push(name_of(n));
+        }
+    }
+    // go binds several names at once (`var a, b T`)
+    if names.is_empty() {
+        let mut cursor = node.walk();
+        for c in node.named_children(&mut cursor) {
+            if c.kind() == "identifier" {
+                names.push(name_of(c));
+            }
+        }
+    }
+    for raw in names {
+        for name in raw.split(',') {
+            let name = name
+                .trim()
+                .trim_start_matches(['&', '*', ' '])
+                .trim_start_matches("mut ")
+                .trim();
+            // a c++ declarator carries the initialiser: `p = new Client()`
+            let name = name.split(['=', '(', '[', ':']).next().unwrap_or(name).trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                ctx.bind(name.to_string(), ty.clone());
+            }
+        }
+    }
+}
+
+// The type a constructor-ish initialiser produces: `Client::new(..)`,
+// `Client { .. }`, `new Client(..)`, `&Client{}`, `Client()`. Returns `None`
+// for anything that needs real inference to know.
+fn constructed_type(value: &str) -> Option<String> {
+    let v = value.trim().trim_start_matches(['&', '*', ' ']).trim();
+    // `new Client(...)` (ts/js/c++)
+    if let Some(rest) = v.strip_prefix("new ") {
+        let name = rest.split(['(', '{', '<', ' ']).next()?.trim();
+        return (!name.is_empty()).then(|| name.to_string());
+    }
+    // `Client::new(...)` / `Client::default()` - the type is the qualifier
+    if let Some((head, tail)) = v.split_once("::") {
+        let ctor = tail.split(['(', ':']).next().unwrap_or("");
+        if matches!(ctor, "new" | "default" | "from" | "with_capacity" | "create") {
+            let name = head.rsplit("::").next()?.trim();
+            return (!name.is_empty()).then(|| name.to_string());
+        }
+    }
+    // a bare type name as the whole initialiser: a unit struct (`let l = Ledger;`)
+    let bare = v.trim_end_matches(';').trim();
+    let unit_struct = !bare.is_empty()
+        && bare.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && bare.chars().all(|c| c.is_alphanumeric() || c == '_')
+        // an ALL_CAPS name is a constant, not a type
+        && bare.chars().any(|c| c.is_ascii_lowercase());
+    if unit_struct {
+        return Some(bare.to_string());
+    }
+    // `Client { .. }` struct literal (rust/go)
+    let head = v.split(['{', '(']).next()?.trim();
+    let is_type_name = head
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+        && head.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':');
+    if is_type_name && (v.contains('{') || v.contains('(')) {
+        return Some(head.rsplit("::").next()?.to_string());
+    }
+    None
+}
+
+// Measure a function body: size, decision points, loop nesting, and
+// acquire/release calls. One extra walk of the definition's subtree, so a
+// closure nested in a function is counted into that function too - which is
+// what "how big is this body" should mean.
+fn func_metrics(node: Node, own_name: &str, ctx: &Ctx) -> FuncMetrics {
+    let mut m = FuncMetrics {
+        body_lines: node.end_position().row - node.start_position().row + 1,
+        params: count_params(node, ctx),
+        ..FuncMetrics::default()
+    };
+    walk_metrics(node, ctx, own_name, 0, 0, &mut m);
+    m.loops.sort_by_key(|l| l.line);
+    m.resources.sort_by_key(|r| r.line);
+    m
+}
+
+fn count_params(node: Node, ctx: &Ctx) -> usize {
+    let kinds = ctx.lang.param_list_kinds();
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if kinds.contains(&n.kind()) {
+            // `self`/`this` receivers are parameters of the call, not the API
+            return n
+                .named_children(&mut n.walk())
+                .filter(|c| !c.kind().contains("self"))
+                .count();
+        }
+        let mut cursor = n.walk();
+        stack.extend(n.children(&mut cursor));
+    }
+    0
+}
+
+fn walk_metrics(
+    node: Node,
+    ctx: &Ctx,
+    own_name: &str,
+    loop_depth: usize,
+    guard_depth: usize,
+    m: &mut FuncMetrics,
+) {
+    let lang = ctx.lang;
+    let kind = node.kind();
+    m.nodes += 1;
+
+    let is_loop = lang.loop_kinds().contains(&kind);
+    let depth = if is_loop {
+        let d = loop_depth + 1;
+        m.loops.push(LoopInfo {
+            line: pos(node).0,
+            kind: loop_label(kind),
+            depth: d,
+            trip: literal_trip(node, ctx),
+        });
+        d
+    } else {
+        loop_depth
+    };
+    let guard = guard_depth + usize::from(lang.guard_kinds().contains(&kind));
+
+    if lang.branch_kinds().contains(&kind) {
+        m.branches += 1;
+    }
+    if let Some(op) = resource_op(node, ctx, guard > 0) {
+        m.resources.push(op);
+    }
+    if lang.call_kinds().contains(&kind) && callee_name(node, ctx).as_deref() == Some(own_name) {
+        m.recursive = true;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        walk_metrics(child, ctx, own_name, depth, guard, m);
+    }
+}
+
+// rightmost name of a call's callee (`billing::charge(1)` -> `charge`)
+fn callee_name(call: Node, ctx: &Ctx) -> Option<String> {
+    let callee = call.child_by_field_name("function")?;
+    loose_name(callee, ctx).map(|(_, name)| name).filter(|n| !n.is_empty())
+}
+
+fn loop_label(kind: &str) -> String {
+    if kind.contains("comprehension") || kind.contains("generator") {
+        "comprehension".into()
+    } else if kind.starts_with("do_") {
+        "do".into()
+    } else if kind.starts_with("while") {
+        "while".into()
+    } else if kind.starts_with("loop") {
+        "loop".into()
+    } else {
+        "for".into()
+    }
+}
+
+// A resource acquire/release call, matched on the callee's rightmost name.
+// C++ `new`/`delete` are operators rather than calls, so they are matched on
+// their own node kinds.
+fn resource_op(node: Node, ctx: &Ctx, guarded: bool) -> Option<ResourceOp> {
+    let pairs = ctx.lang.resource_pairs();
+    let line = pos(node).0;
+    if ctx.lang == Language::Cpp {
+        match node.kind() {
+            "new_expression" => {
+                return Some(ResourceOp {
+                    line,
+                    name: "new".into(),
+                    pair: "new",
+                    acquire: true,
+                    guarded,
+                })
+            }
+            "delete_expression" => {
+                return Some(ResourceOp {
+                    line,
+                    name: "delete".into(),
+                    pair: "new",
+                    acquire: false,
+                    guarded,
+                })
+            }
+            _ => {}
+        }
+    }
+    if !ctx.lang.call_kinds().contains(&node.kind()) {
+        return None;
+    }
+    let name = callee_name(node, ctx)?;
+    for (acq, rel) in pairs {
+        if name == *acq {
+            return Some(ResourceOp { line, name, pair: acq, acquire: true, guarded });
+        }
+        if name == *rel {
+            return Some(ResourceOp { line, name, pair: acq, acquire: false, guarded });
+        }
+    }
+    None
+}
+
+// Trip count of a counted loop when every bound is an integer literal. Read
+// from the loop header text rather than the grammar so one routine covers all
+// six languages; anything it cannot prove returns `None`.
+fn literal_trip(node: Node, ctx: &Ctx) -> Option<usize> {
+    // everything before the body: `for i := 0; i < 8` etc. Taken from the
+    // grammar because the delimiter differs per language (`{`, `:`, newline)
+    let header = match node.child_by_field_name("body") {
+        Some(b) => ctx.src.get(node.start_byte()..b.start_byte())?,
+        None => text(node, ctx.src),
+    };
+    let int = |s: &str| s.trim().parse::<usize>().ok();
+
+    // `for i in 0..8` / `0..=8`
+    if let Some(range) = header.split(" in ").nth(1) {
+        if let Some((lo, hi)) = range.split_once("..") {
+            let (hi, inclusive) = match hi.strip_prefix('=') {
+                Some(rest) => (rest, true),
+                None => (hi, false),
+            };
+            let hi = hi.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?;
+            let (lo, hi) = (int(lo)?, int(hi)?);
+            return hi.checked_sub(lo).map(|n| n + usize::from(inclusive));
+        }
+        // `for i in range(8)` / `range(2, 8)`
+        if let Some(args) = range.split_once("range(").map(|(_, a)| a) {
+            let args = args.split(')').next()?;
+            let nums: Vec<usize> = args.split(',').filter_map(int).collect();
+            return match (nums.len(), args.matches(',').count()) {
+                (1, 0) => Some(nums[0]),
+                (2, 1) => nums[1].checked_sub(nums[0]),
+                _ => None,
+            };
+        }
+        return None;
+    }
+
+    // C-style `for (i = 0; i < 8; i++)` - init, condition, step
+    let parts: Vec<&str> = header.split(';').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let start = int(parts[0].rsplit(['=', ':']).next()?)?;
+    let cond = parts[1];
+    let (op_inclusive, bound) = if let Some((_, b)) = cond.split_once("<=") {
+        (true, b)
+    } else if let Some((_, b)) = cond.split_once('<') {
+        (false, b)
+    } else {
+        return None;
+    };
+    let end = int(bound)?;
+    end.checked_sub(start).map(|n| n + usize::from(op_inclusive))
 }
 
 fn func_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
@@ -441,6 +968,53 @@ fn func_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
         }
     }
     None
+}
+
+// jest/mocha/vitest-style registrars: `test("name", () => {...})`. Suffixed
+// forms (`it.only`, `test.each`, `describe.skip`) match on the head segment.
+pub(crate) const BDD_REGISTRARS: &[&str] = &[
+    "test", "it", "describe", "suite", "context", "specify", "bench",
+];
+
+// Label for an anonymous function passed to a BDD test registrar, e.g.
+// `test("charge", () => { ... })` -> `test("charge")`. These callbacks are the
+// only "test functions" JS/TS suites have - without this they are anonymous and
+// every call inside them is attributed to `<top>`.
+fn bdd_test_label(node: Node, ctx: &Ctx) -> Option<String> {
+    if !matches!(
+        ctx.lang,
+        Language::JavaScript | Language::TypeScript | Language::Tsx
+    ) || !matches!(node.kind(), "arrow_function" | "function_expression")
+    {
+        return None;
+    }
+    // the callback must be an argument of a call, not a bound variable
+    let args = node.parent()?;
+    if args.kind() != "arguments" {
+        return None;
+    }
+    let call = args.parent()?;
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let callee = text(call.child_by_field_name("function")?, ctx.src);
+    let head = callee
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .find(|s| !s.is_empty())?;
+    if !BDD_REGISTRARS.contains(&head) {
+        return None;
+    }
+    // the title is the first string-ish argument
+    let mut cursor = args.walk();
+    let title = args.children(&mut cursor).find_map(|c| {
+        matches!(c.kind(), "string" | "template_string")
+            .then(|| oneline(text(c, ctx.src)))
+            .map(|t| t.trim_matches(['"', '\'', '`']).to_string())
+    })?;
+    if title.is_empty() {
+        return None;
+    }
+    Some(format!("{head}(\"{title}\")"))
 }
 
 // C++ `function_definition` name: descend the declarator chain to the
@@ -655,7 +1229,7 @@ fn classify_call(node: Node, ctx: &Ctx) -> Option<RawCall> {
 
 // record any call in loose form: rightmost identifier as the name, whatever
 // sits left of it as the qualifier. Unlike [`resolve_callee`] this never
-// requires the receiver to be `self`-like - `surf` wants the superset.
+// requires the receiver to be `self`-like - `changes` wants the superset.
 fn loose_call(node: Node, ctx: &Ctx) -> Option<CallSite> {
     let callee = node.child_by_field_name("function")?;
     let (qualifier, name) = loose_name(callee, ctx)?;
@@ -666,9 +1240,46 @@ fn loose_call(node: Node, ctx: &Ctx) -> Option<CallSite> {
         caller: ctx.caller(),
         line: pos(callee).0,
         name,
+        recv_type: receiver_type(callee, qualifier.as_deref(), ctx),
         qualifier,
         test_ctx: ctx.test_mod_depth > 0,
     })
+}
+
+// Declared type of a method call's receiver. `c.charge()` looks `c` up in the
+// scope's type environment; `self.charge()` uses the enclosing type; a
+// qualifier that is itself a known type name (`Client::new`) is that type.
+// Everything else is `None` - an unknown receiver must not be guessed.
+fn receiver_type(callee: Node, qualifier: Option<&str>, ctx: &Ctx) -> Option<String> {
+    let q = qualifier?;
+    if !matches!(
+        callee.kind(),
+        "field_expression" | "member_expression" | "selector_expression" | "attribute"
+            | "scoped_identifier" | "qualified_identifier"
+    ) {
+        return None;
+    }
+    let base = q
+        .trim_start_matches(['&', '*', '(', ' '])
+        .split(["->", "::", "."].as_slice()[0])
+        .next()
+        .unwrap_or(q)
+        .trim();
+    // `self.x` / `this.x`
+    if matches!(base, "self" | "this" | "Self") {
+        return ctx.current_type().map(|(t, _)| normalize_type(&t));
+    }
+    // a bound local, parameter or receiver
+    if let Some(t) = ctx.type_of(base) {
+        return Some(t);
+    }
+    // the qualifier is written as the type itself (`Client::new`, `Client.of`)
+    let last = q.rsplit(["::", "."].as_slice()[0]).next().unwrap_or(q).trim();
+    let looks_like_type = last.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    if looks_like_type && ctx.types.iter().any(|t| t.name == last) {
+        return Some(last.to_string());
+    }
+    None
 }
 
 // index one enum variant/enumerator as a const-like definition
@@ -750,6 +1361,8 @@ fn maybe_use(node: Node, ctx: &mut Ctx) {
         caller: ctx.caller(),
         line: pos(node).0,
         name,
+        // a use is a value/type reference, not a call through a receiver
+        recv_type: None,
         qualifier,
         test_ctx: ctx.test_mod_depth > 0,
     });
@@ -940,6 +1553,8 @@ fn scan_macro_tokens(node: Node, ctx: &mut Ctx) {
             caller: ctx.caller(),
             line: pos(id).0,
             name: oneline(text(id, ctx.src)),
+            // macro token trees are approximated; no receiver typing there
+            recv_type: None,
             qualifier,
             test_ctx: ctx.test_mod_depth > 0,
         });
@@ -1340,6 +1955,171 @@ mod tests {
             .uses
             .iter()
             .any(|u| u.name == "RED" && u.qualifier.as_deref() == Some("Color")));
+    }
+
+    // jest/vitest tests are anonymous callbacks; their string label becomes the
+    // caller so `changes` can report which test exercises a function
+    #[test]
+    fn bdd_callbacks_name_and_flag_their_scope() {
+        let src = "import { charge } from \"./pay\";\n\
+                   describe(\"pay\", () => {\n\
+                     it(\"charges a fee\", () => { expect(charge(1)).toBe(31); });\n\
+                   });\n\
+                   const total = charge(2);\n\
+                   run(() => { charge(3); });\n";
+        let ex = extract(Language::JavaScript, src).unwrap();
+        let site = |line: usize| {
+            ex.calls
+                .iter()
+                .find(|c| c.name == "charge" && c.line == line)
+                .unwrap_or_else(|| panic!("no charge call on line {line}"))
+        };
+        let inner = site(3);
+        assert_eq!(inner.caller, "it(\"charges a fee\")");
+        assert!(inner.test_ctx);
+        // outside any suite, nothing changes
+        assert_eq!(site(5).caller, TOP_LEVEL);
+        assert!(!site(5).test_ctx);
+        // a non-test callback stays anonymous
+        assert_eq!(site(6).caller, TOP_LEVEL);
+        assert!(!site(6).test_ctx);
+    }
+
+    #[test]
+    fn func_metrics_count_shape_and_literal_trips() {
+        let rust = "fn work(a: usize, b: usize) -> usize {\n\
+                    \x20   let mut t = 0;\n\
+                    \x20   for i in 0..4 { for j in 0..=b { t += i * j; } }\n\
+                    \x20   if t > 3 { t -= 1; }\n\
+                    \x20   t\n\
+                    }\n";
+        let f = &extract(Language::Rust, rust).unwrap().funcs[0];
+        assert_eq!(f.metrics.params, 2);
+        assert_eq!(f.metrics.branches, 1);
+        assert_eq!(f.metrics.loops.len(), 2);
+        assert_eq!(f.metrics.max_loop_depth(), 2);
+        // `0..4` is countable; `0..=b` depends on a value
+        assert_eq!(f.metrics.loops[0].trip, Some(4));
+        assert_eq!(f.metrics.loops[1].trip, None);
+        assert_eq!(f.metrics.complexity(), 4);
+        assert!(!f.metrics.recursive);
+
+        // C-style headers and python ranges resolve the same way
+        let go = "package m\nfunc loop() { for i := 0; i <= 7; i++ { use(i) } }\n";
+        let g = &extract(Language::Go, go).unwrap().funcs[0];
+        assert_eq!(g.metrics.loops[0].trip, Some(8));
+        let py = "def loop():\n    for i in range(2, 6):\n        use(i)\n";
+        let p = &extract(Language::Python, py).unwrap().funcs[0];
+        assert_eq!(p.metrics.loops[0].trip, Some(4));
+
+        // recursion is detected by self-name
+        let rec = "fn fact(n: u64) -> u64 { if n < 2 { 1 } else { n * fact(n - 1) } }\n";
+        assert!(extract(Language::Rust, rec).unwrap().funcs[0].metrics.recursive);
+    }
+
+    #[test]
+    fn resource_ops_pair_by_language() {
+        let c = "void f() { char* p = (char*)malloc(10); use(p); }\n\
+                 void g() { char* p = (char*)malloc(10); free(p); }\n";
+        let ex = extract(Language::Cpp, c).unwrap();
+        let leaky = ex.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(leaky.metrics.resources.len(), 1);
+        assert!(leaky.metrics.resources[0].acquire);
+        let paired = ex.funcs.iter().find(|f| f.name == "g").unwrap();
+        assert_eq!(paired.metrics.resources.len(), 2);
+        assert!(!paired.metrics.resources[1].acquire);
+
+        // python `with` marks the acquire as automatically released
+        let py = "def read(p):\n    with open(p) as fh:\n        return fh.read()\n";
+        let f = &extract(Language::Python, py).unwrap().funcs[0];
+        assert!(f.metrics.resources[0].guarded);
+    }
+
+    // the type layer `changes` resolves calls through: definitions, method
+    // owners, parameter types, module identities, and receiver types
+    #[test]
+    fn typed_languages_expose_types_owners_and_receivers() {
+        let rust = "pub struct Client { id: u64 }\n\
+                    pub trait Pay { fn pay(&self); }\n\
+                    impl Client {\n\
+                    \x20   pub fn charge(&self, cents: u64) -> u64 { cents }\n\
+                    }\n\
+                    fn run(c: &Client) -> u64 {\n\
+                    \x20   let other = Client::new();\n\
+                    \x20   other.charge(1) + c.charge(2)\n\
+                    }\n";
+        let ex = extract(Language::Rust, rust).unwrap();
+        let kinds: Vec<(&str, &str)> = ex
+            .types
+            .iter()
+            .map(|t| (t.name.as_str(), t.kind.as_str()))
+            .collect();
+        assert_eq!(kinds, vec![("Client", "struct"), ("Pay", "trait")]);
+        let charge = ex.funcs.iter().find(|f| f.name == "charge").unwrap();
+        assert_eq!(charge.owner.as_deref(), Some("Client"));
+        assert_eq!(charge.param_types, vec!["Client", "u64"]);
+        // both receivers resolve: one from a parameter, one from a constructor
+        let calls: Vec<(&str, Option<&str>)> = ex
+            .calls
+            .iter()
+            .filter(|c| c.name == "charge")
+            .map(|c| (c.name.as_str(), c.recv_type.as_deref()))
+            .collect();
+        assert_eq!(calls, vec![("charge", Some("Client")), ("charge", Some("Client"))]);
+
+        let go = "package billing\n\
+                  type Ledger struct { n int }\n\
+                  func (l *Ledger) Charge(c int) int { return c }\n\
+                  func run() int {\n\
+                  \tvar led Ledger\n\
+                  \treturn led.Charge(1)\n\
+                  }\n";
+        let ex = extract(Language::Go, go).unwrap();
+        assert_eq!(ex.modules, vec!["billing"]);
+        assert!(ex.types.iter().any(|t| t.name == "Ledger"));
+        let m = ex.funcs.iter().find(|f| f.name == "Charge").unwrap();
+        assert_eq!(m.owner.as_deref(), Some("Ledger"));
+        let call = ex.calls.iter().find(|c| c.name == "Charge").unwrap();
+        assert_eq!(call.recv_type.as_deref(), Some("Ledger"));
+
+        let ts = "export class Gateway { send(n: number): void {} }\n\
+                  export interface Wire { id: string }\n\
+                  function go(): void {\n\
+                  \x20 const g = new Gateway();\n\
+                  \x20 g.send(1);\n\
+                  }\n";
+        let ex = extract(Language::TypeScript, ts).unwrap();
+        assert!(ex.types.iter().any(|t| t.name == "Gateway" && t.kind == "class"));
+        assert!(ex.types.iter().any(|t| t.name == "Wire" && t.kind == "interface"));
+        let call = ex.calls.iter().find(|c| c.name == "send").unwrap();
+        assert_eq!(call.recv_type.as_deref(), Some("Gateway"));
+
+        let cpp = "namespace billing {\n\
+                   class Account { public: double debit(double a); };\n\
+                   double run() { Account acct; return acct.debit(1.0); }\n\
+                   }\n";
+        let ex = extract(Language::Cpp, cpp).unwrap();
+        assert_eq!(ex.modules, vec!["billing"]);
+        assert!(ex.types.iter().any(|t| t.name == "Account"));
+        let call = ex.calls.iter().find(|c| c.name == "debit").unwrap();
+        assert_eq!(call.recv_type.as_deref(), Some("Account"));
+    }
+
+    #[test]
+    fn type_names_normalise_to_their_definition() {
+        for (raw, want) in [
+            ("&mut Option<billing::Client>", "Client"),
+            ("Vec<Invoice>", "Invoice"),
+            ("std::shared_ptr<Account>", "Account"),
+            ("Promise<Gateway>", "Gateway"),
+            ("[]Ledger", "Ledger"),
+            ("Ledger[]", "Ledger"),
+            (": Wire", "Wire"),
+            ("*const Client", "Client"),
+            ("u64", "u64"),
+        ] {
+            assert_eq!(normalize_type(raw), want, "normalising {raw}");
+        }
     }
 
     #[test]

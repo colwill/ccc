@@ -143,6 +143,170 @@ impl Language {
         }
     }
 
+    // Does this language declare types where the syntax tree can read them?
+    pub fn is_typed(self) -> bool {
+        matches!(
+            self,
+            Language::Rust | Language::Go | Language::Cpp | Language::TypeScript | Language::Tsx
+        )
+    }
+
+    // kinds that define a named type
+    pub fn type_kinds(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Language::Rust => &[
+                ("struct_item", "struct"),
+                ("enum_item", "enum"),
+                ("trait_item", "trait"),
+                ("union_item", "union"),
+                ("type_item", "alias"),
+            ],
+            Language::Go => &[("type_spec", "struct")],
+            Language::Cpp => &[
+                ("class_specifier", "class"),
+                ("struct_specifier", "struct"),
+                ("enum_specifier", "enum"),
+                ("union_specifier", "union"),
+                ("alias_declaration", "alias"),
+            ],
+            Language::TypeScript | Language::Tsx => &[
+                ("class_declaration", "class"),
+                ("abstract_class_declaration", "class"),
+                ("interface_declaration", "interface"),
+                ("type_alias_declaration", "alias"),
+                ("enum_declaration", "enum"),
+            ],
+            // classes exist but carry no declared field/param types
+            Language::JavaScript => &[("class_declaration", "class")],
+            Language::Python => &[("class_definition", "class")],
+        }
+    }
+
+    // kinds that declare a module identity a qualifier can name: a Go
+    // `package`, a C++ `namespace`, a Rust inline `mod`
+    pub fn module_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Go => &["package_clause"],
+            Language::Cpp => &["namespace_definition"],
+            Language::Rust => &["mod_item"],
+            _ => &[],
+        }
+    }
+
+    // kinds that repeat their body - loop-nesting depth and unroll candidates
+    pub fn loop_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust => &["for_expression", "while_expression", "loop_expression"],
+            // comprehensions are loops that the reader does not always see
+            Language::Python => &[
+                "for_statement",
+                "while_statement",
+                "list_comprehension",
+                "set_comprehension",
+                "dictionary_comprehension",
+                "generator_expression",
+            ],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => &[
+                "for_statement",
+                "for_in_statement",
+                "while_statement",
+                "do_statement",
+            ],
+            Language::Go => &["for_statement"],
+            Language::Cpp => &["for_statement", "for_range_loop", "while_statement", "do_statement"],
+        }
+    }
+
+    // kinds that fork control flow
+    pub fn branch_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust => &["if_expression", "match_arm"],
+            Language::Python => &["if_statement", "elif_clause", "except_clause", "case_clause"],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => &[
+                "if_statement",
+                "switch_case",
+                "catch_clause",
+                "ternary_expression",
+            ],
+            Language::Go => &[
+                "if_statement",
+                "expression_case",
+                "type_case",
+                "communication_case",
+            ],
+            Language::Cpp => &[
+                "if_statement",
+                "case_statement",
+                "catch_clause",
+                "conditional_expression",
+            ],
+        }
+    }
+
+    // node kinds holding a function's parameter list
+    pub fn param_list_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust | Language::Python => &["parameters"],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => &["formal_parameters"],
+            Language::Go | Language::Cpp => &["parameter_list"],
+        }
+    }
+
+    // kinds that make a resource release automatic
+    pub fn guard_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Python => &["with_statement"],
+            Language::Go => &["defer_statement"],
+            // rust/c++ release through RAII, which has no distinct node kind.
+            // I cant be bothered to try and analyse this right now
+            _ => &[],
+        }
+    }
+
+    // (acquire, release) call-name pairs
+    pub fn resource_pairs(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Language::Cpp => &[
+                ("malloc", "free"),
+                ("calloc", "free"),
+                ("realloc", "free"),
+                ("strdup", "free"),
+                ("new", "delete"),
+                ("fopen", "fclose"),
+                ("lock", "unlock"),
+            ],
+            Language::Rust => &[("leak", "from_raw"), ("forget", "from_raw"), ("into_raw", "from_raw")],
+            Language::Go => &[
+                ("Open", "Close"),
+                ("OpenFile", "Close"),
+                ("Dial", "Close"),
+                ("Lock", "Unlock"),
+                ("RLock", "RUnlock"),
+                ("NewTicker", "Stop"),
+                ("NewTimer", "Stop"),
+            ],
+            Language::Python => &[("open", "close"), ("connect", "close"), ("acquire", "release")],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => &[
+                ("addEventListener", "removeEventListener"),
+                ("setInterval", "clearInterval"),
+                ("createObjectURL", "revokeObjectURL"),
+            ],
+        }
+    }
+
+    // how this language asks the compiler to inline, named in lint advice
+    pub fn inline_hint(self) -> &'static str {
+        match self {
+            Language::Rust => "#[inline]",
+            Language::Cpp => "inline / header definition",
+            Language::Go => "keep under the inliner's cost budget",
+            Language::Python => "no inliner - consider hoisting the call out of hot loops",
+            Language::JavaScript | Language::TypeScript | Language::Tsx => {
+                "monomorphic call site (JIT inlines these)"
+            }
+        }
+    }
+
     // field name holding a function's return type (if the grammar has one)
     pub fn return_field(self) -> Option<&'static str> {
         match self {

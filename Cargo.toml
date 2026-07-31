@@ -1,6 +1,6 @@
 [package]
 name = "codecache"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 rust-version = "1.77"
 author = "github.com/colwill"
@@ -30,7 +30,7 @@ tree-sitter-cpp = "0.23"
 tiktoken-rs = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# already in the tree via `ignore`; used directly for surf service globs
+# already in the tree via `ignore`; used directly for `changes` service globs
 globset = "0.4"
 # minimal synchronous HTTP server for `ccc serve` (no async runtime)
 tiny_http = "0.12"
