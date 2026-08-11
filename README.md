@@ -127,18 +127,14 @@ The `.ccc/map.json` file is used to hint to ccc where to find dependencies, for 
 
 ## AGENTS.md
 
-If you're not using `ccc serve`, you can generate a `.ccc` directory using `ccc scan` and then add a block to your AGENTS.md file instead:
+#### Note: If you're not using `ccc serve`, you can generate a `.ccc` directory using `ccc scan` and then add a block to your AGENTS.md file  to scan the `.ccc` directory instead.
 
-Coding agents that read an [`AGENTS.md`](https://agents.md) at the repo root
-(Claude Code, Cursor, and others) can be told to treat `.ccc/CCC.md` as their
-primary lens on the codebase: reason from the map on every turn, and fall
-through to source only when they actually need to read or change a specific
-line. Drop a block like this into your `AGENTS.md` (or `CLAUDE.md`):
+For those using `ccc serve` and the MCP tools add the following block to an AGENTS.md file at the root of your project - agents that read an [`AGENTS.md`](https://agents.md) at the repo root pick this up automatically e.g. Copilot, Claude, Cursor etc.
 
 ```md
 # AGENTS.md
 
-This repo ships a ContextCodeCache - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
+This repo has a ContextCodeCache - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
 as the entry point for everything you do here.
 
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
