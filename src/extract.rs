@@ -37,6 +37,8 @@ struct RawCall {
     caller: String,
     call_line: usize,
     kind: CallKind,
+    // type body the call sits in
+    in_type: Option<String>,
 }
 
 enum Scope {
@@ -156,7 +158,18 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
     let mut refs = Vec::new();
     for c in &ctx.calls {
         let resolved = match &c.kind {
-            CallKind::Free(name) => ctx.free_index.get(name).map(|v| (name.clone(), v)),
+            // An unqualified call inside a class body means that class's own
+            // method in C++, C# and Zig
+            CallKind::Free(name) => {
+                let sibling = c
+                    .in_type
+                    .as_ref()
+                    .filter(|_| lang.implicit_member_scope())
+                    .and_then(|ty| ctx.method_index.get(&(ty.clone(), name.clone())));
+                sibling
+                    .or_else(|| ctx.free_index.get(name))
+                    .map(|v| (name.clone(), v))
+            }
             CallKind::Method { ty, name } => ctx
                 .method_index
                 .get(&(ty.clone(), name.clone()))
@@ -255,7 +268,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
     // a C++ `class_specifier`, a TS `class_declaration`) are also type scopes
     // and would otherwise be swallowed by that branch
     if let Some(kind) = lang.type_kinds().iter().find(|(k, _)| *k == kind).map(|(_, v)| *v) {
-        if let Some(name) = node.child_by_field_name("name") {
+        if let Some(name) = type_def_name(node, ctx) {
             ctx.types.push(TypeDef {
                 line: pos(node).0,
                 name: oneline(text(name, ctx.src)),
@@ -263,13 +276,19 @@ fn visit(node: Node, ctx: &mut Ctx) {
             });
         }
     }
-    if lang.module_kinds().contains(&kind) {
+    // A test scope is a module the language recognises but not one the project
+    // is built out of
+    if lang.module_kinds().contains(&kind) && ctx.test_mod_depth == 0 {
         // a go `package_clause` has no `name` field; its identifier child is it
         let name = node
             .child_by_field_name("name")
             .or_else(|| node.named_child(0))
             .map(|n| oneline(text(n, ctx.src)));
-        if let Some(name) = name.filter(|n| !n.is_empty()) {
+        // `declare module "pkg"` names an external package's types, not a
+        // module this project defines - its name arrives quoted, which is the
+        // tell
+        let local = |n: &String| !n.is_empty() && !n.starts_with('"') && !n.starts_with('\'');
+        if let Some(name) = name.filter(local) {
             if !ctx.modules.contains(&name) {
                 ctx.modules.push(name);
             }
@@ -333,6 +352,10 @@ fn visit(node: Node, ctx: &mut Ctx) {
     } else if matches!(lang, Language::TypeScript | Language::Tsx) && kind == "enum_declaration" {
         if !ctx.in_function() {
             extract_ts_enum(node, ctx);
+        }
+    } else if lang == Language::Odin && kind == "enum_declaration" {
+        if !ctx.in_function() {
+            extract_odin_enum(node, ctx);
         }
     } else if lang.call_kinds().contains(&kind) {
         if let Some(call) = classify_call(node, ctx) {
@@ -401,14 +424,48 @@ fn type_scope(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
         (Language::Cpp, "class_specifier" | "struct_specifier") => {
             Some((name_of("name")?, Some("this".to_string())))
         }
+        (
+            Language::CSharp,
+            "class_declaration" | "struct_declaration" | "interface_declaration"
+            | "record_declaration",
+        ) => Some((name_of("name")?, Some("this".to_string()))),
+        // zig methods live in an anonymous struct bound to a name receiver is `self`
+        (Language::Zig, "struct_declaration" | "union_declaration" | "opaque_declaration") => {
+            let name = type_def_name(node, ctx)?;
+            Some((oneline(text(name, ctx.src)), Some("self".to_string())))
+        }
         _ => None,
     }
+}
+
+// `static int Charge(this Client c, int amt)` 
+// the `this` before Client qualifies as an extension method
+fn csharp_extension_receiver(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
+    let list = first_child_of_kind(node, "parameter_list")?;
+    let first = list.named_children(&mut list.walk()).find(|p| p.kind() == "parameter")?;
+    let mut cursor = first.walk();
+    let extends = first
+        .children(&mut cursor)
+        .any(|c| c.kind() == "modifier" && text(c, ctx.src).trim() == "this");
+    if !extends {
+        return None;
+    }
+    let ty = oneline(text(first.child_by_field_name("type")?, ctx.src));
+    let recv = first
+        .child_by_field_name("name")
+        .map(|n| oneline(text(n, ctx.src)));
+    Some((ty, recv))
 }
 
 // if it is a method the enclosing type scope or for go... the method's own receiver
 fn func_owner(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
     if ctx.lang == Language::Go && node.kind() == "method_declaration" {
         return go_receiver(node, ctx.src);
+    }
+    if ctx.lang == Language::CSharp {
+        if let Some(owner) = csharp_extension_receiver(node, ctx) {
+            return Some(owner);
+        }
     }
     // C++ methods are often defined out of line as `Class::method` rather than
     // nested inside the class body, so the owner comes from the qualified name.
@@ -478,8 +535,11 @@ fn const_eligible(ctx: &Ctx) -> bool {
         | Language::JavaScript
         | Language::TypeScript
         | Language::Tsx
-        | Language::Cpp => !ctx.in_type(),
-        Language::Rust | Language::Go => true,
+        | Language::Cpp
+        | Language::C
+        | Language::Zig => !ctx.in_type(),
+        Language::CSharp => true,
+        Language::Rust | Language::Go | Language::Odin => true,
     }
 }
 
@@ -602,7 +662,15 @@ fn param_pairs(node: Node, ctx: &Ctx) -> Vec<(Option<String>, Option<String>)> {
             .or_else(|| p.child_by_field_name("declarator"))
             .map(|n| oneline(text(n, ctx.src)))
             // a bare identifier parameter (go `x` in `x, y int`, js `x`)
-            .or_else(|| (p.kind() == "identifier").then(|| oneline(text(p, ctx.src))));
+            .or_else(|| (p.kind() == "identifier").then(|| oneline(text(p, ctx.src))))
+            // odin labels neither side: `spec: string` is an identifier child
+            // and a type child
+            .or_else(|| {
+                (ctx.lang == Language::Odin)
+                    .then(|| first_child_of_kind(p, "identifier"))
+                    .flatten()
+                    .map(|n| oneline(text(n, ctx.src)))
+            });
         let ty = p
             .child_by_field_name("type")
             .map(|n| oneline(text(n, ctx.src)))
@@ -611,6 +679,12 @@ fn param_pairs(node: Node, ctx: &Ctx) -> Vec<(Option<String>, Option<String>)> {
                 p.kind().contains("self").then(|| {
                     ctx.current_type().map(|(t, _)| t).unwrap_or_default()
                 })
+            })
+            .or_else(|| {
+                (ctx.lang == Language::Odin)
+                    .then(|| first_child_of_kind(p, "type"))
+                    .flatten()
+                    .map(|n| oneline(text(n, ctx.src)))
             });
         let name = name.map(|n| {
             // `&self` / `mut x` / `*p` reduce to the bound identifier
@@ -652,12 +726,12 @@ fn bind_declaration(node: Node, ctx: &mut Ctx) {
     let kind = node.kind();
     let interesting = matches!(
         kind,
-        "let_declaration"            // rust
-            | "short_var_declaration" // go `x := ...`
-            | "var_spec"              // go `var x T`
+        "let_declaration"               // rust
+            | "short_var_declaration"   // go `x := ...`
+            | "var_spec"                // go `var x T`
             | "const_spec"
-            | "variable_declarator"   // js/ts
-            | "declaration"           // c++
+            | "variable_declarator"     // js/ts
+            | "declaration"             // c++
             | "field_declaration"
     );
     if !interesting {
@@ -834,7 +908,7 @@ fn walk_metrics(
 
 // rightmost name of a call's callee (`billing::charge(1)` -> `charge`)
 fn callee_name(call: Node, ctx: &Ctx) -> Option<String> {
-    let callee = call.child_by_field_name("function")?;
+    let callee = callee_node(call)?;
     loose_name(callee, ctx).map(|(_, name)| name).filter(|n| !n.is_empty())
 }
 
@@ -951,12 +1025,20 @@ fn literal_trip(node: Node, ctx: &Ctx) -> Option<usize> {
 }
 
 fn func_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
-    // C++ has no `name` field: the name is buried in the declarator chain.
-    if ctx.lang == Language::Cpp {
+    // C and C++ have no `name` field: the name is buried in the declarator
+    // chain, behind any pointer/array/parenthesised layers the return type put
+    // there.
+    if matches!(ctx.lang, Language::Cpp | Language::C) {
         return cpp_func_name(node, ctx);
     }
     if let Some(n) = node.child_by_field_name("name") {
         return Some((oneline(text(n, ctx.src)), n));
+    }
+    // odin declares by binding a name to a procedure literal
+    if ctx.lang == Language::Odin {
+        if let Some(n) = first_child_of_kind(node, "identifier") {
+            return Some((oneline(text(n, ctx.src)), n));
+        }
     }
     // lambda function expression bound to a variable declarator
     if matches!(node.kind(), "arrow_function" | "function_expression") {
@@ -1043,7 +1125,54 @@ fn cpp_declarator_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a
     }
 }
 
+// First direct child of a given kind
+fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    let found = node.children(&mut cursor).find(|c| c.kind() == kind);
+    found
+}
+
+// The node carrying a type definition's name
+fn type_def_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<Node<'a>> {
+    if let Some(n) = node.child_by_field_name("name") {
+        return Some(n);
+    }
+    match ctx.lang {
+        // `typedef struct {...} Codec;` names the type on the typedef
+        Language::C | Language::Cpp if node.kind() == "type_definition" => {
+            if node
+                .child_by_field_name("type")
+                .and_then(|t| t.child_by_field_name("name"))
+                .is_some()
+            {
+                return None;
+            }
+            node.child_by_field_name("declarator")
+                .filter(|d| d.kind() == "type_identifier")
+        }
+        // `pub const Codec = struct { ... };` - the struct is anonymous and the
+        // name belongs to the binding around it
+        Language::Zig => {
+            let parent = node.parent()?;
+            if parent.kind() != "variable_declaration" {
+                return None;
+            }
+            first_child_of_kind(parent, "identifier")
+        }
+        // `Codec :: struct { ... }` - an unlabelled identifier child
+        Language::Odin => first_child_of_kind(node, "identifier"),
+        _ => None,
+    }
+}
+
 fn func_return(node: Node, ctx: &Ctx) -> Option<String> {
+    // odin wraps the signature in a `procedure` node
+    if ctx.lang == Language::Odin {
+        let proc = first_child_of_kind(node, "procedure")?;
+        let t = first_child_of_kind(proc, "type")?;
+        let t = oneline(text(t, ctx.src));
+        return (!t.is_empty()).then_some(t);
+    }
     let field = ctx.lang.return_field()?;
     let n = node.child_by_field_name(field)?;
     let mut t = oneline(text(n, ctx.src));
@@ -1142,7 +1271,87 @@ fn extract_consts(node: Node, ctx: &mut Ctx) {
                 }
             }
         }
-        Language::Cpp => {
+        Language::CSharp => {
+            // a plain field is mutable state; `const` and `readonly` are the
+            // two ways C# says "this will not change"
+            let mut cursor = node.walk();
+            let is_const = node
+                .children(&mut cursor)
+                .any(|c| matches!(text(c, ctx.src).trim(), "const" | "readonly"));
+            if !is_const {
+                return;
+            }
+            let Some(decl) = first_child_of_kind(node, "variable_declaration") else {
+                return;
+            };
+            let ty = decl
+                .child_by_field_name("type")
+                .map(|n| oneline(text(n, ctx.src)));
+            let mut cursor = decl.walk();
+            for d in decl.children(&mut cursor) {
+                if d.kind() != "variable_declarator" {
+                    continue;
+                }
+                if let Some(name) = d.child_by_field_name("name") {
+                    ctx.consts.push(Const {
+                        line: pos(name).0,
+                        name: oneline(text(name, ctx.src)),
+                        ty: ty.clone(),
+                    });
+                }
+            }
+        }
+        Language::Zig => {
+            // `var` is mutable, so only `const` bindings are constants
+            if first_child_of_kind(node, "const").is_none() {
+                return;
+            }
+            // the same node shape also spells a type definition and an import;
+            // both are recorded elsewhere and are not constants
+            let mut cursor = node.walk();
+            let bound_elsewhere = node.children(&mut cursor).any(|c| {
+                ctx.lang.type_kinds().iter().any(|(k, _)| *k == c.kind())
+                    || (c.kind() == "builtin_function"
+                        && text(c, ctx.src).trim_start().starts_with("@import"))
+            });
+            if bound_elsewhere {
+                return;
+            }
+            let Some(name) = first_child_of_kind(node, "identifier") else {
+                return;
+            };
+            let ty = node
+                .child_by_field_name("type")
+                .map(|n| oneline(text(n, ctx.src)));
+            ctx.consts.push(Const {
+                line: pos(name).0,
+                name: oneline(text(name, ctx.src)),
+                ty,
+            });
+        }
+        Language::Odin => {
+            let Some(name) = first_child_of_kind(node, "identifier") else {
+                return;
+            };
+            // `Handle :: distinct int` declares a type. It shares a node kind
+            // with every other `::` binding, so the value is what tells them
+            // apart.
+            if first_child_of_kind(node, "distinct_type").is_some() {
+                ctx.types.push(TypeDef {
+                    line: pos(name).0,
+                    name: oneline(text(name, ctx.src)),
+                    kind: "alias".to_string(),
+                });
+                return;
+            }
+            let ty = first_child_of_kind(node, "type").map(|n| oneline(text(n, ctx.src)));
+            ctx.consts.push(Const {
+                line: pos(name).0,
+                name: oneline(text(name, ctx.src)),
+                ty,
+            });
+        }
+        Language::Cpp | Language::C => {
             // only `const`/`constexpr`/... declarations count as consts; plain
             // `int x = 5;` and function prototypes are skipped.
             if !cpp_is_const_decl(node, ctx.src) {
@@ -1218,24 +1427,47 @@ fn has_const_keyword(node: Node) -> bool {
 }
 
 fn classify_call(node: Node, ctx: &Ctx) -> Option<RawCall> {
-    let callee = node.child_by_field_name("function")?;
+    let callee = callee_node(node)?;
     let kind = resolve_callee(callee, ctx)?;
     Some(RawCall {
         caller: ctx.caller(),
         call_line: pos(callee).0,
         kind,
+        in_type: ctx.current_type().map(|(ty, _)| ty),
     })
 }
 
 // record any call in loose form: rightmost identifier as the name, whatever
 // sits left of it as the qualifier. Unlike [`resolve_callee`] this never
 // requires the receiver to be `self`-like - `changes` wants the superset.
+//
+// The node naming what a call invokes. Every grammar here puts it on a
+// `function` field except C#'s `new Client()`, where the thing being called is
+// the type being constructed.
+fn callee_node(call: Node) -> Option<Node> {
+    call.child_by_field_name("function")
+        .or_else(|| call.child_by_field_name("type"))
+}
+
 fn loose_call(node: Node, ctx: &Ctx) -> Option<CallSite> {
-    let callee = node.child_by_field_name("function")?;
+    let callee = callee_node(node)?;
     let (qualifier, name) = loose_name(callee, ctx)?;
     if name.is_empty() {
         return None;
     }
+    // Odin nests a qualified call inside the member access rather than the
+    // other way round
+    let qualifier = qualifier.or_else(|| {
+        if ctx.lang != Language::Odin {
+            return None;
+        }
+        let parent = node.parent()?;
+        if parent.kind() != "member_expression" {
+            return None;
+        }
+        let q = parent.named_child(0)?;
+        (q.id() != node.id()).then(|| oneline(text(q, ctx.src)))
+    });
     Some(CallSite {
         caller: ctx.caller(),
         line: pos(callee).0,
@@ -1255,7 +1487,7 @@ fn receiver_type(callee: Node, qualifier: Option<&str>, ctx: &Ctx) -> Option<Str
     if !matches!(
         callee.kind(),
         "field_expression" | "member_expression" | "selector_expression" | "attribute"
-            | "scoped_identifier" | "qualified_identifier"
+            | "scoped_identifier" | "qualified_identifier" | "member_access_expression"
     ) {
         return None;
     }
@@ -1287,6 +1519,21 @@ fn extract_variant(node: Node, ctx: &mut Ctx) {
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
+    // zig spells an enum variant and a struct field the same way; only the
+    // parent tells them apart
+    if ctx.lang == Language::Zig {
+        let Some(parent) = node.parent() else { return };
+        if parent.kind() != "enum_declaration" {
+            return;
+        }
+        let ty = type_def_name(parent, ctx).map(|n| oneline(text(n, ctx.src)));
+        ctx.consts.push(Const {
+            line: pos(name).0,
+            name: oneline(text(name, ctx.src)),
+            ty,
+        });
+        return;
+    }
     // rust: enum_variant < enum_variant_list < enum_item(name);
     // cpp: enumerator < enumerator_list < enum_specifier(name)
     let ty = node
@@ -1324,6 +1571,25 @@ fn extract_ts_enum(node: Node, ctx: &mut Ctx) {
                 ty: ty.clone(),
             });
         }
+    }
+}
+
+// odin `Mode :: enum { Fast, Small }` - the members are bare identifiers with
+// no node kind of their own, so they are read straight off the declaration
+fn extract_odin_enum(node: Node, ctx: &mut Ctx) {
+    let ty = type_def_name(node, ctx).map(|n| oneline(text(n, ctx.src)));
+    let mut cursor = node.walk();
+    let members: Vec<Node> = node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "identifier")
+        .collect();
+    // the first identifier is the enum's own name, not a member
+    for m in members.into_iter().skip(1) {
+        ctx.consts.push(Const {
+            line: pos(m).0,
+            name: oneline(text(m, ctx.src)),
+            ty: ty.clone(),
+        });
     }
 }
 
@@ -1376,12 +1642,25 @@ fn maybe_use(node: Node, ctx: &mut Ctx) {
 fn extract_import(node: Node, ctx: &mut Ctx) {
     let line = pos(node).0;
     let stmt = oneline(text(node, ctx.src));
+    let reexport = is_reexport(ctx.lang, &stmt);
     for (module, names) in parse_import(ctx.lang, &stmt) {
         ctx.imports.push(Import {
             line,
             module,
             names,
+            reexport,
         });
+    }
+}
+
+// does the current statement (stmt) hand the names it binds onward
+fn is_reexport(lang: Language, stmt: &str) -> bool {
+    match lang {
+        Language::Rust => stmt
+            .trim_start()
+            .strip_prefix("pub")
+            .is_some_and(|rest| rest.starts_with(['(', ' ', '\t'])),
+        _ => false,
     }
 }
 
@@ -1412,11 +1691,16 @@ fn parse_import(lang: Language, stmt: &str) -> Vec<(String, Vec<String>)> {
     };
     match lang {
         Language::Rust => {
-            let Some(s) = stmt
-                .trim_start_matches("pub")
-                .trim()
-                .strip_prefix("use")
-            else {
+            // `pub(crate) use` / `pub(super) use` are re-exports too, and used
+            // to be dropped whole: stripping the bare `pub` left `(crate) use`,
+            // which is not a `use` prefix, so the statement produced no import
+            // and the names it binds were invisible to every lookup.
+            let s = stmt.trim_start().strip_prefix("pub").unwrap_or(stmt).trim();
+            let s = match s.strip_prefix('(') {
+                Some(rest) => rest.split_once(')').map_or(s, |(_, tail)| tail).trim(),
+                None => s,
+            };
+            let Some(s) = s.strip_prefix("use") else {
                 return Vec::new();
             };
             let s = s.trim().trim_end_matches(';').trim();
@@ -1496,6 +1780,72 @@ fn parse_import(lang: Language, stmt: &str) -> Vec<(String, Vec<String>)> {
             }
             out
         }
+        Language::C => {
+            let s = stmt.trim().strip_prefix("#include").unwrap_or("").trim();
+            let module = s.trim_matches(|c| c == '"' || c == '<' || c == '>').to_string();
+            if module.is_empty() {
+                Vec::new()
+            } else {
+                vec![(module, Vec::new())]
+            }
+        }
+        Language::CSharp => {
+            // `using System.Text;`, `using static A.B;`, `using X = A.B;`
+            let s = stmt.trim().trim_end_matches(';').trim();
+            let Some(s) = s.strip_prefix("using") else {
+                return Vec::new();
+            };
+            let s = s.trim().strip_prefix("static").unwrap_or(s).trim();
+            match s.split_once('=') {
+                // an alias binds the name on the left to the path on the right
+                Some((alias, path)) => {
+                    vec![(path.trim().to_string(), idents(alias))]
+                }
+                // a plain `using` opens a namespace without binding a name; the
+                // module is what a qualifier can then reach through
+                None => vec![(s.to_string(), Vec::new())],
+            }
+        }
+        Language::Zig => {
+            // only `@import(...)` bindings are imports - every other `const`
+            // arrives here too, because they share a node kind
+            let Some((bound, rest)) = stmt.split_once('=') else {
+                return Vec::new();
+            };
+            if !rest.contains("@import") {
+                return Vec::new();
+            }
+            let module = rest.split('"').nth(1).unwrap_or("").to_string();
+            if module.is_empty() {
+                return Vec::new();
+            }
+            // `const std = @import("std")` binds `std`; drop the keywords
+            let names: Vec<String> = idents(bound)
+                .into_iter()
+                .filter(|w| !matches!(w.as_str(), "pub" | "const" | "var"))
+                .collect();
+            vec![(module, names)]
+        }
+        Language::Odin => {
+            // `import "core:fmt"` / `import os "core:os"`
+            let module = stmt.split('"').nth(1).unwrap_or("").to_string();
+            if module.is_empty() {
+                return Vec::new();
+            }
+            let before = stmt.split('"').next().unwrap_or("");
+            let alias = idents(before).into_iter().find(|w| w != "import");
+            // with no alias the package is bound under its last path segment:
+            // `core:fmt` -> `fmt`
+            let names = alias.map(|a| vec![a]).unwrap_or_else(|| {
+                module
+                    .rsplit([':', '/'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| vec![s.to_string()])
+                    .unwrap_or_default()
+            });
+            vec![(module, names)]
+        }
         Language::Cpp => {
             if let Some(s) = stmt.trim().strip_prefix("#include") {
                 let module = s
@@ -1571,11 +1921,13 @@ fn loose_name(node: Node, ctx: &Ctx) -> Option<(Option<String>, String)> {
         "identifier" | "type_identifier" | "field_identifier" => {
             Some((None, oneline(text(node, src))))
         }
-        // rs `a.b` / cpp `a.b` `this->b`
+        // rs `a.b` / cpp `a.b` `this->b` / zig `a.b` (`object`/`member`)
         "field_expression" => named(
             node.child_by_field_name("value")
-                .or_else(|| node.child_by_field_name("argument")),
-            node.child_by_field_name("field")?,
+                .or_else(|| node.child_by_field_name("argument"))
+                .or_else(|| node.child_by_field_name("object")),
+            node.child_by_field_name("field")
+                .or_else(|| node.child_by_field_name("member"))?,
         ),
         // rs `a::b` (value position) / `module::Type` (type position)
         "scoped_identifier" | "scoped_type_identifier" => named(
@@ -1596,6 +1948,23 @@ fn loose_name(node: Node, ctx: &Ctx) -> Option<(Option<String>, String)> {
             node.child_by_field_name("object"),
             node.child_by_field_name("attribute")?,
         ),
+        // c# `a.b`
+        "member_access_expression" => named(
+            node.child_by_field_name("expression"),
+            node.child_by_field_name("name")?,
+        ),
+        // odin `a.b` labels neither side, and nests a qualified call the other
+        // way up: `member_expression(a, call_expression(b(...)))`
+        "member_expression" if ctx.lang == Language::Odin => {
+            let mut cursor = node.walk();
+            let kids: Vec<Node> = node.named_children(&mut cursor).collect();
+            let (&q, &tail) = (kids.first()?, kids.last()?);
+            let name = match tail.kind() {
+                "call_expression" => tail.child_by_field_name("function")?,
+                _ => tail,
+            };
+            named(Some(q), name)
+        }
         // js/ts `a.b`
         "member_expression" => named(
             node.child_by_field_name("object"),
@@ -1624,8 +1993,17 @@ fn resolve_callee(node: Node, ctx: &Ctx) -> Option<CallKind> {
         "field_expression" => {
             let obj = node
                 .child_by_field_name("value")
-                .or_else(|| node.child_by_field_name("argument"))?;
-            let name = oneline(text(node.child_by_field_name("field")?, src));
+                .or_else(|| node.child_by_field_name("argument"))
+                .or_else(|| node.child_by_field_name("object"))?;
+            let field = node
+                .child_by_field_name("field")
+                .or_else(|| node.child_by_field_name("member"))?;
+            self_method(obj, oneline(text(field, src)), ctx)
+        }
+        // c#: `a.b()` / `this.b()`
+        "member_access_expression" => {
+            let obj = node.child_by_field_name("expression")?;
+            let name = oneline(text(node.child_by_field_name("name")?, src));
             self_method(obj, name, ctx)
         }
         // rs: `a::b()` / `Self::b()`
@@ -1704,18 +2082,54 @@ fn maybe_note(node: Node, ctx: &mut Ctx) {
 fn preceding_comment(node: Node, ctx: &Ctx) -> Option<String> {
     let is_comment = |n: &Node| ctx.lang.comment_kinds().contains(&n.kind());
 
-    let mut cur = node.prev_sibling()?;
+    // Climb out of anything wrapping the definition - a TS `export`, a python
+    // decorated definition - because the comment is a sibling of the wrapper,
+    // not of the definition inside it.
+    let mut anchor = node;
+    while let Some(parent) = anchor.parent() {
+        if !ctx.lang.doc_wrapper_kinds().contains(&parent.kind()) {
+            break;
+        }
+        anchor = parent;
+    }
+    // Then step back over any annotations written between the two: a Rust
+    // `#[inline]`, a python `@staticmethod`, a C# `[Obsolete]`.
+    let mut cur = anchor.prev_sibling()?;
+    while ctx.lang.annotation_kinds().contains(&cur.kind()) {
+        cur = cur.prev_sibling()?;
+    }
     if !is_comment(&cur) {
         return None;
     }
-    // must be directly above the definition (allow the line right before)
-    if node
+    // must be directly above the definition, or above the annotations leading
+    // to it (allow the line right before)
+    if anchor
         .start_position()
         .row
         .saturating_sub(cur.end_position().row)
         > 1
+        && !ctx.lang.annotation_kinds().is_empty()
+        && cur.end_position().row + 1 < anchor.start_position().row
     {
-        return None;
+        // the gap is only acceptable when annotations fill it
+        let filled = {
+            let mut n = cur.next_sibling();
+            let mut ok = true;
+            while let Some(x) = n {
+                if x.id() == anchor.id() {
+                    break;
+                }
+                if !ctx.lang.annotation_kinds().contains(&x.kind()) {
+                    ok = false;
+                    break;
+                }
+                n = x.next_sibling();
+            }
+            ok
+        };
+        if !filled {
+            return None;
+        }
     }
     // doc comments are often a run of single-line comments (`///` in Rust)
     // walk to the topmost adjacent one so we use the summary line
@@ -1792,6 +2206,437 @@ fn strip_comment(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    struct LangFixture {
+        lang: Language,
+        src: &'static str,
+        func: &'static str,
+        ret: Option<&'static str>,
+        doc: &'static str,
+        caller: &'static str,
+        konst: &'static str,
+        ty: &'static str,
+        module: Option<&'static str>,
+        import: &'static str,
+        complexity: usize,
+    }
+
+    const LANG_FIXTURES: &[LangFixture] = &[
+        LangFixture {
+            lang: Language::C,
+            src: "#include <stdio.h>\n\
+                  \n\
+                  static const int LIMIT = 4;\n\
+                  \n\
+                  typedef struct Codec { int level; } Codec;\n\
+                  \n\
+                  // Parse the level.\n\
+                  static int parse_level(const char* spec) {\n\
+                  \x20   for (int i = 0; i < LIMIT; i++) {\n\
+                  \x20       if (spec[i] == ' ') { return 1; }\n\
+                  \x20   }\n\
+                  \x20   return 0;\n\
+                  }\n\
+                  \n\
+                  int drive(const char* spec) { return parse_level(spec); }\n",
+            func: "parse_level",
+            ret: Some("int"),
+            doc: "Parse the level.",
+            caller: "drive",
+            konst: "LIMIT",
+            ty: "Codec",
+            module: None,
+            import: "stdio.h",
+            complexity: 3,
+        },
+        LangFixture {
+            lang: Language::CSharp,
+            src: "using System.Text;\n\
+                  \n\
+                  namespace Billing\n\
+                  {\n\
+                  \x20   public class Client\n\
+                  \x20   {\n\
+                  \x20       public const int Limit = 4;\n\
+                  \n\
+                  \x20       // Parse the level.\n\
+                  \x20       public int ParseLevel(string spec)\n\
+                  \x20       {\n\
+                  \x20           for (int i = 0; i < Limit; i++)\n\
+                  \x20           {\n\
+                  \x20               if (spec.Length > 0) { return 1; }\n\
+                  \x20           }\n\
+                  \x20           return 0;\n\
+                  \x20       }\n\
+                  \n\
+                  \x20       public int Drive(string spec) { return ParseLevel(spec); }\n\
+                  \x20   }\n\
+                  }\n",
+            func: "ParseLevel",
+            ret: Some("int"),
+            doc: "Parse the level.",
+            caller: "Drive",
+            konst: "Limit",
+            ty: "Client",
+            module: Some("Billing"),
+            import: "System.Text",
+            complexity: 3,
+        },
+        LangFixture {
+            lang: Language::Zig,
+            src: "const std = @import(\"std\");\n\
+                  \n\
+                  pub const LIMIT: usize = 4;\n\
+                  \n\
+                  pub const Codec = struct { level: u8 };\n\
+                  \n\
+                  /// Parse the level.\n\
+                  pub fn parseLevel(spec: []const u8) u8 {\n\
+                  \x20   for (spec) |ch| {\n\
+                  \x20       if (ch == ' ') return 1;\n\
+                  \x20   }\n\
+                  \x20   return 0;\n\
+                  }\n\
+                  \n\
+                  pub fn drive(spec: []const u8) u8 {\n\
+                  \x20   return parseLevel(spec);\n\
+                  }\n",
+            func: "parseLevel",
+            ret: Some("u8"),
+            doc: "Parse the level.",
+            caller: "drive",
+            konst: "LIMIT",
+            ty: "Codec",
+            module: None,
+            import: "std",
+            complexity: 3,
+        },
+        LangFixture {
+            lang: Language::Odin,
+            src: "package codec\n\
+                  \n\
+                  import \"core:fmt\"\n\
+                  \n\
+                  LIMIT :: 4\n\
+                  \n\
+                  Codec :: struct { level: u8 }\n\
+                  \n\
+                  // Parse the level.\n\
+                  parse_level :: proc(spec: string) -> u8 {\n\
+                  \x20   for i := 0; i < LIMIT; i += 1 {\n\
+                  \x20       if spec[i] == ' ' {\n\
+                  \x20           return 1\n\
+                  \x20       }\n\
+                  \x20   }\n\
+                  \x20   return 0\n\
+                  }\n\
+                  \n\
+                  drive :: proc(spec: string) -> u8 {\n\
+                  \x20   return parse_level(spec)\n\
+                  }\n",
+            func: "parse_level",
+            ret: Some("u8"),
+            doc: "Parse the level.",
+            caller: "drive",
+            konst: "LIMIT",
+            ty: "Codec",
+            module: Some("codec"),
+            import: "core:fmt",
+            complexity: 3,
+        },
+    ];
+
+    #[test]
+    fn new_languages_extract_the_same_shapes() {
+        for f in LANG_FIXTURES {
+            let name = f.lang.as_str();
+            let ex = extract(f.lang, f.src).unwrap_or_else(|| panic!("{name}: parse failed"));
+
+            let func = ex
+                .funcs
+                .iter()
+                .find(|x| x.name == f.func)
+                .unwrap_or_else(|| panic!("{name}: no `{}` in {:?}", f.func,
+                    ex.funcs.iter().map(|x| &x.name).collect::<Vec<_>>()));
+            assert_eq!(func.ret.as_deref(), f.ret, "{name}: return type");
+            assert_eq!(func.comment.as_deref(), Some(f.doc), "{name}: doc comment");
+            assert_eq!(func.metrics.complexity(), f.complexity, "{name}: complexity");
+            assert_eq!(func.metrics.max_loop_depth(), 1, "{name}: loop depth");
+            assert_eq!(func.metrics.params, 1, "{name}: parameter count");
+
+            assert!(
+                ex.funcs.iter().any(|x| x.name == f.caller),
+                "{name}: no caller `{}`", f.caller
+            );
+            assert!(
+                ex.refs.iter().any(|r| r.caller == f.caller && r.target_name == f.func),
+                "{name}: `{}` -> `{}` unresolved", f.caller, f.func
+            );
+            assert!(
+                ex.consts.iter().any(|c| c.name == f.konst),
+                "{name}: no const `{}` in {:?}", f.konst,
+                ex.consts.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+            assert!(
+                ex.types.iter().any(|t| t.name == f.ty),
+                "{name}: no type `{}` in {:?}", f.ty,
+                ex.types.iter().map(|t| &t.name).collect::<Vec<_>>()
+            );
+            assert!(
+                ex.imports.iter().any(|i| i.module == f.import),
+                "{name}: no import `{}` in {:?}", f.import,
+                ex.imports.iter().map(|i| &i.module).collect::<Vec<_>>()
+            );
+            match f.module {
+                Some(m) => assert!(ex.modules.iter().any(|x| x == m), "{name}: no module `{m}`"),
+                None => assert!(ex.modules.is_empty(), "{name}: unexpected modules"),
+            }
+        }
+    }
+
+    // A binding that is really a type or an import must not also be filed as a
+    // constant. Zig spells all three with `variable_declaration`, so this is
+    // the one language where the three can collide.
+    #[test]
+    fn zig_type_and_import_bindings_are_not_constants() {
+        let src = "const std = @import(\"std\");\n\
+                   pub const Codec = struct { level: u8 };\n\
+                   pub const LIMIT: usize = 4;\n\
+                   var counter: usize = 0;\n";
+        let ex = extract(Language::Zig, src).unwrap();
+        let names: Vec<&str> = ex.consts.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["LIMIT"], "only the value binding is a constant");
+        assert!(ex.types.iter().any(|t| t.name == "Codec"));
+        assert!(ex.imports.iter().any(|i| i.module == "std"));
+    }
+
+    // `defer` and `using` both promise the release happens when exiting scope but
+    // function slightly differently
+    #[test]
+    fn defer_guards_the_release_and_using_guards_the_acquire() {
+        let deferred: &[(Language, &str)] = &[
+            (
+                Language::Zig,
+                "pub fn run() void {\n\
+                 \x20   const f = openFile();\n\
+                 \x20   defer f.close();\n\
+                 }\n",
+            ),
+            (
+                Language::Odin,
+                "package p\n\
+                 run :: proc() {\n\
+                 \x20   h := open(\"x\")\n\
+                 \x20   defer close(h)\n\
+                 }\n",
+            ),
+        ];
+        for (lang, src) in deferred {
+            let ex = extract(*lang, src).unwrap();
+            let f = &ex.funcs[0];
+            assert!(
+                f.metrics.resources.iter().any(|r| r.acquire),
+                "{}: no acquire recorded", lang.as_str()
+            );
+            let release = f
+                .metrics
+                .resources
+                .iter()
+                .find(|r| !r.acquire)
+                .unwrap_or_else(|| panic!("{}: no release recorded", lang.as_str()));
+            assert!(release.guarded, "{}: release not seen as deferred", lang.as_str());
+        }
+
+        // C# `using` wraps the acquisition itself
+        let cs = "class C { void Run(string p) { using (var f = File.OpenRead(p)) { } } }\n";
+        let ex = extract(Language::CSharp, cs).unwrap();
+        let f = ex.funcs.iter().find(|x| x.name == "Run").unwrap();
+        let acquire = f.metrics.resources.iter().find(|r| r.acquire).expect("no acquire");
+        assert!(acquire.guarded, "csharp: `using` did not guard the acquire");
+    }
+
+
+    #[test]
+    fn a_typedef_names_a_type_exactly_once() {
+        // an anonymous typedef has nowhere but the typedef to carry its name
+        let ex = extract(Language::Cpp, "typedef struct { int x; } Anon;\n").unwrap();
+        assert!(ex.types.iter().any(|t| t.name == "Anon"), "{:?}", ex.types);
+        // a named one is already recorded by the struct, and must not be
+        // recorded a second time by the typedef around it
+        let ex = extract(Language::C, "typedef struct Codec { int x; } Codec;\n").unwrap();
+        assert_eq!(ex.types.iter().filter(|t| t.name == "Codec").count(), 1, "{:?}", ex.types);
+    }
+
+    #[test]
+    fn enum_members_are_indexed_without_swallowing_struct_fields() {
+        let zig = "pub const Mode = enum {\n\
+                   \x20   fast,\n\
+                   \x20   small,\n\
+                   };\n\
+                   pub const Codec = struct {\n\
+                   \x20   level: u8,\n\
+                   \x20   name: u8,\n\
+                   };\n";
+        let ex = extract(Language::Zig, zig).unwrap();
+        let consts: Vec<(&str, Option<&str>)> =
+            ex.consts.iter().map(|c| (c.name.as_str(), c.ty.as_deref())).collect();
+        // zig spells a variant and a struct field the same way
+        assert_eq!(consts, vec![("fast", Some("Mode")), ("small", Some("Mode"))]);
+
+        let odin = "package p\n\
+                    \n\
+                    Mode :: enum {\n\
+                    \x20   Fast,\n\
+                    \x20   Small,\n\
+                    }\n\
+                    \n\
+                    Handle :: distinct int\n";
+        let ex = extract(Language::Odin, odin).unwrap();
+        let consts: Vec<(&str, Option<&str>)> =
+            ex.consts.iter().map(|c| (c.name.as_str(), c.ty.as_deref())).collect();
+        assert_eq!(consts, vec![("Fast", Some("Mode")), ("Small", Some("Mode"))]);
+        // `distinct` declares a type - it shares a node kind with every other
+        // `::` binding, so it is easy to file as a value by mistake
+        assert!(
+            ex.types.iter().any(|t| t.name == "Handle" && t.kind == "alias"),
+            "{:?}", ex.types
+        );
+    }
+
+    #[test]
+    fn csharp_methods_are_owned_and_an_extension_binds_the_type_it_extends() {
+        let src = "public class Client { public int Id; }\n\
+                   public static class Ext {\n\
+                   \x20   public static int Charge(this Client c, int amt) { return amt; }\n\
+                   }\n\
+                   public class Box<T> {\n\
+                   \x20   public T Get<U>(U key) { return default(T); }\n\
+                   }\n";
+        let ex = extract(Language::CSharp, src).unwrap();
+        let charge = ex.funcs.iter().find(|f| f.name == "Charge").unwrap();
+        // declared inside `Ext`, but it extends `Client` - and `Client` is the
+        // type a call through a receiver will name
+        assert_eq!(charge.owner.as_deref(), Some("Client"));
+        // a generic method is an ordinary method with an ordinary return type
+        let get = ex.funcs.iter().find(|f| f.name == "Get").unwrap();
+        assert_eq!(get.owner.as_deref(), Some("Box"));
+        assert_eq!(get.ret.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn an_unqualified_call_means_a_sibling_method_only_where_the_language_says_so() {
+        // C++, C# and Zig look in the enclosing type before the file
+        let cases: &[(Language, &str)] = &[
+            (
+                Language::Cpp,
+                "struct C {\n\
+                 \x20   int settle(int a) { return a; }\n\
+                 \x20   int charge(int a) { return settle(a); }\n\
+                 };\n",
+            ),
+            (
+                Language::CSharp,
+                "class C {\n\
+                 \x20   int Settle(int a) { return a; }\n\
+                 \x20   int Charge(int a) { return Settle(a); }\n\
+                 }\n",
+            ),
+        ];
+        for (lang, src) in cases {
+            let ex = extract(*lang, src).unwrap();
+            assert!(
+                ex.refs.iter().any(|r| r.target_name.eq_ignore_ascii_case("settle")),
+                "{}: a sibling method call resolved to nothing", lang.as_str()
+            );
+        }
+        // Rust needs `self.` or `Self::`, so a bare name is the free function
+        // even when an identically named method is in scope
+        let rust = "fn settle(a: u8) -> u8 { a }\n\
+                    struct C;\n\
+                    impl C {\n\
+                    \x20   fn settle(&self, a: u8) -> u8 { a + 1 }\n\
+                    \x20   fn charge(&self, a: u8) -> u8 { settle(a) }\n\
+                    }\n";
+        let ex = extract(Language::Rust, rust).unwrap();
+        let r = ex.refs.iter().find(|r| r.caller == "charge").expect("no ref from `charge`");
+        assert_eq!(r.target_line, 1, "rust must reach the free `settle`, not the method");
+    }
+
+    // A doc comment is not always the definition's immediate predecessor.
+    // Attributes sit between the two, and `export` / decorators / a `const`
+    // binding wrap the definition so the comment belongs to the wrapper
+    #[test]
+    fn a_doc_comment_survives_attributes_and_wrappers() {
+        struct Case {
+            lang: Language,
+            src: &'static str,
+            func: &'static str,
+            doc: &'static str,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                lang: Language::Rust,
+                src: "/// Exported to C.\n#[no_mangle]\npub extern \"C\" fn init() -> u32 { 1 }\n",
+                func: "init",
+                doc: "Exported to C.",
+            },
+            Case {
+                lang: Language::Rust,
+                src: "/// Two attributes deep.\n#[inline]\n#[must_use]\npub fn go() -> u32 { 1 }\n",
+                func: "go",
+                doc: "Two attributes deep.",
+            },
+            Case {
+                lang: Language::Python,
+                src: "# Decorated.\n@staticmethod\ndef run():\n    return 1\n",
+                func: "run",
+                doc: "Decorated.",
+            },
+            Case {
+                lang: Language::TypeScript,
+                src: "// Exported.\nexport function run(): number { return 1; }\n",
+                func: "run",
+                doc: "Exported.",
+            },
+            Case {
+                lang: Language::TypeScript,
+                src: "/** Bound to a name. */\nexport const run = () => 1;\n",
+                func: "run",
+                doc: "Bound to a name.",
+            },
+            Case {
+                lang: Language::JavaScript,
+                src: "// Plain arrow const.\nconst run = () => 1;\n",
+                func: "run",
+                doc: "Plain arrow const.",
+            },
+            Case {
+                lang: Language::CSharp,
+                src: "class C {\n  // Attributed.\n  [Obsolete]\n  public int Run() { return 1; }\n}\n",
+                func: "Run",
+                doc: "Attributed.",
+            },
+        ];
+        for c in CASES {
+            let ex = extract(c.lang, c.src).unwrap();
+            let f = ex
+                .funcs
+                .iter()
+                .find(|f| f.name == c.func)
+                .unwrap_or_else(|| panic!("{}: no `{}`", c.lang.as_str(), c.func));
+            assert_eq!(f.comment.as_deref(), Some(c.doc), "{}", c.lang.as_str());
+        }
+    }
+
+    // tthe relaxation must not reach backwards past unrelated code: a comment
+    // that documents something else is not this definition's summary
+    #[test]
+    fn a_distant_or_unrelated_comment_is_not_adopted() {
+        let src = "// Documents the constant.\nconst LIMIT: u32 = 4;\n\npub fn undocumented() -> u32 { LIMIT }\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        let f = ex.funcs.iter().find(|f| f.name == "undocumented").unwrap();
+        assert_eq!(f.comment, None, "a comment on the previous item is not a doc");
+    }
+
     #[test]
     fn rust_imports_are_captured() {
         let src = "use crate::model::{CallSite, Const};\n\
@@ -1820,6 +2665,56 @@ mod tests {
                 ("crate::languages", vec![]),
             ]
         );
+    }
+
+    #[test]
+    fn a_crate_root_is_module_declarations_and_re_exports_not_an_empty_file() {
+        let src = "//! crate docs\n\
+                   pub mod scan;\n\
+                   pub mod serve;\n\
+                   mod internal;\n\
+                   pub use scan::{scan, ScanReport};\n\
+                   pub(crate) use serve::helper;\n\
+                   pub use internal::*;\n\
+                   use std::path::PathBuf;\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        assert_eq!(ex.modules, vec!["scan", "serve", "internal"]);
+
+        let flags: Vec<(&str, bool)> = ex
+            .imports
+            .iter()
+            .map(|i| (i.module.as_str(), i.reexport))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("scan", true),
+                ("serve", true),
+                ("internal", true),
+                ("std::path", false),
+            ],
+            "`pub use` republishes, a plain `use` only consumes"
+        );
+
+        // a glob binds no names but is still a re-export of internal module
+        let glob = ex.imports.iter().find(|i| i.module == "internal").unwrap();
+        assert!(glob.names.is_empty() && glob.reexport);
+    }
+
+    #[test]
+    fn an_inline_test_module_is_not_declared_structure() {
+        // `mod tests` is a module the grammar sees and the project is not built
+        // from - counting it would put a 1 on nearly every Rust file
+        let src = "pub mod real;\n\
+                   pub fn charge(c: u64) -> u64 { c }\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       mod nested_helpers {}\n\
+                       #[test]\n\
+                       fn t() { assert_eq!(charge(1), 1); }\n\
+                   }\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        assert_eq!(ex.modules, vec!["real"]);
     }
 
     #[test]
@@ -2229,6 +3124,39 @@ mod tests {
         assert!(!ex.consts.iter().any(|c| c.name == "ratio"));
         // class attribute is not a module const
         assert!(!ex.consts.iter().any(|c| c.name == "ATTR"));
+    }
+
+    #[test]
+    fn ts_module_identity_comes_from_namespace_blocks_only() {
+        // the two TS forms that actually name a scope
+        let ns = extract(
+            Language::TypeScript,
+            "namespace Billing { export function a(): number { return 1; } }\n",
+        )
+        .unwrap();
+        assert_eq!(ns.modules, vec!["Billing"]);
+        let legacy = extract(
+            Language::TypeScript,
+            "module Legacy { export function b(): number { return 2; } }\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.modules, vec!["Legacy"]);
+        // `declare module "ext"` describes someone else's package
+        let ambient = extract(
+            Language::TypeScript,
+            "declare module \"ext\" { export function e(): void; }\n",
+        )
+        .unwrap();
+        assert!(ambient.modules.is_empty(), "{:?}", ambient.modules);
+        // and the two forms that carry no name at all: in ES-module and CommonJS
+        // code every file is already a module, so neither groups anything
+        for src in [
+            "function c() { return 3; }\nmodule.exports = { c };\n",
+            "export function d(): number { return 4; }\n",
+        ] {
+            let ex = extract(Language::TypeScript, src).unwrap();
+            assert!(ex.modules.is_empty(), "{src} -> {:?}", ex.modules);
+        }
     }
 
     #[test]

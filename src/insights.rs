@@ -7,8 +7,9 @@
 //! line and measurement it came from so a reader can check it. The UI is
 //! labelled accordingly; do not present these as proofs.
 
+use crate::extract::TOP_LEVEL;
 use crate::languages::Language;
-use crate::model::FileCache;
+use crate::model::{FileCache, Func, FuncMetrics};
 use crate::changes::{self, ChangesConfig};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -29,14 +30,24 @@ const MAX_FLAME_GROUPS: usize = 12;
 const MAX_EDGE_SITES: usize = 60;
 // recommended test targets kept in the payload
 const MAX_TARGETS: usize = 60;
+// how many facades an import is chased through (`__main__` -> package
+// `__init__` -> the module that defines the name). Bounded so a barrel that
+// re-exports a barrel cannot walk the whole tree.
+const MAX_FACADE_HOPS: usize = 3;
+// file stems that stand for their directory rather than for themselves
+const FACADE_STEMS: &[&str] = &["__init__", "index", "mod"];
 
-// one function definition, addressed by (file, index into that file's funcs)
+// one function definition, addressed by (file, index into that file's funcs).
+// An index one past the end of that slice addresses the file's module scope
+// instead - see `Graph::module_frames`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct NodeId(usize, usize);
 
 struct Graph<'a> {
     caches: &'a [FileCache],
     nodes: Vec<NodeId>,
+    // synthetic frames for code that runs at a file's top level
+    module_frames: BTreeMap<usize, Func>,
     // adjacency over positions in `nodes`
     out: Vec<BTreeSet<usize>>,
     into: Vec<BTreeSet<usize>>,
@@ -47,15 +58,14 @@ struct Graph<'a> {
 
 impl<'a> Graph<'a> {
     fn name(&self, i: usize) -> &str {
-        let NodeId(f, k) = self.nodes[i];
-        &self.caches[f].funcs[k].name
+        &self.func(i).name
     }
     fn file(&self, i: usize) -> String {
         changes::path_str(&self.caches[self.nodes[i].0].rel_path)
     }
-    fn func(&self, i: usize) -> &crate::model::Func {
+    fn func(&self, i: usize) -> &Func {
         let NodeId(f, k) = self.nodes[i];
-        &self.caches[f].funcs[k]
+        self.caches[f].funcs.get(k).unwrap_or_else(|| &self.module_frames[&f])
     }
     fn lang(&self, i: usize) -> Language {
         self.caches[self.nodes[i].0].language
@@ -70,6 +80,11 @@ impl<'a> Graph<'a> {
     fn is_test(&self, i: usize) -> bool {
         self.func(i).test_ctx || changes::is_test_path(&self.file(i))
     }
+    // a file's module scope rather than a function someone defined
+    fn is_module(&self, i: usize) -> bool {
+        let NodeId(f, k) = self.nodes[i];
+        k >= self.caches[f].funcs.len()
+    }
 }
 
 // Resolve calls to function definitions.
@@ -82,23 +97,54 @@ impl<'a> Graph<'a> {
 // one target, produces no edge: an absent edge is better than a wrong one.
 fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
     let mut nodes = Vec::new();
-    // (file, name) -> node position; first definition wins for overloads
-    let mut by_file_name: BTreeMap<(usize, &str), usize> = BTreeMap::new();
+    // (file, name) -> every node with that name, in definition order. A name
+    // is not unique within a file: overloads share one, and so does an
+    // interface method and the class method implementing it.
+    let mut by_file_name: BTreeMap<(usize, &str), Vec<usize>> = BTreeMap::new();
     let mut by_name: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
 
     for (fi, c) in caches.iter().enumerate() {
         for (ki, f) in c.funcs.iter().enumerate() {
             let pos = nodes.len();
             nodes.push(NodeId(fi, ki));
-            by_file_name.entry((fi, f.name.as_str())).or_insert(pos);
+            by_file_name.entry((fi, f.name.as_str())).or_default().push(pos);
             by_name.entry(f.name.as_str()).or_default().push(pos);
         }
+    }
+
+    // One frame per file that calls anything from its top level
+    let mut module_frames: BTreeMap<usize, Func> = BTreeMap::new();
+    for (fi, c) in caches.iter().enumerate() {
+        if !c.calls.iter().any(|call| call.caller == TOP_LEVEL) {
+            continue;
+        }
+        by_file_name.insert((fi, TOP_LEVEL), vec![nodes.len()]);
+        nodes.push(NodeId(fi, c.funcs.len()));
+        module_frames.insert(
+            fi,
+            Func {
+                line: 1,
+                col: 1,
+                name: TOP_LEVEL.to_string(),
+                ret: None,
+                comment: None,
+                start_line: 1,
+                end_line: c.lines,
+                test_ctx: false,
+                owner: None,
+                param_types: Vec::new(),
+                // nobody wrote this frame, so it carries no measurements of its
+                // own; the calls it makes are the whole of what it contributes
+                metrics: FuncMetrics::default(),
+            },
+        );
     }
 
     let n = nodes.len();
     let mut g = Graph {
         caches,
         nodes,
+        module_frames,
         out: vec![BTreeSet::new(); n],
         into: vec![BTreeSet::new(); n],
         call_sites: vec![0; n],
@@ -140,11 +186,10 @@ fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
     // (owning type, method) -> nodes, for receiver-typed calls
     let mut by_owner: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (pos, NodeId(fi, ki)) in g.nodes.iter().copied().enumerate() {
-        if let Some(owner) = caches[fi].funcs[ki].owner.as_deref() {
-            by_owner
-                .entry((owner, caches[fi].funcs[ki].name.as_str()))
-                .or_default()
-                .push(pos);
+        // module frames are past the end of `funcs` and own no method
+        let Some(f) = caches[fi].funcs.get(ki) else { continue };
+        if let Some(owner) = f.owner.as_deref() {
+            by_owner.entry((owner, f.name.as_str())).or_default().push(pos);
         }
     }
     // per file: which name was imported from which files
@@ -153,32 +198,125 @@ fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
     for (i, s) in stems.iter().enumerate() {
         stem_files.entry(s).or_default().push(i);
     }
+    // a facade is imported under its directory
+    for (i, c) in caches.iter().enumerate() {
+        if !FACADE_STEMS.contains(&stems[i]) {
+            continue;
+        }
+        if let Some(dir) = c.rel_path.parent().and_then(Path::file_name).and_then(|d| d.to_str()) {
+            stem_files.entry(dir).or_default().push(i);
+        }
+    }
     for (a, c) in caches.iter().enumerate() {
+        let files_named = |s: &str| {
+            stem_files
+                .get(s)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&b| b != a)
+                .collect::<Vec<usize>>()
+        };
         for imp in &c.imports {
             let segs: Vec<&str> = imp
                 .module
                 .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+                .filter(|s| !s.is_empty())
                 .collect();
-            let targets: BTreeSet<usize> = segs
-                .iter()
-                .chain(imp.names.iter().map(|s| s.as_str()).collect::<Vec<_>>().iter())
-                .filter_map(|s| stem_files.get(*s))
-                .flatten()
-                .copied()
-                .filter(|&b| b != a)
+            // The last segment names the module the statement actually reaches;
+            // the ones before it are the packages on the way there. Preferring
+            // it keeps `from mypkg.cli import main` pointed at `cli.py` even
+            // when the package root defines a `main` of its own. Earlier
+            // segments still get their say when the last matches nothing, which
+            // is what carries a C++ `#include "foo/bar.h"` to `bar`.
+            let mut targets: BTreeSet<usize> = segs
+                .last()
+                .map(|s| files_named(s))
+                .unwrap_or_default()
+                .into_iter()
                 .collect();
+            if targets.is_empty() {
+                targets.extend(segs.iter().flat_map(|s| files_named(s)));
+            }
+            // `from pkg import cli` binds a name that is itself a module
+            targets.extend(imp.names.iter().flat_map(|n| files_named(n)));
             for name in &imp.names {
                 imported[a].entry(name.as_str()).or_default().extend(&targets);
             }
+            // An import that binds no names is not empty of meaning - it makes
+            // a whole file's surface available instead of picking from it. A C
+            // or C++ `#include` is the case that matters most, since the
+            // language has no other import form, and without this every call
+            // into another translation unit is unresolvable. A Rust `use m::*`
+            // and a plain C# `using Lib;` say the same thing and are treated
+            // the same way. The single-candidate rule below still applies, so
+            // widening what is available cannot invent an ambiguous edge.
+            if imp.names.is_empty() {
+                for &b in &targets {
+                    for f in &caches[b].funcs {
+                        imported[a].entry(f.name.as_str()).or_default().insert(b);
+                    }
+                }
+            }
         }
     }
+    // Chase each binding through the facades it passes: the name `__main__.py`
+    // imported from `mypkg` is one `mypkg/__init__.py` imported from
+    // `mypkg/cli.py`, and the definition is in the latter. Only files that
+    // import the same name are followed, and the evidence test below still
+    // requires the file it lands on to define that name - so this can widen the
+    // search without loosening what counts as proof.
+    for _ in 0..MAX_FACADE_HOPS {
+        let mut grew = false;
+        for a in 0..caches.len() {
+            for name in imported[a].keys().copied().collect::<Vec<&str>>() {
+                let hops: BTreeSet<usize> = imported[a][name]
+                    .iter()
+                    .filter_map(|&b| imported[b].get(name))
+                    .flatten()
+                    .copied()
+                    .filter(|&b| b != a)
+                    .collect();
+                let reached = imported[a].entry(name).or_default();
+                let before = reached.len();
+                reached.extend(hops);
+                grew |= reached.len() != before;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Which definition of `name` in file `fi` a call on `line` belongs to.
+    // With one candidate this is the old behaviour; with several - an overload
+    // set, or an interface method beside the class method implementing it -
+    // taking the first would credit the wrong one, so the innermost definition
+    // whose body actually spans the call wins.
+    let owner_of = |fi: usize, name: &str, line: usize| -> Option<usize> {
+        let cands = by_file_name.get(&(fi, name))?;
+        if let [only] = cands[..] {
+            return Some(only);
+        }
+        let spans = |&p: &usize| -> Option<(usize, usize)> {
+            let NodeId(f, k) = g.nodes[p];
+            let d = caches[f].funcs.get(k)?;
+            Some((d.start_line, d.end_line))
+        };
+        cands
+            .iter()
+            .filter(|p| spans(p).is_some_and(|(s, e)| s <= line && line <= e))
+            .max_by_key(|p| spans(p).map(|(s, _)| s))
+            .copied()
+            .or_else(|| cands.first().copied())
+    };
 
     // same-file edges, already resolved by the extractor
     for (fi, c) in caches.iter().enumerate() {
         for r in &c.refs {
-            let (Some(&from), Some(&to)) = (
-                by_file_name.get(&(fi, r.caller.as_str())),
-                by_file_name.get(&(fi, r.target_name.as_str())),
+            let (Some(from), Some(to)) = (
+                owner_of(fi, r.caller.as_str(), r.call_line),
+                by_file_name.get(&(fi, r.target_name.as_str())).and_then(|v| v.first().copied()),
             ) else {
                 continue;
             };
@@ -191,7 +329,7 @@ fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
     // cross-file edges, with evidence
     for (a, c) in caches.iter().enumerate() {
         for call in &c.calls {
-            let Some(&from) = by_file_name.get(&(a, call.caller.as_str())) else {
+            let Some(from) = owner_of(a, call.caller.as_str(), call.line) else {
                 continue;
             };
             let candidates = by_name.get(call.name.as_str());
@@ -503,8 +641,8 @@ pub fn rule_catalogue() -> Value {
          "limits": "Nesting depth is not asymptotic complexity - the bounds may be tiny."},
         {"rule": "leak-risk", "severity": "warn",
          "what": "Resource acquired without a matching release in the same function.",
-         "evidence": "acquire/release call-name pairs for the language; `with`/`defer` count as released.",
-         "limits": "Name-matched and function-local. A release in a caller, a wrapper or a destructor reads as missing."},
+         "evidence": "acquire/release call-name pairs for the language, balanced per release name so one `Close` discharges an `Open`, an `OpenFile` or a `Dial` alike; `with`/`defer` count as released.",
+         "limits": "Name-matched and function-local, with no data flow: the release only has to be called somewhere in the same body, so it is not checked to act on the handle that was acquired, and a release reached through a differently named wrapper (`defer closeIt(f)`), a caller, or a destructor reads as missing."},
         {"rule": "high-complexity", "severity": "warn",
          "what": "Many decision points in one function.",
          "evidence": "1 + branches + loops (cyclomatic-style) from the syntax tree.",
@@ -535,7 +673,9 @@ fn lints(g: &Graph) -> (Vec<Value>, bool) {
     }
 
     for i in 0..g.nodes.len() {
-        if g.is_test(i) {
+        // module scope has no body of its own to measure, and "nobody calls
+        // this file's top level" is not a finding
+        if g.is_test(i) || g.is_module(i) {
             continue;
         }
         let f = g.func(i);
@@ -599,36 +739,52 @@ fn lints(g: &Graph) -> (Vec<Value>, bool) {
                 "hoist the inner loop into its own function, or flatten the iteration".into(),
             );
         }
-        // acquires without a matching release in the same body
-        let mut balance: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+        // Acquires without a matching release in the same body
+        let release_for = |acq: &str| {
+            lang.resource_pairs()
+                .iter()
+                .find(|(a, _)| *a == acq)
+                .map(|(_, r)| *r)
+        };
+        let mut balance: BTreeMap<&str, (usize, usize, usize, BTreeSet<&str>)> = BTreeMap::new();
         for r in &m.resources {
-            let e = balance.entry(r.pair).or_default();
+            // a release is keyed by the name actually called; an acquire by the
+            // release its pair calls for
+            let key = if r.acquire {
+                match release_for(r.pair) {
+                    Some(k) => k,
+                    None => continue,
+                }
+            } else {
+                r.name.as_str()
+            };
+            let e = balance.entry(key).or_default();
             match (r.acquire, r.guarded) {
-                (true, false) => e.0 += 1,
+                (true, false) => {
+                    e.0 += 1;
+                    e.3.insert(r.pair);
+                }
                 (true, true) => e.2 += 1,
                 (false, _) => e.1 += 1,
             }
         }
-        for (pair, (acquires, releases, guarded)) in balance {
+        for (release, (acquires, releases, guarded, acquired_by)) in balance {
             if acquires > releases {
                 let line = m
                     .resources
                     .iter()
-                    .find(|r| r.pair == pair && r.acquire && !r.guarded)
+                    .find(|r| r.acquire && !r.guarded && release_for(r.pair) == Some(release))
                     .map(|r| r.line)
                     .unwrap_or(f.line);
-                let release = lang
-                    .resource_pairs()
-                    .iter()
-                    .find(|(a, _)| *a == pair)
-                    .map(|(_, r)| *r)
-                    .unwrap_or("release");
+                // which acquires are unmatched cannot be told apart, so name
+                // every one that needs this release
+                let names = acquired_by.iter().copied().collect::<Vec<_>>().join("/");
                 push(
                     "leak-risk",
                     "warn",
                     line,
                     format!(
-                        "{} unreleased `{pair}` ({releases} matching `{release}`, {guarded} auto-released)",
+                        "{} unreleased `{names}` ({releases} matching `{release}`, {guarded} auto-released)",
                         acquires - releases
                     ),
                     format!("pair it with `{release}`, or hand ownership to a caller that does"),
@@ -983,13 +1139,7 @@ pub fn test_kind_rubric() -> Value {
     ])
 }
 
-// Recommend tests for the gaps. Every recommendation carries the measurements
-// that produced it; nothing here knows what your existing tests assert, only
-// which functions they mention by name.
-// `must_keep` names (file, function) pairs that have to survive truncation:
-// the changed functions with no coverage. `test_triggers` cites target rows by
-// id rather than restating them, so a cited row that got truncated away would
-// leave a dangling reference.
+// recommend tests for the gaps; self explanatory
 fn test_targets(g: &Graph, ctx: &ServiceCtx, must_keep: &BTreeSet<(String, String)>) -> Value {
     let n = g.nodes.len();
     let depth = depth_below(g);
@@ -1011,6 +1161,9 @@ fn test_targets(g: &Graph, ctx: &ServiceCtx, must_keep: &BTreeSet<(String, Strin
     for i in 0..n {
         if g.is_test(i) {
             continue; // do not recommend tests for tests
+        }
+        if g.is_module(i) {
+            continue; // there is no module scope to call from a test
         }
         let f = g.func(i);
         let m = &f.metrics;
@@ -1736,7 +1889,9 @@ pub fn insights(
             "files": caches.len(),
             // source lines across every mapped file
             "lines": total_lines,
-            "functions": n,
+            // definitions only - the module frames the graph adds for top-level
+            // code are nodes, but nobody wrote them as functions
+            "functions": caches.iter().map(|c| c.funcs.len()).sum::<usize>(),
             "edges": edge_count,
             "roots": roots.len(),
         },
@@ -1756,9 +1911,11 @@ pub fn insights(
                      call reached by leaving its caller's service.",
         },
         "hot": {
-            "most_called": take(&by_callers, &|i| !g.into[i].is_empty()),
-            "widest": take(&by_fanout, &|i| !g.out[i].is_empty()),
-            "most_complex": take(&by_complexity, &|i| !g.is_test(i)),
+            // module frames are callers, not functions, so they carry the
+            // `most_called` counts without ever being ranked as a row
+            "most_called": take(&by_callers, &|i| !g.into[i].is_empty() && !g.is_module(i)),
+            "widest": take(&by_fanout, &|i| !g.out[i].is_empty() && !g.is_module(i)),
+            "most_complex": take(&by_complexity, &|i| !g.is_test(i) && !g.is_module(i)),
             "deepest_chains": deepest_chains(&g, &roots),
             "cycles": cycles(&g),
             "note": "structural, not measured: ranks by call-graph shape, not execution frequency.",
@@ -1860,6 +2017,201 @@ mod tests {
     }
 
     #[test]
+    fn module_scope_calls_make_a_python_entry_point_a_caller() {
+        // The shape every Python CLI has. `__main__.py` does its work at the
+        // top level, so the extractor attributes the call to module scope
+        // rather than to a function - and with no node for that scope the call
+        // used to be dropped, leaving `main` reading as uncalled.
+        let (dir, caches) = map("pymain", &[
+            (
+                "mypkg/cli.py",
+                "def parse(argv):\n    return argv\n\n\ndef main(argv=None):\n    return parse(argv)\n",
+            ),
+            (
+                "mypkg/__main__.py",
+                "from mypkg.cli import main\n\nraise SystemExit(main())\n",
+            ),
+        ]);
+        let g = build_graph(&caches);
+        let pos = |name: &str| (0..g.nodes.len()).find(|&i| g.name(i) == name).unwrap();
+        let (top, main) = (pos(TOP_LEVEL), pos("main"));
+        assert!(g.is_module(top));
+        assert_eq!(g.file(top), "mypkg/__main__.py");
+        assert!(g.out[top].contains(&main));
+        assert_eq!(g.into[main], BTreeSet::from([top]));
+        assert_eq!(g.call_sites[main], 1);
+        // nothing runs a module, so it is the entry point a flame graph of a
+        // Python package should be rooted at
+        assert!(g.is_root(top));
+        // but it is not a definition: nobody wrote it, so it is not a thing to
+        // lint, rank or recommend a test for
+        let (rows, _) = lints(&g);
+        assert!(rows.iter().all(|r| r["function"] != TOP_LEVEL));
+        drop(dir);
+    }
+
+    #[test]
+    fn a_package_facade_import_reaches_the_module_that_defines_the_name() {
+        let (dir, caches) = map("pyfacade", &[
+            ("mypkg/cli.py", "def run():\n    return 1\n"),
+            ("mypkg/__init__.py", "from .cli import run\n\n__all__ = [\"run\"]\n"),
+            ("mypkg/app.py", "from mypkg import run\n\n\ndef go():\n    return run()\n"),
+        ]);
+        let g = build_graph(&caches);
+        let pos = |name: &str| (0..g.nodes.len()).find(|&i| g.name(i) == name).unwrap();
+        assert!(g.out[pos("go")].contains(&pos("run")));
+        drop(dir);
+    }
+
+    #[test]
+    fn a_package_root_defining_the_same_name_does_not_blur_a_direct_import() {
+        // this is a very specific test for a problem I encountered this week :(
+        let (dir, caches) = map("pyspecific", &[
+            ("mypkg/cli.py", "def run():\n    return 1\n"),
+            ("mypkg/__init__.py", "def run():\n    return 2\n"),
+            (
+                "mypkg/app.py",
+                "from mypkg.cli import run\n\n\ndef go():\n    return run()\n",
+            ),
+        ]);
+        let g = build_graph(&caches);
+        let cli = caches.iter().position(|c| c.rel_path.ends_with("cli.py")).unwrap();
+        let go = (0..g.nodes.len()).find(|&i| g.name(i) == "go").unwrap();
+        let called: Vec<String> = g.out[go].iter().map(|&i| g.file(i)).collect();
+        assert_eq!(called, vec![changes::path_str(&caches[cli].rel_path)]);
+        drop(dir);
+    }
+
+    #[test]
+    fn cross_file_calls_resolve_in_the_newly_added_languages() {
+        // each pair is written so the call can only resolve through evidence
+        struct Pair {
+            tag: &'static str,
+            files: &'static [(&'static str, &'static str)],
+            caller: &'static str,
+            callee: &'static str,
+        }
+        const PAIRS: &[Pair] = &[
+            Pair {
+                tag: "xcs",
+                files: &[
+                    (
+                        "lib/Money.cs",
+                        "namespace Lib { public class Money { public static int Charge(int c) { return c; } } }\n",
+                    ),
+                    (
+                        "api/Api.cs",
+                        "using Lib;\nnamespace Api { public class Handler { public int Handle() { return Money.Charge(100); } } }\n",
+                    ),
+                ],
+                caller: "Handle",
+                callee: "Charge",
+            },
+            Pair {
+                tag: "xzig",
+                files: &[
+                    ("money.zig", "pub fn charge(cents: u32) u32 {\n    return cents;\n}\n"),
+                    (
+                        "api.zig",
+                        "const money = @import(\"money.zig\");\n\npub fn handle() u32 {\n    return money.charge(100);\n}\n",
+                    ),
+                ],
+                caller: "handle",
+                callee: "charge",
+            },
+            Pair {
+                tag: "xodin",
+                files: &[
+                    ("money/money.odin", "package money\n\ncharge :: proc(cents: int) -> int {\n    return cents\n}\n"),
+                    (
+                        "api/api.odin",
+                        "package api\n\nimport \"money\"\n\nhandle :: proc() -> int {\n    return money.charge(100)\n}\n",
+                    ),
+                ],
+                caller: "handle",
+                callee: "charge",
+            },
+        ];
+
+        for pair in PAIRS {
+            let (dir, caches) = map(pair.tag, pair.files);
+            let g = build_graph(&caches);
+            let pos = |name: &str| {
+                (0..g.nodes.len())
+                    .find(|&i| g.name(i) == name)
+                    .unwrap_or_else(|| panic!("{}: no `{name}`", pair.tag))
+            };
+            let (from, to) = (pos(pair.caller), pos(pair.callee));
+            assert!(
+                g.out[from].contains(&to),
+                "{}: `{}` -> `{}` did not resolve across files",
+                pair.tag, pair.caller, pair.callee
+            );
+            assert_eq!(g.into[to].len(), 1, "{}: caller count", pair.tag);
+            drop(dir);
+        }
+    }
+
+    #[test]
+    fn a_call_is_credited_to_the_definition_whose_body_spans_it() {
+        // interface method and class mehtods share names so ended up resolving 
+        // which was hit first... wrong
+        let (dir, caches) = map("overload", &[(
+            "src/pay.cs",
+            "public interface ICharger { int Pay(int a); }\n\
+             public class Payer : ICharger {\n\
+             \x20   public int Pay(int a) { return Settle(a); }\n\
+             \x20   private int Settle(int a) { return a; }\n\
+             }\n",
+        )]);
+        let g = build_graph(&caches);
+        let at = |line: usize| {
+            (0..g.nodes.len())
+                .find(|&i| g.func(i).line == line)
+                .unwrap_or_else(|| panic!("nothing defined on line {line}"))
+        };
+        let settle = (0..g.nodes.len()).find(|&i| g.name(i) == "Settle").unwrap();
+        assert!(g.out[at(3)].contains(&settle), "the class body makes the call");
+        assert!(g.out[at(1)].is_empty(), "the interface declaration makes none");
+        assert_eq!(g.into[settle].len(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn an_include_makes_the_included_file_s_definitions_resolvable() {
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            (
+                "incc",
+                &[
+                    ("money.c", "int charge(int cents) { return cents; }\n"),
+                    ("api.c", "#include \"money.h\"\nint handle(void) { return charge(100); }\n"),
+                ],
+            ),
+            (
+                "inccpp",
+                &[
+                    ("money.cpp", "int charge(int cents) { return cents; }\n"),
+                    ("api.cpp", "#include \"money.h\"\nint handle() { return charge(100); }\n"),
+                ],
+            ),
+        ];
+        for (tag, files) in cases {
+            let (dir, caches) = map(tag, files);
+            let g = build_graph(&caches);
+            let pos = |name: &str| {
+                (0..g.nodes.len())
+                    .find(|&i| g.name(i) == name)
+                    .unwrap_or_else(|| panic!("{tag}: no `{name}`"))
+            };
+            assert!(
+                g.out[pos("handle")].contains(&pos("charge")),
+                "{tag}: the call did not resolve through the include"
+            );
+            drop(dir);
+        }
+    }
+
+    #[test]
     fn flame_values_nest_and_recursion_is_cut() {
         let (dir, caches) = map("flame", &[(
             "src/lib.rs",
@@ -1922,6 +2274,72 @@ mod tests {
             !found.iter().any(|f| f["file"] == "src/hot_test.cpp"),
             "test files must not raise lints"
         );
+        drop(dir);
+    }
+
+    #[test]
+    fn a_release_discharges_every_acquire_that_calls_for_it() {
+        let (dir, caches) = map("leakpairs", &[
+            (
+                "svc/main.go",
+                "func openFile(p string) error {\n\
+                 \x20 f, err := os.OpenFile(p, os.O_RDWR, 0644)\n\
+                 \x20 if err != nil { return err }\n\
+                 \x20 defer f.Close()\n\
+                 \x20 return nil\n\
+                 }\n\
+                 func dial(a string) error {\n\
+                 \x20 c, err := net.Dial(\"tcp\", a)\n\
+                 \x20 if err != nil { return err }\n\
+                 \x20 defer c.Close()\n\
+                 \x20 return nil\n\
+                 }\n\
+                 func timer() {\n\
+                 \x20 t := time.NewTimer(time.Second)\n\
+                 \x20 defer t.Stop()\n\
+                 }\n\
+                 func aliased(p string) error {\n\
+                 \x20 f, err := os.OpenFile(p, os.O_RDWR, 0644)\n\
+                 \x20 if err != nil { return err }\n\
+                 \x20 r := f\n\
+                 \x20 defer r.Close()\n\
+                 \x20 return nil\n\
+                 }\n\
+                 func leaks(p string) error {\n\
+                 \x20 f, err := os.Open(p)\n\
+                 \x20 _ = f\n\
+                 \x20 return err\n\
+                 }\n",
+            ),
+            (
+                "svc/alloc.cpp",
+                "void ok(int n) {\n\
+                 \x20 char* p = (char*)calloc(n, 1);\n\
+                 \x20 free(p);\n\
+                 }\n",
+            ),
+            (
+                "svc/db.py",
+                "def ok(dsn):\n\
+                 \x20   c = connect(dsn)\n\
+                 \x20   c.close()\n\
+                 \x20   return 1\n",
+            ),
+        ]);
+        let g = build_graph(&caches);
+        let (found, _) = lints(&g);
+        let leaks: Vec<&str> = found
+            .iter()
+            .filter(|f| f["rule"] == "leak-risk")
+            .map(|f| f["function"].as_str().unwrap())
+            .collect();
+        // the paired acquires are clean, whichever pair names their release,
+        // and whether the handle is deferred directly or through an alias
+        assert_eq!(leaks, vec!["leaks"], "only the unpaired acquire may fire");
+        // and the one real finding still names the acquire that needs closing
+        let leak = found.iter().find(|f| f["rule"] == "leak-risk").unwrap();
+        assert!(leak["message"].as_str().unwrap().contains("unreleased `Open`"));
+        assert!(leak["hint"].as_str().unwrap().contains("`Close`"));
         drop(dir);
     }
 
