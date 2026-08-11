@@ -44,13 +44,10 @@ struct MapState {
     root_label: String,
     ts: String,
     caches: Vec<FileCache>,
+    externals: Vec<ExternalDep>,
+    facade: Option<String>,
     watch_secs: Option<u64>,
-    // `/insights` is opt-in (`--html`): it is a human UI, not an agent endpoint
     html: bool,
-    // Six MCP tools are views onto one analysis pass. Computing it per call
-    // would repeat the whole graph build for each; this keeps one result per
-    // (map generation, base ref). Behind a Mutex so it can be filled while
-    // holding only a read lock on the map.
     analysis: Mutex<Option<Analysis>>,
 }
 
@@ -75,6 +72,8 @@ impl MapState {
             root_label,
             ts: render::now_ts(),
             caches,
+            externals: manifest_deps(root),
+            facade: cargo_package_name(root),
             watch_secs: None,
             html: false,
             analysis: Mutex::new(None),
@@ -85,6 +84,8 @@ impl MapState {
         let before = self.caches.len();
         let files = scan::collect_files(&self.root)?;
         self.caches = scan::build_caches(&self.root, &files);
+        self.externals = manifest_deps(&self.root);
+        self.facade = cargo_package_name(&self.root);
         self.ts = render::now_ts();
         self.invalidate();
         Ok((before, self.caches.len()))
@@ -93,8 +94,16 @@ impl MapState {
     // swap in a fresh map (built outside lock by watcher)
     fn swap_in(&mut self, caches: Vec<FileCache>) {
         self.caches = caches;
+        self.externals = manifest_deps(&self.root);
+        self.facade = cargo_package_name(&self.root);
         self.ts = render::now_ts();
         self.invalidate();
+    }
+
+    fn external_named(&self, want: &str) -> Option<&ExternalDep> {
+        let norm = |s: &str| s.replace('-', "_").to_ascii_lowercase();
+        let want = norm(want);
+        self.externals.iter().find(|d| norm(&d.name) == want)
     }
 
     // `ts` alone would do it, but it has one-second resolution - two rescans
@@ -274,36 +283,90 @@ fn spawn_watcher(state: Arc<RwLock<MapState>>, root: PathBuf, interval: std::tim
     });
 }
 
-fn q_index(map: &MapState) -> Value {
-    let mut totals = Counts::default();
-    let files: Vec<Value> = map
-        .caches
-        .iter()
-        .map(|c| {
-            let n = c.counts();
-            totals.add(n);
-            json!({
-                "path": map.path_of(c),
-                "language": c.language.as_str(),
-                "funcs": n.funcs,
-                "consts": n.consts,
-                "refs": n.refs,
-                "notes": n.notes,
-            })
+// `prefix` narrows the overview to one subtree; totals then describe the
+// filtered set, with the project-wide file count kept alongside so a filtered
+// answer can never be mistaken for the whole project
+fn q_index(map: &MapState, prefix: Option<&str>) -> Value {
+    let want = prefix
+        .map(|p| {
+            p.trim()
+                .trim_start_matches("./")
+                .trim_matches('/')
+                .to_string()
         })
-        .collect();
-    json!({
+        .filter(|p| !p.is_empty());
+    let mut totals = Counts::default();
+    let mut files: Vec<Value> = Vec::new();
+    for c in &map.caches {
+        let path = map.path_of(c);
+        if let Some(w) = &want {
+            if path != *w && !path.starts_with(&format!("{w}/")) {
+                continue;
+            }
+        }
+        let n = c.counts();
+        totals.add(n);
+        files.push(json!({
+            "path": path,
+            "language": c.language.as_str(),
+            "funcs": n.funcs,
+            "consts": n.consts,
+            "refs": n.refs,
+            "notes": n.notes,
+            "mods": n.mods,
+            "exports": n.reexports,
+        }));
+    }
+    let mut out = json!({
         "root": map.root_label,
         "generated": map.ts,
         "totals": {
-            "files": map.caches.len(),
+            "files": files.len(),
             "funcs": totals.funcs,
             "consts": totals.consts,
             "refs": totals.refs,
             "notes": totals.notes,
+            "mods": totals.mods,
+            "exports": totals.reexports,
         },
+        "project_files": map.caches.len(),
         "files": files,
-    })
+    });
+    if let Some(w) = want {
+        // a filter that matches nothing is an answer, not an error - say which
+        // top-level directories the map does hold
+        if out["files"].as_array().is_some_and(|a| a.is_empty()) {
+            let mut tops: BTreeSet<String> = BTreeSet::new();
+            for c in &map.caches {
+                let p = map.path_of(c);
+                tops.insert(match p.split_once('/') {
+                    Some((d, _)) => format!("{d}/"),
+                    None => p,
+                });
+            }
+            out["available"] = json!(tops.into_iter().collect::<Vec<_>>());
+        }
+        out["filter"] = json!(w);
+    }
+    out
+}
+
+// A query ending in a separator (`clap::`, `client.`) names a qualifier with no
+// symbol after it: list everything under that qualifier rather than looking for
+// a symbol literally called "clap::".
+fn split_query(query: &str) -> (Option<&str>, &str) {
+    let q = query.trim();
+    for sep in ["::", "."] {
+        if let Some(prefix) = q.strip_suffix(sep) {
+            let prefix = prefix.trim();
+            return if prefix.is_empty() {
+                (None, "")
+            } else {
+                (Some(prefix), "")
+            };
+        }
+    }
+    split_qualified(q)
 }
 
 fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
@@ -311,34 +374,50 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
     if q.is_empty() {
         return Err("empty query".into());
     }
-    if !matches!(kind, "any" | "func" | "const" | "note" | "call") {
-        return Err(format!("kind '{kind}' not one of any|func|const|note|call"));
+    if !matches!(
+        kind,
+        "any" | "func" | "const" | "note" | "call" | "type" | "import"
+    ) {
+        return Err(format!(
+            "kind '{kind}' not one of any|func|const|note|call|type|import"
+        ));
     }
-    let (want_qualifier, want_name) = split_qualified(query.trim());
-    let want_qualifier = want_qualifier.map(|s| s.to_ascii_lowercase());
+    let (qualifier_raw, want_name) = split_query(query);
+    let want_qualifier = qualifier_raw.map(|s| s.to_ascii_lowercase());
     let want_name = want_name.to_ascii_lowercase();
+
+    let qualifier_only = want_name.is_empty() && want_qualifier.is_some();
+    if want_name.is_empty() && want_qualifier.is_none() {
+        return Err(format!(
+            "query '{query}' names no symbol; use `mod::` to list a qualifier"
+        ));
+    }
+
     // qualified queries (`serde_json::to_string`) resolve against call sites;
     // under `any` unqualified calls stay out so definitions aren't drowned.
     // uses (enum variants, consts) are constant-like and rare, so they are
     // searched under `any` even unqualified
-    let search_calls =
-        kind == "call" || (kind == "any" && want_qualifier.is_some() && !want_name.is_empty());
-    let search_uses = matches!(kind, "any" | "call") && !want_name.is_empty();
+    let search_calls = kind == "call" || (kind == "any" && want_qualifier.is_some());
+    let search_uses = matches!(kind, "any" | "call");
+    // a qualifier-only query is about where a module is used, so definitions
+    // (which carry no qualifier) cannot answer it
+    let search_defs = !qualifier_only;
     let mut results = Vec::new();
     for c in &map.caches {
         let path = map.path_of(c);
-        if matches!(kind, "any" | "func") {
+        if search_defs && matches!(kind, "any" | "func") {
             for f in &c.funcs {
                 if f.name.to_ascii_lowercase().contains(&q) {
                     results.push(json!({
                         "kind": "func", "file": path, "line": f.line, "col": f.col,
                         "name": f.name, "ret": f.ret, "doc": f.comment,
+                        "owner": f.owner,
                         "span": [f.start_line, f.end_line],
                     }));
                 }
             }
         }
-        if matches!(kind, "any" | "const") {
+        if search_defs && matches!(kind, "any" | "const") {
             for k in &c.consts {
                 if k.name.to_ascii_lowercase().contains(&q) {
                     results.push(json!({
@@ -348,11 +427,57 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
                 }
             }
         }
-        if matches!(kind, "any" | "note") {
+        // type definitions: structs, enums, traits, classes, interfaces,
+        // aliases. Extracted all along, searchable only since they were wired
+        // in here - a struct used purely through its type was invisible.
+        if search_defs && matches!(kind, "any" | "type") {
+            for t in &c.types {
+                if t.name.to_ascii_lowercase().contains(&q) {
+                    results.push(json!({
+                        "kind": "type", "file": path, "line": t.line,
+                        "name": t.name, "type": t.kind,
+                    }));
+                }
+            }
+        }
+        if search_defs && matches!(kind, "any" | "note") {
             for n in &c.notes {
                 if n.text.to_ascii_lowercase().contains(&q) {
                     results.push(json!({
                         "kind": "note", "file": path, "line": n.line, "text": n.text,
+                    }));
+                }
+            }
+        }
+        // import statements
+        if matches!(kind, "any" | "import") {
+            for imp in &c.imports {
+                let module_ok = match (&want_qualifier, qualifier_only) {
+                    (Some(w), true) => qualifier_under(Some(&imp.module), w),
+                    (Some(w), false) => {
+                        qualifier_matches(Some(&imp.module.to_ascii_lowercase()), w)
+                    }
+                    (None, _) => imp.module.to_ascii_lowercase().contains(&q),
+                };
+                let bound: Vec<&String> = imp
+                    .names
+                    .iter()
+                    .filter(|n| {
+                        want_name.is_empty() || n.to_ascii_lowercase().contains(&want_name)
+                    })
+                    .collect();
+                let hit = if qualifier_only {
+                    module_ok
+                } else if want_qualifier.is_some() {
+                    module_ok && !bound.is_empty()
+                } else {
+                    module_ok || !bound.is_empty()
+                };
+                if hit {
+                    results.push(json!({
+                        "kind": "import", "file": path, "line": imp.line,
+                        "name": bound.first().map(|n| n.as_str()).unwrap_or(&imp.module),
+                        "module": imp.module, "names": imp.names,
                     }));
                 }
             }
@@ -364,11 +489,11 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
             .filter(|_| search_calls)
             .chain(c.uses.iter().map(|s| ("use", s)).filter(|_| search_uses));
         for (site_kind, site) in sites {
-            let name_ok =
-                !want_name.is_empty() && site.name.to_ascii_lowercase().contains(&want_name);
-            let qualifier_ok = match &want_qualifier {
-                None => true,
-                Some(w) => site
+            let name_ok = qualifier_only || site.name.to_ascii_lowercase().contains(&want_name);
+            let qualifier_ok = match (&want_qualifier, qualifier_only) {
+                (None, _) => true,
+                (Some(w), true) => qualifier_under(site.qualifier.as_deref(), w),
+                (Some(w), false) => site
                     .qualifier
                     .as_deref()
                     .map(|cq| qualifier_matches(Some(&cq.to_ascii_lowercase()), w))
@@ -383,15 +508,43 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
             }
         }
     }
+    // report what was actually looked at
+    let mut searched: Vec<&str> = Vec::new();
+    for (name, on) in [
+        ("func", search_defs && matches!(kind, "any" | "func")),
+        ("const", search_defs && matches!(kind, "any" | "const")),
+        ("type", search_defs && matches!(kind, "any" | "type")),
+        ("note", search_defs && matches!(kind, "any" | "note")),
+        ("import", matches!(kind, "any" | "import")),
+        ("call", search_calls),
+        ("use", search_uses),
+    ] {
+        if on {
+            searched.push(name);
+        }
+    }
     let total = results.len();
     results.truncate(FIND_CAP);
-    Ok(json!({
+    let mut out = json!({
         "query": query,
         "kind": kind,
+        "qualifier": qualifier_raw,
         "count": total,
         "truncated": total > FIND_CAP,
+        "searched": searched,
         "results": results,
-    }))
+    });
+    if total == 0 {
+        out["miss"] = json!(true);
+        let probe = if want_name.is_empty() {
+            want_qualifier.clone().unwrap_or_default()
+        } else {
+            want_name.clone()
+        };
+        out["suggestions"] = Value::Array(nearest_names(map, &probe, 8));
+        add_miss_evidence(map, &mut out, qualifier_raw);
+    }
+    Ok(out)
 }
 
 // `serde_json::to_string` / `client.charge` -> (Some("serde_json"), "to_string");
@@ -434,6 +587,222 @@ fn qualifier_matches(call_qualifier: Option<&str>, want: &str) -> bool {
     !want.is_empty() && have.len() >= want.len() && have[have.len() - want.len()..] == want[..]
 }
 
+// `money::` asks for everything *under* a qualifier, so it matches by prefix
+fn qualifier_under(call_qualifier: Option<&str>, want: &str) -> bool {
+    let segs = |s: &str| -> Vec<String> {
+        s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| seg.to_ascii_lowercase())
+            .collect()
+    };
+    let Some(cq) = call_qualifier else {
+        return false;
+    };
+    let have = segs(cq);
+    let want = segs(want);
+    !want.is_empty() && have.len() >= want.len() && have[..want.len()] == want[..]
+}
+
+// Levenshtein dist
+fn edit_distance(a: &str, b: &str, cap: usize) -> Option<usize> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > cap {
+        return None;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        let mut row_min = cur[0];
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            row_min = row_min.min(cur[j]);
+        }
+        if row_min > cap {
+            return None;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    let d = prev[b.len()];
+    (d <= cap).then_some(d)
+}
+
+const BAND: usize = 1000;
+
+fn name_distance(want: &str, have: &str) -> Option<usize> {
+    if want == have {
+        return Some(0);
+    }
+    if have.contains(want) || want.contains(have) {
+        return Some(BAND + have.len().abs_diff(want.len()).min(BAND - 1));
+    }
+    Some(2 * BAND + edit_distance(want, have, std::cmp::max(2, want.len() / 3))?)
+}
+
+// nearest indexed names to a query that found nothing
+fn nearest_names(map: &MapState, want: &str, limit: usize) -> Vec<Value> {
+    let want = want.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    // a definition is a more useful suggestion than the import that binds it
+    let rank = |kind: &str| match kind {
+        "type" => 0,
+        "func" => 1,
+        "const" => 2,
+        _ => 3,
+    };
+    let mut seen: BTreeSet<(String, &'static str)> = BTreeSet::new();
+    let mut scored: Vec<(usize, usize, String, &'static str, String)> = Vec::new();
+    for c in &map.caches {
+        let path = map.path_of(c);
+        let named = c
+            .funcs
+            .iter()
+            .map(|f| (f.name.as_str(), "func"))
+            .chain(c.consts.iter().map(|k| (k.name.as_str(), "const")))
+            .chain(c.types.iter().map(|t| (t.name.as_str(), "type")))
+            .chain(
+                c.imports
+                    .iter()
+                    .flat_map(|i| i.names.iter().map(|n| (n.as_str(), "import"))),
+            );
+        for (name, kind) in named {
+            if !seen.insert((name.to_ascii_lowercase(), kind)) {
+                continue;
+            }
+            if let Some(score) = name_distance(&want, &name.to_ascii_lowercase()) {
+                scored.push((score, rank(kind), name.to_string(), kind, path.clone()));
+            }
+        }
+    }
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    // one row per name
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    scored
+        .into_iter()
+        .filter(|(_, _, name, _, _)| named.insert(name.to_ascii_lowercase()))
+        .take(limit)
+        .map(|(_, _, name, kind, file)| json!({"name": name, "kind": kind, "file": file}))
+        .collect()
+}
+
+// the kinds a lookup actually searched
+const SEARCHED_KINDS: &[&str] = &[
+    "func", "const", "type", "call", "use", "import", "reexport",
+];
+
+// the module name a file's contents are reachable under from outside it
+fn file_facade(map: &MapState, c: &FileCache) -> Option<String> {
+    let stem = c.rel_path.file_stem().and_then(|s| s.to_str())?;
+    match stem {
+        "lib" => map.facade.clone(),
+        "mod" | "__init__" => c
+            .rel_path
+            .parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|s| s.to_str())
+            .map(str::to_string),
+        _ => Some(stem.to_string()),
+    }
+}
+
+// one place a symbol is re-exported: which file publishes it, under what name,
+// and which module it actually came from
+struct Route {
+    facade: String,
+    module: String,
+    file: String,
+    line: usize,
+    glob: bool,
+}
+
+// Where `name` is re-exported to, restricted to routes a `qualifier` could mean.
+fn reexport_routes(map: &MapState, name: &str, qualifier: Option<&str>) -> Vec<Route> {
+    let mut routes = Vec::new();
+    for c in &map.caches {
+        let Some(facade) = file_facade(map, c) else {
+            continue;
+        };
+        for imp in c.imports.iter().filter(|i| i.reexport) {
+            let glob = imp.names.is_empty();
+            if !glob && !imp.names.iter().any(|n| n == name) {
+                continue;
+            }
+            // facade and the module it re-exports from 
+            // both are paths a caller legitimately writes, so both have to match
+            let via = format!("{facade}::{}", imp.module);
+            let wanted = match qualifier {
+                None => true,
+                Some(q) => {
+                    qualifier_matches(Some(&facade), q) || qualifier_matches(Some(&via), q)
+                }
+            };
+            if wanted {
+                routes.push(Route {
+                    facade: facade.clone(),
+                    module: imp.module.clone(),
+                    file: map.path_of(c),
+                    line: imp.line,
+                    glob,
+                });
+            }
+        }
+    }
+    routes
+}
+
+// what the map knows about a *qualifier* whose symbol missed
+fn qualifier_evidence(map: &MapState, qualifier: &str) -> (usize, Vec<String>) {
+    let mut sites = 0usize;
+    let mut examples = Vec::new();
+
+    let note = |path: &str, line: usize, sites: &mut usize, examples: &mut Vec<String>| {
+        *sites += 1;
+        let at = format!("{path}:{line}");
+        if examples.len() < 3 && !examples.contains(&at) {
+            examples.push(at);
+        }
+    };
+    for c in &map.caches {
+        let path = map.path_of(c);
+        for site in c.calls.iter().chain(c.uses.iter()) {
+            if qualifier_under(site.qualifier.as_deref(), qualifier) {
+                note(&path, site.line, &mut sites, &mut examples);
+            }
+        }
+        for imp in &c.imports {
+            if qualifier_under(Some(&imp.module), qualifier) {
+                note(&path, imp.line, &mut sites, &mut examples);
+            }
+        }
+    }
+    (sites, examples)
+}
+
+// Attach the qualifier verdict to a zero-hit result.
+fn add_miss_evidence(map: &MapState, out: &mut Value, qualifier: Option<&str>) {
+    let Some(q) = qualifier else { return };
+    let head = q.split([':', '.']).next().unwrap_or(q);
+    let (sites, examples) = qualifier_evidence(map, q);
+    out["qualifier_sites"] = json!(sites);
+    out["qualifier_examples"] = json!(examples);
+
+    match map.external_named(head) {
+        Some(dep) => {
+            out["declared"] = json!(true);
+            out["external_dependency"] = dep.json();
+        }
+        None => out["declared"] = json!(false),
+    }
+}
+
 fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     let symbol = symbol.trim();
     if symbol.is_empty() {
@@ -441,8 +810,17 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     }
     let (qualifier, name) = split_qualified(symbol);
     let mut definitions = Vec::new();
-    let mut stem_matched_defs = Vec::new();
+    let mut narrowed_defs = Vec::new();
     let mut references = Vec::new();
+    let names_it = |q: &str, candidate: &str| crate::changes::qualifier_names_service(q, candidate);
+    // a qualifier may name a facade rather than the file the definition sits in
+    let routes = reexport_routes(map, name, qualifier);
+    let via_reexport = |stem: &str, owner: Option<&str>| {
+        qualifier.is_some()
+            && routes
+                .iter()
+                .any(|r| names_it(&r.module, stem) || owner.is_some_and(|o| names_it(&r.module, o)))
+    };
     for c in &map.caches {
         let path = map.path_of(c);
         let stem = c
@@ -454,10 +832,18 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
             if f.name == name {
                 let def = json!({
                     "kind": "func", "file": path, "line": f.line, "col": f.col,
-                    "ret": f.ret, "doc": f.comment, "span": [f.start_line, f.end_line],
+                    "ret": f.ret, "doc": f.comment, "owner": f.owner,
+                    "span": [f.start_line, f.end_line],
                 });
-                if qualifier.is_some_and(|q| crate::changes::qualifier_names_service(q, stem)) {
-                    stem_matched_defs.push(def.clone());
+                // `money::charge` narrows by file stem; `Encoding::parse`
+                // narrows by the type the method hangs off. Without the owner
+                // check every `X::new` collapsed onto whichever project
+                // function happened to be called `new`.
+                let narrows = qualifier.is_some_and(|q| {
+                    names_it(q, stem) || f.owner.as_deref().is_some_and(|o| names_it(q, o))
+                }) || via_reexport(stem, f.owner.as_deref());
+                if narrows {
+                    narrowed_defs.push(def.clone());
                 }
                 definitions.push(def);
             }
@@ -470,13 +856,21 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
                 // `money::MAX` narrows by file stem, `Encoding::O200kBase`
                 // by the owning enum recorded as the const's type
                 let narrows = qualifier.is_some_and(|q| {
-                    crate::changes::qualifier_names_service(q, stem)
-                        || k.ty
-                            .as_deref()
-                            .is_some_and(|t| crate::changes::qualifier_names_service(q, t))
-                });
+                    names_it(q, stem) || k.ty.as_deref().is_some_and(|t| names_it(q, t))
+                }) || via_reexport(stem, k.ty.as_deref());
                 if narrows {
-                    stem_matched_defs.push(def.clone());
+                    narrowed_defs.push(def.clone());
+                }
+                definitions.push(def);
+            }
+        }
+        for t in &c.types {
+            if t.name == name {
+                let def = json!({
+                    "kind": "type", "file": path, "line": t.line, "type": t.kind,
+                });
+                if qualifier.is_some_and(|q| names_it(q, stem)) || via_reexport(stem, None) {
+                    narrowed_defs.push(def.clone());
                 }
                 definitions.push(def);
             }
@@ -498,26 +892,102 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
                 }));
             }
         }
+        // An import binds a name without ever calling it. This is the only
+        // evidence a derive macro, a trait or a type-only dependency leaves.
+        for imp in &c.imports {
+            let bound = imp.names.iter().any(|n| n == name);
+            // `use foo::bar::*` binds nothing but still names `bar`
+            let tail_named = imp.names.is_empty()
+                && imp
+                    .module
+                    .rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                    .next()
+                    .is_some_and(|seg| seg == name);
+            let qualifier_ok = match qualifier {
+                None => true,
+                Some(q) => qualifier_matches(Some(&imp.module), q),
+            };
+            if (bound || tail_named) && qualifier_ok {
+                // a re-export is not a use of the symbol, it is a second route
+                // to it - the difference between "someone depends on this" and
+                // "this is published API", which is exactly what a caller
+                // weighing a rename needs to tell apart
+                references.push(json!({
+                    "kind": if imp.reexport { "reexport" } else { "import" },
+                    "file": path, "line": imp.line,
+                    "module": imp.module, "names": imp.names,
+                }));
+            }
+        }
     }
-    // a qualifier that names a file (`money::charge` -> lib/money.rs) narrows
-    // the definitions to that file; otherwise all bare-name definitions stay
-    if !stem_matched_defs.is_empty() {
-        definitions = stem_matched_defs;
+    // A qualifier that names a file or an owning type narrows the definitions
+    // to it. When it narrows nothing, the bare-name matches are not this
+    // symbol at all - `Regex::new` is not the project's `Dir::new` - so they
+    // are withheld from `definitions` and reported separately as what they are.
+    let mut name_only = Vec::new();
+    if !narrowed_defs.is_empty() {
+        definitions = narrowed_defs;
+    } else if qualifier.is_some() && !definitions.is_empty() {
+        name_only = std::mem::take(&mut definitions);
     }
-    if definitions.is_empty() && references.is_empty() {
-        return Err(format!("symbol '{symbol}' not found in the map"));
-    }
+    // Whether this symbol is published, however the caller happened to spell the
+    // lookup. A rename that reads as local is not local when a crate root
+    // re-exports the name, and nothing else in the answer says so.
+    let public = if qualifier.is_some() {
+        reexport_routes(map, name, None)
+    } else {
+        routes
+    };
+    let defined_in = |module: &str| {
+        definitions.iter().any(|d| {
+            d.get("file")
+                .and_then(|f| f.as_str())
+                .map(std::path::Path::new)
+                .and_then(std::path::Path::file_stem)
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| names_it(module, stem))
+        })
+    };
+    let mut seen_export = BTreeSet::new();
+    let exported_as: Vec<Value> = public
+        .iter()
+        .filter(|r| !r.glob || defined_in(&r.module))
+        .filter_map(|r| {
+            let path = format!("{}::{name}", r.facade);
+            let at = format!("{}:{}", r.file, r.line);
+            seen_export.insert((path.clone(), at.clone())).then(|| {
+                json!({"path": path, "from": r.module, "at": at})
+            })
+        })
+        .collect();
+
     let total_refs = references.len();
     references.truncate(REFS_CAP);
-    Ok(json!({
+    let mut out = json!({
         "symbol": symbol,
         "name": name,
         "qualifier": qualifier,
         "counts": {"definitions": definitions.len(), "references": total_refs},
         "truncated": total_refs > REFS_CAP,
+        "searched": SEARCHED_KINDS,
         "definitions": definitions,
         "references": references,
-    }))
+    });
+    if !name_only.is_empty() {
+        let shown: Vec<Value> = name_only.into_iter().take(REFS_CAP).collect();
+        out["name_only_matches"] = Value::Array(shown);
+    }
+    if !exported_as.is_empty() {
+        out["exported_as"] = Value::Array(exported_as);
+    }
+    // A miss is an answer, not an error: say what was covered and what to try,
+    // so the lookup can be carried on rather than abandoned.
+    if out["counts"]["definitions"] == 0 && total_refs == 0 {
+        out["miss"] = json!(true);
+        out["suggestions"] = Value::Array(nearest_names(map, name, 8));
+        add_miss_evidence(map, &mut out, qualifier);
+    }
+    Ok(out)
 }
 
 // package name from a root Cargo.toml, if any - the name code uses to
@@ -541,6 +1011,181 @@ fn cargo_package_name(root: &Path) -> Option<String> {
         }
     }
     None
+}
+
+// one externally declared package, straight from a manifest
+#[derive(Debug, Clone)]
+struct ExternalDep {
+    name: String,
+    version: Option<String>,
+    // dependencies | dev-dependencies | build-dependencies | ...
+    kind: String,
+    manifest: String,
+}
+
+impl ExternalDep {
+    fn json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "version": self.version,
+            "kind": self.kind,
+            "manifest": self.manifest,
+        })
+    }
+}
+
+// `"1.0"` or `{ version = "0.4", features = [..] }` -> the version string
+fn toml_version(rest: &str) -> Option<String> {
+    let r = rest.trim();
+    let tail = match r.strip_prefix('{') {
+        Some(inner) => &inner[inner.find("version")? + "version".len()..],
+        None => r,
+    };
+    tail.split('"').nth(1).map(str::to_string)
+}
+
+// Declared dependencies from whatever manifests the root carries
+fn manifest_deps(root: &Path) -> Vec<ExternalDep> {
+    let mut out = Vec::new();
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+
+    if let Some(text) = read("Cargo.toml") {
+        let mut section = String::new();
+        for line in text.lines() {
+            let t = line.split('#').next().unwrap_or("").trim();
+            if let Some(h) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                section = h.trim().to_string();
+                // `[dependencies.serde]` declares one dependency by section name
+                if let Some((kind, name)) = section.split_once('.') {
+                    if is_cargo_dep_section(kind) && !name.contains('.') {
+                        out.push(ExternalDep {
+                            name: name.trim_matches('"').to_string(),
+                            version: None,
+                            kind: kind.to_string(),
+                            manifest: "Cargo.toml".into(),
+                        });
+                    }
+                }
+                continue;
+            }
+            let kind = section.rsplit('.').next().unwrap_or("");
+            if !is_cargo_dep_section(kind) {
+                continue;
+            }
+            let Some((name, rest)) = t.split_once('=') else {
+                continue;
+            };
+            let name = name.trim().trim_matches('"');
+            if name.is_empty() {
+                continue;
+            }
+            out.push(ExternalDep {
+                name: name.to_string(),
+                version: toml_version(rest),
+                kind: kind.to_string(),
+                manifest: "Cargo.toml".into(),
+            });
+        }
+    }
+
+    // package.json: the two dependency objects, scanned as `"name": "range"`
+    if let Some(text) = read("package.json") {
+        for kind in ["dependencies", "devDependencies"] {
+            let Some(start) = text.find(&format!("\"{kind}\"")) else {
+                continue;
+            };
+            let Some(open) = text[start..].find('{').map(|i| start + i + 1) else {
+                continue;
+            };
+            let Some(close) = text[open..].find('}').map(|i| open + i) else {
+                continue;
+            };
+            for entry in text[open..close].split(',') {
+                let Some((name, range)) = entry.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim().trim_matches('"');
+                if name.is_empty() {
+                    continue;
+                }
+                out.push(ExternalDep {
+                    name: name.to_string(),
+                    version: Some(range.trim().trim_matches('"').to_string()),
+                    kind: kind.to_string(),
+                    manifest: "package.json".into(),
+                });
+            }
+        }
+    }
+
+    // go.mod: `require path v1.2.3`, single line or block
+    if let Some(text) = read("go.mod") {
+        let mut in_block = false;
+        for line in text.lines() {
+            let t = line.split("//").next().unwrap_or("").trim();
+            if t.starts_with("require (") {
+                in_block = true;
+                continue;
+            }
+            if in_block && t == ")" {
+                in_block = false;
+                continue;
+            }
+            let spec = if in_block {
+                t
+            } else {
+                match t.strip_prefix("require ") {
+                    Some(s) => s.trim(),
+                    None => continue,
+                }
+            };
+            let mut parts = spec.split_whitespace();
+            let (Some(path), version) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
+            }
+            out.push(ExternalDep {
+                name: path.to_string(),
+                version: version.map(str::to_string),
+                kind: "require".into(),
+                manifest: "go.mod".into(),
+            });
+        }
+    }
+
+    // requirements.txt: one pinned distribution per line
+    if let Some(text) = read("requirements.txt") {
+        for line in text.lines() {
+            let t = line.split('#').next().unwrap_or("").trim();
+            if t.is_empty() || t.starts_with('-') {
+                continue;
+            }
+            let split = t.find(|c| "=<>!~[ ;".contains(c)).unwrap_or(t.len());
+            let (name, rest) = t.split_at(split);
+            if name.is_empty() {
+                continue;
+            }
+            out.push(ExternalDep {
+                name: name.to_string(),
+                version: (!rest.trim().is_empty()).then(|| rest.trim().to_string()),
+                kind: "requirements".into(),
+                manifest: "requirements.txt".into(),
+            });
+        }
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.kind.cmp(&b.kind)));
+    out.dedup_by(|a, b| a.name == b.name && a.kind == b.kind && a.manifest == b.manifest);
+    out
+}
+
+fn is_cargo_dep_section(name: &str) -> bool {
+    matches!(
+        name,
+        "dependencies" | "dev-dependencies" | "build-dependencies"
+    )
 }
 
 // File-level dependency edges, resolved from imports and calls. A call only
@@ -606,6 +1251,11 @@ fn q_dependencies(map: &MapState, file: Option<&str>) -> Result<Value, String> {
                     let syms = edges.entry((a, b)).or_default();
                     if imp.names.is_empty() {
                         syms.insert(seg.to_string());
+                        // an import that binds no names still makes a whole
+                        // file available
+                        for f in &map.caches[b].funcs {
+                            imported.entry(f.name.as_str()).or_default().insert(b);
+                        }
                     }
                     for n in &imp.names {
                         syms.insert(n.clone());
@@ -695,6 +1345,8 @@ fn q_dependencies(map: &MapState, file: Option<&str>) -> Result<Value, String> {
         None => Ok(json!({
             "files": map.caches.len(),
             "edges": edges.iter().map(edge_json).collect::<Vec<_>>(),
+            // declared external packages
+            "external": map.externals.iter().map(ExternalDep::json).collect::<Vec<_>>(),
             "ambiguous_symbols": ambiguous.iter().take(50).collect::<Vec<_>>(),
             // call names that matched a definition elsewhere but lacked
             // qualifier/import evidence - surfaced so exclusions are auditable
@@ -746,6 +1398,13 @@ fn q_file(map: &MapState, key: &str) -> Result<Value, String> {
         "notes": c.notes.iter().map(|n| json!({
             "line": n.line, "text": n.text,
         })).collect::<Vec<_>>(),
+        // a file that defines nothing may still declare the shape of everything
+        // around it
+        "modules": c.modules,
+        "imports": c.imports.iter().map(|i| json!({
+            "line": i.line, "module": i.module, "names": i.names,
+            "reexport": i.reexport,
+        })).collect::<Vec<_>>(),
         "markdown": render::render_file(c, &map.ts),
     }))
 }
@@ -781,31 +1440,40 @@ fn mcp_tools() -> Value {
         })
     };
     json!({ "tools": [
-        tool("index", "Project overview: every mapped file with its function/const/ref/note counts.", json!({}), &[]),
+        tool(
+            "index",
+            "START HERE in an unfamiliar project: what it contains, which directories carry the weight, where to look next. Use instead of `ls -R`, `find . -name '*.rs'` or `tree`. Every file the map holds is named, in path order, one row each - nothing is ever collapsed into a directory summary, so a row always tells you where something actually is. Most projects come back whole; the answer is capped at about a thousand lines, and past that the rest waits behind `offset` (or narrow with `path` instead of paging). The header totals always describe the whole filtered set, not the page. Where a project has module roots the rows carry two more columns: `mods`, the submodules a file declares, and `exp`, the names it re-exports - so a Rust `lib.rs` or `mod.rs`, which defines nothing and reads as zero in every other column, is visible as the module graph and public surface it is. Then drill: `path` for the files under one directory, `offset` for the next page of rows.",
+            json!({
+                "path": {"type": "string", "description": "limit to one subtree, e.g. `src/api` (optional)"},
+                "limit": {"type": "integer", "description": "rows per page (default: as many as fit the ~1000-line ceiling, usually the whole project)"},
+                "offset": {"type": "integer", "description": "rows to skip (default 0)"},
+            }),
+            &[],
+        ),
         tool(
             "find",
-            "Search the code map for symbols by substring (case-insensitive). Returns file:line locations with return types and doc summaries. A qualified query like `serde_json::to_string` or `client.charge` matches call sites (kind `call`) filtered by that qualifier.",
+            "USE INSTEAD OF `grep -rn <name>` whenever you know part of a name but not where it lives: is there a function like parse_config, what types end in Error, which files pull in clap. Substring match (case-insensitive) over functions, constants, type definitions (struct/enum/trait/class/interface/alias), notes, call and use sites, and import statements. Returns file:line with return types and doc summaries - no matches inside comments or strings, so nothing to filter by hand. A qualified query (`serde_json::to_string`, `client.charge`) matches sites under that qualifier; a trailing separator (`clap::`) lists everything under it. Zero hits names the kinds it searched and the nearest indexed names, so a miss tells you the symbol is absent rather than that your pattern was wrong.",
             json!({
-                "query": {"type": "string", "description": "substring to search for; qualified form (a::b / a.b) searches call sites"},
-                "kind": {"type": "string", "enum": ["any", "func", "const", "note", "call"], "description": "filter by symbol kind (default any)"},
+                "query": {"type": "string", "description": "substring to search for; qualified form (a::b / a.b) searches call, use and import sites; trailing `::` lists a whole qualifier"},
+                "kind": {"type": "string", "enum": ["any", "func", "const", "type", "note", "call", "import"], "description": "filter by symbol kind (default any)"},
             }),
             &["query"],
         ),
         tool(
             "references",
-            "Definitions, every call site, and qualified value usages (enum variants, consts: `Encoding::O200kBase`) of an exact symbol name across the project. Accepts qualified names (`serde_json::to_string`, `client.charge`) to count one qualifier's sites without any text search. Each hit carries the enclosing caller, qualifier, and test context. Use before changing a function's signature.",
+            "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions and imports are covered, so a struct used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
             json!({"symbol": {"type": "string", "description": "exact symbol name, optionally qualified (a::b or a.b)"}}),
             &["symbol"],
         ),
         tool(
             "dependencies",
-            "File-level dependency edges resolved from imports and calls (type-only imports included). Call edges require the call site to name the target module or use an imported symbol; name-only matches are excluded and listed in excluded_symbols. Without arguments: the whole project graph; with a file: what it depends on and what depends on it.",
+            "ANSWERS what breaks if I change this file, what this module pulls in, and whether a declared package is actually used anywhere. Use instead of opening files to read their import blocks. File-level edges resolved from imports and calls (type-only imports included), plus the external packages declared in the manifests (Cargo.toml, package.json, go.mod, requirements.txt). Call edges require the site to name the target module or use an imported symbol; name-only matches are excluded and listed in excluded_symbols, so an edge here is evidence rather than a guess. Without arguments: the whole graph plus declared dependencies; with `file`: what it depends on and what depends on it.",
             json!({"file": {"type": "string", "description": "relative path (optional)"}}),
             &[],
         ),
         tool(
             "file",
-            "The map entry for one source file: the rendered .ccc markdown (constants, functions with return types and doc summaries, notes). Pass structured=true instead when you need definition spans and the intra-file call graph.",
+            "ANSWERS what is in this file - the submodules it declares, its imports (`pub` marks a re-export), every constant and function with its return type and doc summary, plus notes - for a fraction of the tokens reading it would cost. Use it to decide whether a file is worth opening at all, and on a module root (lib.rs, mod.rs, __init__.py) to read the module graph and published API of everything around it. NOT for editing: this is a map, not the code, so open the real source before you change a line. Pass structured=true for definition spans and the intra-file call graph instead of the rendered markdown.",
             json!({
                 "path": {"type": "string", "description": "relative path, cache name, or unique path suffix"},
                 "structured": {"type": "boolean", "description": "return spans and the intra-file call graph instead of the rendered markdown (default false)"},
@@ -814,17 +1482,17 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "notes",
-            "All marker comments (TODO/FIXME/XXX/HACK/BUG/NOTE/SAFETY), optionally filtered by marker.",
+            "ANSWERS what is left to do or known-broken in this project. Use instead of grepping for TODO and FIXME. All marker comments (TODO/FIXME/XXX/HACK/BUG/NOTE/SAFETY) with their file, line and enclosing function, optionally filtered to one marker.",
             json!({"marker": {"type": "string", "description": "e.g. TODO (optional)"}}),
             &[],
         ),
-        tool("refresh", "Rescan the source tree into memory. Call after editing source files.", json!({}), &[]),
+        tool("refresh", "CALL AFTER EDITING source files. Rescans the tree into memory; without it the map lags about three seconds behind your edit, and every other tool answers from that stale map.", json!({}), &[]),
 
         // analysis tools. All six are views onto one pass, computed once
         // per (map generation, base), paged.
         tool(
             "changes",
-            "What this branch changed, diffed against a base ref: changed functions with the tests that name them, which services need testing, service edges, and the calls the resolver refused to attribute. Includes uncommitted edits and untracked files by default. This is the change set the `test_triggers` tool refers to.",
+            "ANSWERS what have I changed on this branch, at function granularity rather than line granularity. Use instead of reading `git diff` by hand when you want to know which functions moved and what they touch. Diffed against a base ref: changed functions with the tests that name them, which services need testing, service edges, and the calls the resolver refused to attribute. Includes uncommitted edits and untracked files by default. This is the change set `test_triggers` refers to.",
             json!({
                 "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
                 "limit": {"type": "integer", "description": "changed functions per page (default 40, max 500)"},
@@ -834,7 +1502,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "test_triggers",
-            "Which tests to run for the changes on this branch, and which are missing. Tests are matched to changed functions through the call graph, so a change deep in the stack still surfaces the tests above it; `distance` is how many call hops away each one sits. Returns a runnable command per language. Call this before running a suite, and after editing, to find what a change puts at risk.",
+            "CALL BEFORE RUNNING ANY TEST SUITE, and again after editing: it answers which tests your changes actually put at risk, so you run those instead of everything, and which changes no test covers at all. Tests are matched to changed functions through the call graph, so a change deep in the stack still surfaces the tests above it; `distance` is how many call hops away each sits. Returns a runnable command per language.",
             json!({
                 "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
                 "limit": {"type": "integer", "description": "triggered tests and gaps per page (default 25, max 500)"},
@@ -844,7 +1512,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "test_targets",
-            "Functions ranked by how much a missing test would cost, each with the kind of test the measurements justify (smoke-test, integration-test, contract-test, perf-test, load-test), the reasoning behind that choice, and language-specific advice. Ranked by complexity, call depth, loop depth, call sites, cross-service callers, and whether anything names the function today.",
+            "ANSWERS where should I add a test, and what kind. Functions ranked by how much a missing test would cost, each with the kind the measurements justify (smoke-test, integration-test, contract-test, perf-test, load-test), the reasoning behind that choice, and language-specific advice. Ranked by complexity, call depth, loop depth, call sites, cross-service callers, and whether anything names the function today.",
             json!({
                 "kind": {"type": "string", "enum": ["smoke-test", "integration-test", "contract-test", "perf-test", "load-test"], "description": "only targets recommending this kind"},
                 "limit": {"type": "integer", "description": "targets per page (default 15, max 500)"},
@@ -854,7 +1522,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "lints",
-            "Syntax-level findings: leaked resources, unrollable loops, inline candidates, deep nesting and similar. Every finding cites the measurement it came from, and every rule ships its own limits - there is no type or data-flow information behind these, so verify before acting.",
+            "ANSWERS what looks risky in this code before you review or refactor it. Syntax-level findings: leaked resources, unrollable loops, inline candidates, deep nesting and similar. Every finding cites the measurement it came from, and every rule ships its own limits - there is no type or data-flow information behind these, so read the evidence and confirm in the source before acting on one.",
             json!({
                 "rule": {"type": "string", "description": "only findings from this rule (see the rules section of any result)"},
                 "limit": {"type": "integer", "description": "findings per page (default 40, max 500)"},
@@ -864,7 +1532,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "hot",
-            "Call-graph shape: the most-called functions, the widest fan-outs, the most complex, the deepest call chains, and recursion cycles. Structural, not measured - it ranks by graph shape, not execution frequency, so treat it as where to look rather than where time goes.",
+            "ANSWERS what is central to this codebase and where to start reading. Call-graph shape: the most-called functions, the widest fan-outs, the most complex, the deepest call chains, and recursion cycles. Static, not sampled: it ranks by call-graph shape - how many sites reach a function, how complex it is, how deep it sits - which is what the source says is hot, as opposed to what an execution trace would.",
             json!({
                 "view": {"type": "string", "enum": ["most_called", "widest", "most_complex", "deepest_chains", "cycles"], "description": "one view (default: all five)"},
                 "limit": {"type": "integer", "description": "rows per view (default 15, max 500)"},
@@ -874,7 +1542,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "services",
-            "The service map and the call edges between services, with the call sites that carry each hop. Services come from `.ccc/map.json` when present, top-level directories otherwise. An edge is `declared` if the config lists it, `detected` if calls were resolved across it - both are reported, since a declared HTTP or queue link resolves no calls by design.",
+            "ANSWERS how the parts of this system talk to each other, and which code carries each hop. The service map and the call edges between services, with the call sites behind them. Services come from `.ccc/map.json` when present, top-level directories otherwise. An edge is `declared` if the config lists it, `detected` if calls were resolved across it - both are reported, since a declared HTTP or queue link resolves no calls by design.",
             json!({
                 "service": {"type": "string", "description": "drill into one service: its definition plus every edge touching it"},
                 "limit": {"type": "integer", "description": "edges per page (default 25, max 500)"},
@@ -903,35 +1571,43 @@ fn mcp_initialize(params: &Value) -> Value {
             "title": "ContextCodeCache",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "In-memory code map of the project (the .ccc ContextCodeCache). \
-            Prefer these tools over grep or text search for symbol and call-site \
-            questions in this project: the map already indexes every definition, \
-            call site, and qualified constant-like usage (enum variants, consts), \
-            each hit is structured (file, line, enclosing caller, qualifier, test \
-            context) with no textual false positives, and qualified names like \
-            `serde_json::to_string` or `Encoding::O200kBase` are understood \
-            directly - one `references` call replaces a grep plus manual filtering. \
-            Orient with `index`, locate symbols with `find`, check `references` before \
-            changing a signature, `dependencies` for file-level impact, `file` for one \
-            file's full map, `notes` for TODO/FIXME markers. The map auto-refreshes \
-            when source files change (three seconds of lag); call `refresh` to force an \
-            immediate rescan after editing. Reach for text search only for non-symbol \
-            text (string literals, config). \
-            Six further tools analyse the map rather than index it: `changes` for what \
-            this branch touched, `test_triggers` for which tests that makes necessary \
-            (call it before running a suite and after editing), `test_targets` for \
-            where a missing test would cost most and which kind to write, `lints` for \
-            syntax-level findings, `hot` for call-graph shape, `services` for the \
-            service map and the calls crossing it. These are heuristics over a syntax \
-            tree - no type inference, data flow or runtime profile - so each result \
-            carries the evidence behind it and the limits of the rule that produced \
-            it; read those before acting. They are paged, not truncated: when a result \
-            says `showing 1-40 of 152`, pass `offset` to walk the rest. \
-            Results are markdown; the same data is available as JSON from this \
-            server's HTTP endpoints (/index, /find, /references, /dependencies, /file, \
-            /notes, /insights.json) when something needs to parse it. Open real source \
-            files for exact code - this map is for navigation and impact, not \
-            authoritative content.",
+        "instructions": "Code map of this project (the .ccc ContextCodeCache), held in \
+            memory and refreshed automatically about three seconds after source changes.\n\n\
+            1. SEARCHING - always start here. For any question about where something is \
+            defined, called, imported or changed in this project, call a ccc tool before \
+            reaching for grep or opening files. Hits carry file, line, enclosing caller \
+            and qualifier with no textual false positives, and qualified names \
+            (`serde_json::to_string`, `Encoding::O200kBase`) resolve directly. \
+            Definitions, call sites, usages, imports and re-exports are all indexed, so \
+            no hits is evidence of absence rather than a gap in coverage - a miss names \
+            the kinds it searched and the nearest indexed names. A module root (Rust \
+            `lib.rs`/`mod.rs`, a package `__init__.py`) defines nothing and is not \
+            empty: it is read as the module graph and published surface it declares, and \
+            a crate-facade path resolves through the `pub use` behind it. Use text \
+            search only for non-symbol text: string literals, config, prose in \
+            comments.\n\n\
+            2. EDITING - do not work from the map. It records where code is and how it \
+            connects, not its exact content: open the real source file before changing a \
+            line, and never hand-edit anything under `.ccc`, which is overwritten on the \
+            next scan. Call `refresh` after editing so later queries see your change.\n\n\
+            3. TOOLS. Map: `index` project overview - every file named in path order, \
+            never collapsed into directory summaries, most projects whole; past ~1000 \
+            lines the rest waits behind `offset`, and `path` narrows to a subtree. \
+            `find` symbols by \
+            substring, `references` every definition, call, usage, import and re-export \
+            of an exact name - check it before changing a signature, `dependencies` \
+            file-level edges and declared packages, `file` one file's full map including \
+            the submodules it declares, `notes` TODO/FIXME markers, `refresh` force a \
+            rescan. Analysis: `changes` what this branch touched, `test_triggers` the \
+            tests those changes make necessary, `test_targets` where a missing test \
+            would cost most, `lints` syntax-level findings, `hot` call-graph shape, \
+            `services` the service map and the calls crossing it. The analysis tools are \
+            heuristics over a syntax tree - no type inference, data flow or runtime \
+            profile - so each result carries its evidence and limits; read those before \
+            acting. They page rather than truncate: on `showing 1-40 of 152`, pass \
+            `offset` for the rest.\n\n\
+            Results are markdown; the same data is JSON over HTTP (/index, /find, \
+            /references, /dependencies, /file, /notes, /insights.json).",
     })
 }
 
@@ -995,10 +1671,21 @@ fn md_hit(r: &Value) -> String {
     if let Some(ret) = r.get("ret").and_then(|x| x.as_str()) {
         line.push_str(&format!(" -> {ret}"));
     }
+    if let Some(module) = r.get("module").and_then(|x| x.as_str()) {
+        line.push_str(&format!(" {module}"));
+        let names = jnames(r, "names");
+        if !names.is_empty() {
+            line.push_str(&format!(" ({names})"));
+        }
+    }
     if let Some(span) = r.get("span").and_then(|x| x.as_array()) {
         if let [a, b] = &span[..] {
             line.push_str(&format!(" span {a}-{b}"));
         }
+    }
+    // the type a method hangs off - the evidence a qualified lookup narrows on
+    if let Some(owner) = r.get("owner").and_then(|x| x.as_str()) {
+        line.push_str(&format!(" owner={owner}"));
     }
     if let Some(q) = r.get("qualifier").and_then(|x| x.as_str()) {
         line.push_str(&format!(" qualifier={q}"));
@@ -1021,11 +1708,60 @@ fn md_hit(r: &Value) -> String {
     line
 }
 
-fn md_index(v: &Value) -> String {
+// What one `index` answer may spend, in rendered lines. Every file the filter
+// selects is named, in path order; the ceiling only decides how many of them fit
+// in one page. Nothing is ever summarised away - a row always stands for exactly
+// one file, so a caller can act on what it says without having to ask whether
+// this row is a file or a directory standing in for forty of them.
+//
+// Counted in lines rather than bytes because that is the thing the caller is
+// actually rationing. Path length does not change the verdict: 900 files under
+// `cmd/` and 900 under `packages/api/src/main/java/com/acme/` are the same 900
+// lines to read past, whatever they cost to print.
+const INDEX_LINE_CEILING: usize = 1_000;
+
+// The page a caller gets without asking for one. Equal to the ceiling: paging is
+// a backstop for output past it, not the normal way to read an index.
+const INDEX_DEFAULT_ROWS: usize = INDEX_LINE_CEILING;
+
+// one page of rows, plus the line accounting for whatever sits outside it.
+// `structure` adds the two columns that describe a file's shape rather than its
+// contents; it is off for maps where every file would report zero for both,
+// since two dead columns on every row buy the caller nothing.
+fn md_index_rows(out: &mut String, rows: &[[String; 8]], page: &Page, structure: bool) {
+    let (window, note) = page.window(rows);
+    let (extra_head, extra_rule) = if structure {
+        (" mods | exp |", "---|---|")
+    } else {
+        ("", "")
+    };
+    out.push_str(&format!(
+        "| file | lang | funcs | consts | refs | notes |{extra_head}\n\
+         |---|---|---|---|---|---|{extra_rule}\n"
+    ));
+    for r in window {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |",
+            r[0], r[1], r[2], r[3], r[4], r[5]
+        ));
+        if structure {
+            out.push_str(&format!(" {} | {} |", r[6], r[7]));
+        }
+        out.push('\n');
+    }
+    if !note.is_empty() {
+        out.push_str(&note);
+    }
+}
+
+fn md_index(v: &Value, page: &Page) -> String {
     let t = v.get("totals").cloned().unwrap_or_default();
+    let files = jarr(v, "files");
+    // the totals line is always exact and always the whole filtered set, however
+    // many of its rows this page has room for
+    let structure = jnum(&t, "mods") > 0 || jnum(&t, "exports") > 0;
     let mut out = format!(
-        "# {} - {} files (generated {})\n{} funcs, {} consts, {} refs, {} notes\n\n\
-         | file | lang | funcs | consts | refs | notes |\n|---|---|---|---|---|---|\n",
+        "# {} - {} files (generated {})\n{} funcs, {} consts, {} refs, {} notes{}\n",
         jstr(v, "root"),
         jnum(&t, "files"),
         jstr(v, "generated"),
@@ -1033,16 +1769,81 @@ fn md_index(v: &Value) -> String {
         jnum(&t, "consts"),
         jnum(&t, "refs"),
         jnum(&t, "notes"),
+        if structure {
+            format!(
+                ", {} mods, {} re-exports",
+                jnum(&t, "mods"),
+                jnum(&t, "exports")
+            )
+        } else {
+            String::new()
+        },
     );
-    for f in jarr(v, "files") {
+    if let Some(f) = v.get("filter").and_then(|x| x.as_str()) {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
-            jstr(&f, "path"),
-            jstr(&f, "language"),
-            jnum(&f, "funcs"),
-            jnum(&f, "consts"),
-            jnum(&f, "refs"),
-            jnum(&f, "notes"),
+            "filtered to `{f}` - {} of {} mapped files\n",
+            files.len(),
+            jnum(v, "project_files"),
+        ));
+    }
+    out.push('\n');
+    if files.is_empty() {
+        out.push_str("no mapped files here\n");
+        let avail = jnames(v, "available");
+        if !avail.is_empty() {
+            out.push_str(&format!("the map holds: {avail}\n"));
+        }
+        return out;
+    }
+
+    let row = |f: &Value| {
+        [
+            jstr(f, "path"),
+            jstr(f, "language"),
+            jnum(f, "funcs").to_string(),
+            jnum(f, "consts").to_string(),
+            jnum(f, "refs").to_string(),
+            jnum(f, "notes").to_string(),
+            jnum(f, "mods").to_string(),
+            jnum(f, "exports").to_string(),
+        ]
+    };
+    // What the ceiling has left for rows. The header already in `out` is charged
+    // against it, as are the table's own two header lines and the count line
+    // below it - the limit is on the answer, not on the part of it that happens
+    // to be rows. When the listing will not fit, the two lines telling the caller
+    // how to narrow it come out of the same budget.
+    let spent = out.lines().count() + 3;
+    let fits = files.len() <= INDEX_LINE_CEILING.saturating_sub(spent);
+    let row_budget = INDEX_LINE_CEILING.saturating_sub(if fits { spent } else { spent + 2 });
+
+    // Listed in path order, one row per file, always. A row that stood for a
+    // whole directory would be cheaper, but it answers a question nobody asked:
+    // the caller wants to know where something lives, and a subtree summary can
+    // only tell them where to ask again. Path order is what makes `offset`
+    // worth paging through - it walks the project - and `path` is there for
+    // narrowing to the part that matters.
+    let capped = Page {
+        offset: page.offset,
+        limit: page.limit.min(row_budget.max(1)),
+    };
+    // sorted here rather than assumed: `offset` only means "carry on from where
+    // the last page stopped" if the order is a property of the answer, not of
+    // whatever order the map happened to be built in
+    let mut ordered: Vec<&Value> = files.iter().collect();
+    ordered.sort_by_key(|f| jstr(f, "path"));
+    let rows: Vec<[String; 8]> = ordered.into_iter().map(row).collect();
+    md_index_rows(&mut out, &rows, &capped, structure);
+    if !fits {
+        out.push_str(&format!(
+            "\nlisted in path order, one row per file, {} in total. Pass `path` \
+             (e.g. `{}`) to narrow to one subtree rather than paging the whole tree.\n",
+            files.len(),
+            files
+                .first()
+                .map(|f| jstr(f, "path"))
+                .and_then(|p| p.rsplit_once('/').map(|(dir, _)| dir.to_string()))
+                .unwrap_or_else(|| "src".into()),
         ));
     }
     out
@@ -1075,6 +1876,27 @@ fn md_dependencies(v: &Value) -> String {
         jarr(v, "edges").len(),
         edges("edges"),
     );
+    let external = jarr(v, "external");
+    if !external.is_empty() {
+        let by_manifest: BTreeSet<String> =
+            external.iter().map(|d| jstr(d, "manifest")).collect();
+        out.push_str(&format!(
+            "\n## declared dependencies ({}) - from {}\n",
+            external.len(),
+            by_manifest.into_iter().collect::<Vec<_>>().join(", "),
+        ));
+        for d in &external {
+            let version = match d.get("version").and_then(|x| x.as_str()) {
+                Some(v) => format!(" {v}"),
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                "{}{version} ({})\n",
+                jstr(d, "name"),
+                jstr(d, "kind")
+            ));
+        }
+    }
     let ambiguous = jnames(v, "ambiguous_symbols");
     if !ambiguous.is_empty() {
         out.push_str(&format!(
@@ -1107,6 +1929,61 @@ fn md_find(v: &Value) -> String {
     for r in &shown {
         out.push_str(&md_hit(r));
     }
+    out.push_str(&md_miss(v));
+    out
+}
+
+// What a zero-hit answer owes the caller: the kinds it covered, the nearest
+// names, and a next step. A bare "not found" reads as "stop" and cannot be told
+// apart from "this kind is not indexed".
+fn md_miss(v: &Value) -> String {
+    if !jbool(v, "miss") {
+        return String::new();
+    }
+    let suggestions = jarr(v, "suggestions");
+    let mut out = format!("\nsearched kinds: {}\n", jnames(v, "searched"));
+    // the verdict on the qualifier
+    if let Some(q) = v.get("qualifier").and_then(|x| x.as_str()) {
+        let sites = jnum(v, "qualifier_sites");
+        let declared = v.get("external_dependency").map(|dep| {
+            format!(
+                "declared as a dependency ({} in {})",
+                jstr(dep, "kind"),
+                jstr(dep, "manifest")
+            )
+        });
+        if sites > 0 {
+            out.push_str(&format!(
+                "`{q}` itself IS used: {sites} site(s) in the map ({}){}. \
+                 This symbol is not indexed under it - the module is in use, so do \
+                 not read this miss as the module being unused.\n",
+                jnames(v, "qualifier_examples"),
+                declared.map(|d| format!(", and {d}")).unwrap_or_default(),
+            ));
+        } else if let Some(d) = declared {
+            out.push_str(&format!(
+                "`{q}` is {d}, but no call, use or import site in the map names it. \
+                 A dependency declared and never referenced is worth checking by hand.\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "`{q}` is named by no site in the map and declared in no manifest. \
+                 Imports are indexed, so this is evidence of absence, not a gap in \
+                 coverage - safe to conclude the project does not use it.\n"
+            ));
+        }
+    }
+    if !suggestions.is_empty() {
+        let names: Vec<String> = suggestions
+            .iter()
+            .map(|s| format!("{} ({}, {})", jstr(s, "name"), jstr(s, "kind"), jstr(s, "file")))
+            .collect();
+        out.push_str(&format!("nearest indexed names: {}\n", names.join("; ")));
+    }
+    out.push_str(
+        "next: `dependencies` for file-level edges, or text search for string \
+         literals and config.\n",
+    );
     out
 }
 
@@ -1125,7 +2002,34 @@ fn md_references(v: &Value) -> String {
     );
     let hits = |key: &str| -> String { jarr(v, key).iter().map(md_hit).collect() };
     md_section(&mut out, "definitions", &hits("definitions"));
+    // printed before the references because it changes what they mean
+    let exported = jarr(v, "exported_as");
+    if !exported.is_empty() {
+        out.push_str(&format!(
+            "\n## published as\nreachable outside this crate under {} - \
+             renaming it is a breaking change.\n",
+            if exported.len() == 1 { "this path" } else { "these paths" },
+        ));
+        for e in &exported {
+            out.push_str(&format!(
+                "{} (from {}, at {})\n",
+                jstr(e, "path"),
+                jstr(e, "from"),
+                jstr(e, "at"),
+            ));
+        }
+    }
     md_section(&mut out, "references", &hits("references"));
+    let name_only = hits("name_only_matches");
+    if !name_only.is_empty() {
+        out.push_str(&format!(
+            "\n## definitions sharing the name only\n\
+             `{}` does not name any of these - not their file, not their owning \
+             type - so they are not this symbol.\n{name_only}",
+            jstr(v, "qualifier"),
+        ));
+    }
+    out.push_str(&md_miss(v));
     out
 }
 
@@ -1209,9 +2113,40 @@ fn md_file_structured(v: &Value) -> String {
         .iter()
         .map(|n| format!("{} {}\n", jnum(n, "line"), jstr(n, "text")))
         .collect();
+    let modules = jarr(v, "modules")
+        .iter()
+        .filter_map(|m| m.as_str().map(str::to_string))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let modules = if modules.is_empty() {
+        String::new()
+    } else {
+        format!("{modules}\n")
+    };
+    // re-exports first and marked: they are this file's public surface, where a
+    // plain `use` is only what it needed to do its own job
+    let imports: String = jarr(v, "imports")
+        .iter()
+        .map(|i| {
+            let names = jnames(i, "names");
+            format!(
+                "{} {}{}{}\n",
+                jnum(i, "line"),
+                if jbool(i, "reexport") { "pub " } else { "" },
+                jstr(i, "module"),
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({names})")
+                },
+            )
+        })
+        .collect();
+    md_section(&mut out, "modules declared", &modules);
     md_section(&mut out, "consts (line name: type)", &consts);
     md_section(&mut out, "funcs (line:col name -> ret)", &funcs);
     md_section(&mut out, "calls (line caller -> target:line)", &refs);
+    md_section(&mut out, "imports (line [pub] module (names))", &imports);
     md_section(&mut out, "notes (line text)", &notes);
     out
 }
@@ -1236,12 +2171,16 @@ impl Page {
         };
         Page {
             offset: n("offset", 0),
-            limit: n("limit", default_limit).clamp(1, 500),
+            limit: n("limit", default_limit).clamp(1, default_limit.max(500)),
         }
     }
 
     // the window, plus the line that accounts for everything outside it
     fn apply<'a>(&self, items: &'a [Value]) -> (&'a [Value], String) {
+        self.window(items)
+    }
+
+    fn window<'a, T>(&self, items: &'a [T]) -> (&'a [T], String) {
         let total = items.len();
         let start = self.offset.min(total);
         let end = (start + self.limit).min(total);
@@ -1808,7 +2747,10 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let out: Result<String, String> = match name {
-        "index" => Ok(md_index(&q_index(&map))),
+        "index" => Ok(md_index(
+            &q_index(&map, arg("path").as_deref()),
+            &Page::from(&args, INDEX_DEFAULT_ROWS),
+        )),
         "find" => q_find(
             &map,
             &arg("query").unwrap_or_default(),
@@ -2113,12 +3055,27 @@ fn frag_references(v: &Value) -> String {
             )
         })
         .collect();
+    // a miss carries its own next step, so the panel never dead-ends
+    let suggestions = jarr(v, "suggestions");
+    let hint = if suggestions.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = suggestions
+            .iter()
+            .map(|s| esc(&format!("{} ({})", jstr(s, "name"), jstr(s, "kind"))))
+            .collect();
+        format!(
+            r#"<p class="text-xs text-amber-400 mt-1">nearest indexed names: {}</p>"#,
+            names.join(", ")
+        )
+    };
     format!(
-        r#"<p class="text-xs text-slate-500 mb-1">{} definition(s), {} reference(s)</p><div class="max-h-64 overflow-y-auto">{}{}</div>"#,
+        r#"<p class="text-xs text-slate-500 mb-1">{} definition(s), {} reference(s)</p><div class="max-h-64 overflow-y-auto">{}{}</div>{}"#,
         defs.len(),
         v["counts"]["references"].as_u64().unwrap_or(0),
         def_rows,
-        ref_rows
+        ref_rows,
+        hint
     )
 }
 
@@ -2181,7 +3138,7 @@ fn frag_dependencies(v: &Value) -> String {
 }
 
 const ENDPOINTS: &[&str] = &[
-    "GET /index",
+    "GET /index[?path=<subtree>]",
     "GET /find?q=<substring>[&kind=func|const|note]",
     "GET /references?symbol=<name>",
     "GET /dependencies[?file=<path>]",
@@ -2202,7 +3159,7 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
     match (method, path.as_str()) {
         ("GET", "/") | ("GET", "/index") => {
             let map = state.read().expect("map lock poisoned");
-            ok(q_index(&map))
+            ok(q_index(&map, get("path")))
         }
         ("GET", "/health") => {
             let map = state.read().expect("map lock poisoned");
@@ -2229,9 +3186,11 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
                 return bad(400, "missing ?symbol=<name>");
             };
             let map = state.read().expect("map lock poisoned");
+            // a symbol that is genuinely absent is a 200 with zero hits and the
+            // guidance to go with it; 400 is reserved for a malformed request
             match q_references(&map, symbol) {
                 Ok(v) => ok(v),
-                Err(e) => bad(404, e),
+                Err(e) => bad(400, e),
             }
         }
         ("GET", "/dependencies") => {
@@ -2496,10 +3455,477 @@ mod tests {
         state
     }
 
+    // The shapes the fixture above has nothing to say about: imports, a name
+    // shared by two owners, type definitions, and a manifest.
+    fn fixture_imports() -> MapState {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ccc-serve-imports-{}-{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"shop\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\n\
+             serde = { version = \"1.0\", features = [\"derive\"] }\n\
+             globset = \"0.4\"\n\n\
+             [dependencies.tree-sitter]\n\
+             version = \"0.25\"\n\n\
+             [dev-dependencies]\n\
+             tempfile = \"3\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/store.rs"),
+            "use serde::Serialize;\n\
+             use globset::{Glob, GlobSet};\n\
+             pub struct Basket { pub id: u64 }\n\
+             impl Basket {\n    pub fn new(id: u64) -> Basket { Basket { id } }\n}\n\
+             pub fn matcher() -> u64 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/api.rs"),
+            "use crate::store::Basket;\n\
+             pub struct Cart { pub items: u64 }\n\
+             impl Cart {\n    pub fn new() -> Cart { Cart { items: 0 } }\n}\n\
+             pub fn open() -> u64 { 0 }\n",
+        )
+        .unwrap();
+        let state = MapState::build(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        state
+    }
+
+    // A crate root: the file that declares the module graph and publishes the
+    // API, and defines nothing itself.
+    fn fixture_crate() -> MapState {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ccc-serve-crate-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"shop\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/lib.rs"),
+            "//! shop\n\
+             pub mod store;\n\
+             pub mod api;\n\
+             pub use store::{checkout, Basket};\n\
+             pub use api::*;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/store.rs"),
+            "pub struct Basket { pub id: u64 }\n\
+             pub fn checkout(b: u64) -> u64 { b }\n\
+             pub fn tally(n: u64) -> u64 { n }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/api.rs"),
+            "use crate::store::Basket;\n\
+             pub fn open() -> u64 { 0 }\n",
+        )
+        .unwrap();
+        let state = MapState::build(&dir).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        state
+    }
+
+    #[test]
+    fn a_crate_root_does_not_report_as_an_empty_file() {
+        let map = fixture_crate();
+        let v = q_index(&map, None);
+        let root = v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == "src/lib.rs")
+            .expect("lib.rs is mapped");
+        // every count the index used to have reads zero here, and the file is
+        // the most structural one in the project
+        assert_eq!(root["funcs"], 0);
+        assert_eq!(root["consts"], 0);
+        assert_eq!(root["refs"], 0);
+        assert_eq!(root["mods"], 2);
+        // checkout + Basket, and the glob as the one name it is certain about
+        assert_eq!(root["exports"], 3);
+
+        let md = md_index(&v, &Page::from(&json!({}), INDEX_DEFAULT_ROWS));
+        assert!(md.contains("| mods | exp |"), "{md}");
+        assert!(md.contains("2 mods, 3 re-exports"), "{md}");
+    }
+
+    #[test]
+    fn the_structure_columns_stay_off_a_map_with_no_structure() {
+        // two zero columns on every row buy nothing; the fixture is a flat tree
+        // of plain files with no module declarations and no re-exports
+        let md = md_index(
+            &q_index(&fixture(), None),
+            &Page::from(&json!({}), INDEX_DEFAULT_ROWS),
+        );
+        assert!(!md.contains("mods"), "{md}");
+        assert!(md.contains("| file | lang | funcs | consts | refs | notes |"), "{md}");
+    }
+
+    #[test]
+    fn the_file_tool_shows_the_structure_a_module_root_is_made_of() {
+        let map = fixture_crate();
+        let v = q_file(&map, "src/lib.rs").unwrap();
+        assert_eq!(
+            v["modules"].as_array().unwrap(),
+            &vec![json!("store"), json!("api")]
+        );
+        let md = md_file_structured(&v);
+        assert!(md.contains("## modules declared\nstore, api"), "{md}");
+        // `pub` distinguishes the published surface from a working import
+        assert!(md.contains("pub store (checkout, Basket)"), "{md}");
+        assert!(md.contains("pub api"), "{md}");
+        // and the same file's entry in the on-disk cache says it too
+        let cached = jstr(&v, "markdown");
+        assert!(cached.contains("# modules\n    - store\n    - api\n"), "{cached}");
+        assert!(cached.contains("L4@pub store (checkout, Basket)"), "{cached}");
+
+        // a plain consumer is not marked
+        let api = md_file_structured(&q_file(&map, "src/api.rs").unwrap());
+        assert!(api.contains("1 crate::store (Basket)"), "{api}");
+        assert!(!api.contains("pub crate::store"), "{api}");
+    }
+
+    #[test]
+    fn a_facade_qualifier_resolves_through_the_re_export() {
+        let map = fixture_crate();
+        // `shop::checkout` is a real path to src/store.rs, but `shop` names
+        // neither that file nor an owning type - without following the re-export
+        // the definition is withheld as a name-only collision
+        let via_crate = q_references(&map, "shop::checkout").unwrap();
+        assert_eq!(via_crate["counts"]["definitions"], 1, "{via_crate:#}");
+        assert_eq!(via_crate["definitions"][0]["file"], "src/store.rs");
+        assert!(via_crate.get("name_only_matches").is_none());
+
+        // the fuller path a caller may equally write
+        let via_module = q_references(&map, "shop::store::checkout").unwrap();
+        assert_eq!(via_module["counts"]["definitions"], 1);
+        assert_eq!(via_module["definitions"][0]["file"], "src/store.rs");
+
+        // the module's own path still resolves, as it always did
+        assert_eq!(
+            q_references(&map, "store::checkout").unwrap()["counts"]["definitions"],
+            1
+        );
+
+        // a type published the same way
+        let basket = q_references(&map, "shop::Basket").unwrap();
+        assert_eq!(basket["counts"]["definitions"], 1);
+        assert_eq!(basket["definitions"][0]["kind"], "type");
+
+        // and a glob re-export carries the whole module with it
+        let globbed = q_references(&map, "shop::open").unwrap();
+        assert_eq!(globbed["counts"]["definitions"], 1, "{globbed:#}");
+        assert_eq!(globbed["definitions"][0]["file"], "src/api.rs");
+    }
+
+    #[test]
+    fn a_published_symbol_says_so_however_the_lookup_was_spelled() {
+        let map = fixture_crate();
+        let v = q_references(&map, "checkout").unwrap();
+        let exported = v["exported_as"].as_array().expect("published");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0]["path"], "shop::checkout");
+        assert_eq!(exported[0]["from"], "store");
+        assert_eq!(exported[0]["at"], "src/lib.rs:4");
+        assert!(
+            md_references(&v).contains("shop::checkout (from store, at src/lib.rs:4)"),
+            "{}",
+            md_references(&v)
+        );
+
+        // the re-export is a route to the symbol, not a use of it
+        let kinds: Vec<&str> = v["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"reexport"), "{kinds:?}");
+
+        // `tally` lives in the same re-exported module but is not named by the
+        // re-export, so it is not published and must not claim to be
+        let private = q_references(&map, "tally").unwrap();
+        assert_eq!(private["counts"]["definitions"], 1);
+        assert!(private.get("exported_as").is_none(), "{private:#}");
+        // and a facade path that was never published does not resolve
+        let bogus = q_references(&map, "shop::tally").unwrap();
+        assert_eq!(bogus["counts"]["definitions"], 0);
+        assert!(bogus["name_only_matches"].as_array().is_some(), "{bogus:#}");
+    }
+
+    #[test]
+    fn type_definitions_are_findable() {
+        let map = fixture_imports();
+        // a struct used only through its type used to be invisible: extracted
+        // into FileCache::types, never searched
+        let found = q_find(&map, "Basket", "type").unwrap();
+        assert_eq!(found["count"], 1);
+        assert_eq!(found["results"][0]["kind"], "type");
+        assert_eq!(found["results"][0]["file"], "src/store.rs");
+        assert_eq!(found["results"][0]["type"], "struct");
+        // and it resolves as a definition, with its import as a reference
+        let refs = q_references(&map, "Basket").unwrap();
+        assert_eq!(refs["counts"]["definitions"], 1);
+        assert_eq!(refs["definitions"][0]["kind"], "type");
+        let import_refs: Vec<_> = refs["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "import")
+            .collect();
+        assert_eq!(import_refs.len(), 1);
+        assert_eq!(import_refs[0]["file"], "src/api.rs");
+        // enums count too, from the other fixture
+        let modes = q_find(&fixture(), "Mode", "type").unwrap();
+        assert_eq!(modes["count"], 1);
+        assert_eq!(modes["results"][0]["type"], "enum");
+    }
+
+    #[test]
+    fn imports_are_the_only_trace_a_derive_leaves() {
+        let map = fixture_imports();
+        // `use serde::Serialize` never calls anything - the import is the only
+        // evidence, and without it a miss could not be told from a coverage gap
+        let refs = q_references(&map, "serde::Serialize").unwrap();
+        assert_eq!(refs["counts"]["references"], 1);
+        assert_eq!(refs["references"][0]["kind"], "import");
+        assert_eq!(refs["references"][0]["file"], "src/store.rs");
+        assert_eq!(refs["references"][0]["module"], "serde");
+        // a braced import binds each name separately
+        assert_eq!(
+            q_references(&map, "globset::GlobSet").unwrap()["counts"]["references"],
+            1
+        );
+        // and the bare name finds it without the qualifier
+        let bare = q_find(&map, "GlobSet", "any").unwrap();
+        assert!(bare["count"].as_u64().unwrap() >= 1);
+        assert!(bare["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "import"));
+        // a wrong qualifier still answers zero rather than erroring
+        let wrong = q_references(&map, "notacrate::Serialize").unwrap();
+        assert_eq!(wrong["counts"]["references"], 0);
+        assert_eq!(wrong["miss"], true);
+    }
+
+    #[test]
+    fn a_qualifier_narrows_definitions_by_owning_type() {
+        let map = fixture_imports();
+        // two `new`s, one per struct: the qualifier picks the right one
+        for (symbol, file) in [("Basket::new", "src/store.rs"), ("Cart::new", "src/api.rs")] {
+            let refs = q_references(&map, symbol).unwrap();
+            assert_eq!(refs["counts"]["definitions"], 1, "{symbol}");
+            assert_eq!(refs["definitions"][0]["file"], file, "{symbol}");
+            assert!(refs["name_only_matches"].is_null(), "{symbol}");
+        }
+        // an unrelated qualifier resolves to neither. This is the `Regex::new`
+        // case: it used to report whichever project `new` came first.
+        let outside = q_references(&map, "Regex::new").unwrap();
+        assert_eq!(outside["counts"]["definitions"], 0);
+        assert_eq!(outside["name_only_matches"].as_array().unwrap().len(), 2);
+        let md = md_references(&outside);
+        assert!(md.contains("sharing the name only"));
+        assert!(md.contains("owner=Basket"));
+        // an unqualified lookup is unchanged: every same-named definition
+        let bare = q_references(&map, "new").unwrap();
+        assert_eq!(bare["counts"]["definitions"], 2);
+    }
+
+    #[test]
+    fn a_trailing_separator_lists_a_whole_qualifier() {
+        let map = fixture_imports();
+        // `serde::` names a qualifier with no symbol after it
+        let all = q_find(&map, "serde::", "any").unwrap();
+        assert_eq!(all["count"], 1);
+        assert_eq!(all["results"][0]["kind"], "import");
+        assert_eq!(all["results"][0]["module"], "serde");
+        // the dot form behaves the same, and a qualifier-only query matches by
+        // prefix: `money::Mode::Fast` is under `money`, though `money` is not
+        // the tail of its qualifier and a named lookup would not match it
+        assert_eq!(q_find(&fixture(), "money.", "any").unwrap()["count"], 3);
+        assert_eq!(q_find(&fixture(), "money::MAX", "any").unwrap()["count"], 1);
+        // a separator with nothing in front names nothing
+        assert!(q_find(&map, "::", "any").is_err());
+    }
+
+    #[test]
+    fn a_miss_reports_its_coverage_and_the_nearest_names() {
+        let map = fixture_imports();
+        let miss = q_references(&map, "Baskett").unwrap();
+        assert_eq!(miss["miss"], true);
+        // the kinds it covered, so zero cannot be misread as "not indexed"
+        let searched: Vec<&str> = miss["searched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        assert!(searched.contains(&"type") && searched.contains(&"import"));
+        // one typo away from a real name, and the type definition is among the
+        // suggestions rather than only the import that binds it
+        assert_eq!(miss["suggestions"][0]["name"], "Basket");
+        assert!(miss["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "Basket" && s["kind"] == "type"));
+        let md = md_references(&miss);
+        assert!(md.contains("searched kinds:"));
+        assert!(md.contains("nearest indexed names: Basket"));
+        // nothing remotely close: still an answer, just without guesses
+        let far = q_references(&map, "zzzzzzzzzz").unwrap();
+        assert!(far["suggestions"].as_array().unwrap().is_empty());
+        assert!(md_references(&far).contains("searched kinds:"));
+    }
+
+    #[test]
+    fn a_miss_says_whether_the_qualifier_itself_is_used() {
+        let map = fixture_imports();
+        // covers case where `serde::Deserializer` absent, but `serde`
+        // is imported two lines away
+        let wrong_symbol = q_references(&map, "serde::Deserializer").unwrap();
+        assert_eq!(wrong_symbol["miss"], true);
+        assert_eq!(wrong_symbol["qualifier_sites"], 1);
+        assert_eq!(wrong_symbol["declared"], true);
+        assert_eq!(wrong_symbol["external_dependency"]["name"], "serde");
+        let md = md_references(&wrong_symbol);
+        assert!(md.contains("`serde` itself IS used"));
+        assert!(md.contains("src/store.rs:1"));
+        assert!(md.contains("do not read this miss as the module being unused"));
+
+        // nothing names it and no manifest declares it: the negative is now
+        // safe to act on, and says so.
+        let truly_absent = q_references(&map, "tokio::spawn").unwrap();
+        assert_eq!(truly_absent["qualifier_sites"], 0);
+        assert_eq!(truly_absent["declared"], false);
+        assert!(truly_absent["external_dependency"].is_null());
+        assert!(md_references(&truly_absent).contains("evidence of absence"));
+
+        // declared but never referenced anywhere - worth a human look.
+        let unused = q_references(&map, "tempfile::TempDir").unwrap();
+        assert_eq!(unused["qualifier_sites"], 0);
+        assert_eq!(unused["declared"], true);
+        assert!(md_references(&unused).contains("declared and never referenced"));
+
+        // `find` carries the same verdict
+        let found = q_find(&map, "serde::Deserializer", "any").unwrap();
+        assert_eq!(found["count"], 0);
+        assert_eq!(found["qualifier_sites"], 1);
+        assert!(md_find(&found).contains("`serde` itself IS used"));
+    }
+
+    #[test]
+    fn declared_dependencies_come_from_the_manifests() {
+        let map = fixture_imports();
+        let deps = q_dependencies(&map, None).unwrap();
+        let named = |name: &str| -> Option<Value> {
+            deps["external"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == name)
+                .cloned()
+        };
+        assert_eq!(named("globset").unwrap()["version"], "0.4");
+        // an inline table yields its version, not its feature list
+        assert_eq!(named("serde").unwrap()["version"], "1.0");
+        // `[dependencies.tree-sitter]` is a dependency declared as a section
+        assert_eq!(named("tree-sitter").unwrap()["kind"], "dependencies");
+        assert_eq!(named("tempfile").unwrap()["kind"], "dev-dependencies");
+        assert!(md_dependencies(&deps).contains("declared dependencies"));
+        // hyphenated crates are written underscored in code
+        assert_eq!(map.external_named("tree_sitter").unwrap().name, "tree-sitter");
+    }
+
+    #[test]
+    fn manifest_parsing_covers_the_other_ecosystems() {
+        let dir = std::env::temp_dir().join(format!("ccc-manifests-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            "{\n  \"name\": \"web\",\n  \"dependencies\": { \"react\": \"^18.0.0\" },\n  \
+             \"devDependencies\": { \"vitest\": \"1.2.0\" }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("go.mod"),
+            "module example.com/x\n\ngo 1.22\n\nrequire (\n\tgithub.com/pkg/errors v0.9.1\n)\n\
+             require golang.org/x/sync v0.7.0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("requirements.txt"),
+            "# comment\nrequests==2.31.0\nflask>=3\n-e .\n",
+        )
+        .unwrap();
+        let deps = manifest_deps(&dir);
+        let find = |n: &str| deps.iter().find(|d| d.name == n);
+        assert_eq!(find("react").unwrap().kind, "dependencies");
+        assert_eq!(find("vitest").unwrap().kind, "devDependencies");
+        assert_eq!(
+            find("github.com/pkg/errors").unwrap().version.as_deref(),
+            Some("v0.9.1")
+        );
+        assert!(find("golang.org/x/sync").is_some());
+        assert_eq!(find("requests").unwrap().version.as_deref(), Some("==2.31.0"));
+        assert!(find("flask").is_some());
+        // editable installs name no distribution
+        assert!(!deps.iter().any(|d| d.name.starts_with('-')));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suggestions_never_guess_wildly() {
+        assert_eq!(name_distance("charge", "charge"), Some(0));
+        assert!(name_distance("charge", "recharge") < name_distance("charge", "charhe"));
+        assert!(name_distance("charge", "charge_all") < name_distance("charge", "charge_all_now"));
+        // far enough apart is no suggestion at all, not a bad one
+        assert_eq!(name_distance("charge", "zzzzzz"), None);
+        assert_eq!(edit_distance("abc", "abcdefgh", 2), None);
+        assert_eq!(edit_distance("kitten", "sitting", 3), Some(3));
+    }
+
+    #[test]
+    fn find_kinds_are_validated_and_reported() {
+        let map = fixture_imports();
+        assert!(q_find(&map, "Basket", "bogus").is_err());
+        // every answer says what it looked at
+        let f = q_find(&map, "Basket", "any").unwrap();
+        let searched: Vec<&str> = f["searched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        assert!(searched.contains(&"type") && searched.contains(&"import"));
+        // a miss carries suggestions and the coverage note into the markdown
+        let miss = q_find(&map, "Baskett", "any").unwrap();
+        assert_eq!(miss["count"], 0);
+        assert!(md_find(&miss).contains("nearest indexed names: Basket"));
+    }
+
     #[test]
     fn index_and_find() {
         let map = fixture();
-        let idx = q_index(&map);
+        let idx = q_index(&map, None);
         assert_eq!(idx["totals"]["files"], 2);
         let found = q_find(&map, "char", "any").unwrap();
         assert_eq!(found["count"], 1);
@@ -2508,6 +3934,176 @@ mod tests {
         let none = q_find(&map, "charge", "const").unwrap();
         assert_eq!(none["count"], 0);
         assert!(q_find(&map, "  ", "any").is_err());
+    }
+
+    // `index` as a caller gets it with no paging arguments
+    fn idx_md(v: &Value) -> String {
+        md_index(v, &Page::from(&json!({}), INDEX_DEFAULT_ROWS))
+    }
+
+    #[test]
+    fn index_narrows_to_a_subtree_and_says_so() {
+        let map = fixture();
+        let idx = q_index(&map, Some("api"));
+        assert_eq!(idx["totals"]["files"], 1);
+        assert_eq!(idx["files"][0]["path"], "api/main.rs");
+        assert_eq!(idx["project_files"], 2);
+        let md = idx_md(&idx);
+        assert!(md.contains("filtered to `api` - 1 of 2 mapped files"));
+        // a prefix must not match a sibling that merely starts the same way
+        assert_eq!(q_index(&map, Some("ap"))["totals"]["files"], 0);
+        // leading ./ and stray slashes are the same request
+        assert_eq!(q_index(&map, Some("./api/"))["totals"]["files"], 1);
+        assert_eq!(q_index(&map, Some("  "))["totals"]["files"], 2);
+    }
+
+    #[test]
+    fn an_index_filter_that_matches_nothing_reports_what_the_map_holds() {
+        let map = fixture();
+        let md = idx_md(&q_index(&map, Some("services/billing")));
+        assert!(md.contains("no mapped files here"));
+        assert!(md.contains("api/"), "{md}");
+        assert!(md.contains("lib/"), "{md}");
+    }
+
+    // a project of `n` files spread over a splittable tree
+    fn tree_index(n: usize, dir: &str) -> Value {
+        let files: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "path": format!("{dir}/svc{}/mod{}/f{i}.rs", i % 12, i % 60),
+                    "language": "rust",
+                    "funcs": 2, "consts": 1, "refs": 3, "notes": 0,
+                })
+            })
+            .collect();
+        json!({
+            "root": "big", "generated": "now", "project_files": n,
+            "totals": {"files": n, "funcs": 2 * n, "consts": n, "refs": 3 * n, "notes": 0},
+            "files": files,
+        })
+    }
+
+    #[test]
+    fn a_project_under_the_ceiling_is_listed_whole() {
+        // 900 files is a real project and comfortably inside the ceiling
+        let md = idx_md(&tree_index(900, "src"));
+        assert!(!md.contains("showing "), "{md}");
+        let rows = md.lines().filter(|l| l.starts_with("| src/")).count();
+        assert_eq!(rows, 900, "{}", &md[..400.min(md.len())]);
+        assert!(md.contains("(900 total)"), "{md}");
+        assert!(md.contains("| src/svc0/mod0/f0.rs |"), "{md}");
+    }
+
+    #[test]
+    fn a_large_index_pages_and_never_summarises_a_directory() {
+        let md = idx_md(&tree_index(3_000, "src"));
+        // every row is one file
+        assert!(!md.contains("rolled up"), "{}", &md[..400]);
+        assert!(!md.contains(" files)"), "no row stands for a subtree");
+        for l in md.lines().filter(|l| l.starts_with("| src/")) {
+            assert!(l.contains(".rs |"), "not a file row: {l}");
+        }
+        // the headline totals stay exact whatever the page shows
+        assert!(md.contains("3000 files"));
+        assert!(md.contains("6000 funcs, 3000 consts, 9000 refs, 0 notes"));
+        assert!(md.contains("showing 1-"), "{}", &md[..400]);
+        assert!(md.contains("pass offset="), "{}", &md[..400]);
+        assert!(md.contains("Pass `path`"), "narrowing is still offered");
+        assert!(md.lines().count() <= INDEX_LINE_CEILING);
+    }
+
+    #[test]
+    fn paths_are_listed_in_order_so_offset_walks_the_project() {
+        let v = tree_index(3_000, "src");
+        let rows = |md: &str| -> Vec<String> {
+            md.lines()
+                .filter(|l| l.contains(".rs |"))
+                .map(str::to_string)
+                .collect()
+        };
+        let first = rows(&idx_md(&v));
+        let shown = first.len();
+        let second = rows(&md_index(
+            &v,
+            &Page::from(&json!({"offset": shown}), INDEX_DEFAULT_ROWS),
+        ));
+        let sorted = |rs: &[String]| {
+            let mut s = rs.to_vec();
+            s.sort();
+            s
+        };
+        assert_eq!(sorted(&first), first, "page one is in path order");
+        assert_eq!(sorted(&second), second, "so is page two");
+        // and page two picks up exactly where page one stopped
+        assert!(first.last() < second.first(), "pages are contiguous");
+    }
+
+    #[test]
+    fn the_ceiling_counts_lines_so_path_shape_does_not_decide() {
+        let shallow = idx_md(&tree_index(900, "cmd"));
+        let deep = idx_md(&tree_index(900, "packages/api/src/main/java/com/acme"));
+        for md in [&shallow, &deep] {
+            // 900 files plus the table's own header row
+            assert_eq!(md.lines().filter(|l| l.starts_with("| ")).count(), 901);
+        }
+        assert!(deep.len() > shallow.len() * 3 / 2, "the deep one is far wider in bytes");
+
+        // and every answer honours the ceiling, whatever its shape
+        for n in [10, 900, 3_000] {
+            for dir in ["cmd", "packages/api/src/main/java/com/acme"] {
+                let md = idx_md(&tree_index(n, dir));
+                assert!(
+                    md.lines().count() <= INDEX_LINE_CEILING,
+                    "{n} files under {dir}: {} lines",
+                    md.lines().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn index_pages_only_once_the_output_runs_past_the_ceiling() {
+        // a flat tree of 3000 files: nothing to roll up, so paging is the only
+        // thing left to bound the answer with
+        let files: Vec<Value> = (0..3_000)
+            .map(|i| {
+                json!({
+                    "path": format!("f{i:04}.rs"), "language": "rust",
+                    "funcs": 1, "consts": 0, "refs": 3_000 - i, "notes": 0,
+                })
+            })
+            .collect();
+        let v = json!({
+            "root": "flat", "generated": "now", "project_files": 3_000,
+            "totals": {"files": 3_000, "funcs": 3_000, "consts": 0, "refs": 1, "notes": 0},
+            "files": files,
+        });
+        let rows = |md: &str| -> Vec<String> {
+            md.lines()
+                .filter(|l| l.contains(".rs |"))
+                .map(str::to_string)
+                .collect()
+        };
+        let first = md_index(&v, &Page::from(&json!({}), INDEX_DEFAULT_ROWS));
+        assert!(first.lines().count() <= INDEX_LINE_CEILING, "{}", first.lines().count());
+        let shown = rows(&first).len();
+        // the page fills the ceiling rather than a fixed dozen rows
+        assert!(shown > INDEX_LINE_CEILING - 20, "only {shown} rows");
+        assert!(first.contains(&format!("showing 1-{shown} of 3000")), "{}", &first[..300]);
+
+        // and the rest is reachable, disjoint from the first page
+        let second = md_index(
+            &v,
+            &Page::from(&json!({"offset": shown}), INDEX_DEFAULT_ROWS),
+        );
+        let (a, b) = (rows(&first), rows(&second));
+        assert!(a.iter().all(|r| !b.contains(r)), "pages overlap");
+        assert!(second.contains(&format!("showing {}-", shown + 1)), "{}", &second[..300]);
+
+        // a caller wanting less still gets less
+        let small = md_index(&v, &Page::from(&json!({"limit": 20}), INDEX_DEFAULT_ROWS));
+        assert_eq!(rows(&small).len(), 20);
     }
 
     #[test]
@@ -2539,7 +4135,15 @@ mod tests {
         assert_eq!(refs["counts"]["references"], 1);
         assert_eq!(refs["references"][0]["file"], "api/main.rs");
         assert_eq!(refs["references"][0]["qualifier"], "money");
-        assert!(q_references(&map, "nowhere").is_err());
+        // a genuine absence is an answer: zero hits, the kinds covered, and the
+        // nearest names - not an error that reads as "stop looking"
+        let miss = q_references(&map, "nowhere").unwrap();
+        assert_eq!(miss["counts"]["definitions"], 0);
+        assert_eq!(miss["counts"]["references"], 0);
+        assert!(miss["searched"].as_array().unwrap().contains(&json!("import")));
+        assert!(miss["suggestions"].as_array().is_some());
+        // only a malformed request is still an error
+        assert!(q_references(&map, "  ").is_err());
     }
 
     #[test]
@@ -2551,11 +4155,15 @@ mod tests {
         assert_eq!(refs["counts"]["definitions"], 1);
         assert_eq!(refs["counts"]["references"], 1);
         assert_eq!(refs["definitions"][0]["file"], "lib/money.rs");
-        // qualifier that names no file: call sites filter to zero, but the
-        // bare-name definitions are still reported
+        // A qualifier that names neither a file nor an owning type does not
+        // resolve to the bare-name definition: `bogus::charge` is not this
+        // `charge`. It is reported apart, as the name collision it is.
         let miss = q_references(&map, "bogus::charge").unwrap();
         assert_eq!(miss["counts"]["references"], 0);
-        assert_eq!(miss["counts"]["definitions"], 1);
+        assert_eq!(miss["counts"]["definitions"], 0);
+        assert_eq!(miss["name_only_matches"].as_array().unwrap().len(), 1);
+        assert_eq!(miss["name_only_matches"][0]["file"], "lib/money.rs");
+        assert!(md_references(&miss).contains("sharing the name only"));
         // dot-form qualifier works the same as colons
         assert_eq!(
             q_references(&map, "money.charge").unwrap()["counts"]["references"],
@@ -2636,7 +4244,7 @@ mod tests {
 
         // markdown renders the same facts for a fraction of the JSON cost (the
         // table header is fixed overhead, so the margin widens with file count)
-        let as_json = serde_json::to_string_pretty(&q_index(&fixture())).unwrap();
+        let as_json = serde_json::to_string_pretty(&q_index(&fixture(), None)).unwrap();
         assert!(
             idx.len() * 3 < as_json.len() * 2,
             "markdown {} vs json {}",
@@ -2832,6 +4440,24 @@ mod tests {
     }
 
     #[test]
+    fn the_instructions_cover_search_editing_and_every_tool() {
+        let text = mcp_initialize(&json!({}))["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // the two rules a caller has to get right
+        assert!(text.contains("SEARCHING - always start here"), "{text}");
+        assert!(text.contains("EDITING - do not work from the map"), "{text}");
+        for t in mcp_tools()["tools"].as_array().unwrap() {
+            let name = t["name"].as_str().unwrap();
+            assert!(
+                text.contains(&format!("`{name}`")),
+                "instructions never mention `{name}`"
+            );
+        }
+    }
+
+    #[test]
     fn mcp_lifecycle_and_tools() {
         let state = RwLock::new(fixture());
         assert!(mcp_handle(
@@ -2857,15 +4483,13 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                // the code map
-                "index",
+                "index", // the map
                 "find",
                 "references",
                 "dependencies",
                 "file",
                 "notes",
                 "refresh",
-                // views onto the one analysis pass
                 "changes",
                 "test_triggers",
                 "test_targets",
@@ -2886,14 +4510,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("lib/money.rs"));
-        // soft error: unknown symbol is isError, not a protocol error
+        // an unknown symbol is a successful answer with zero hits and the
+        // guidance to carry on; isError is for malformed input only
         let miss = mcp_handle(
             &state,
             &json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                     "params": {"name": "references", "arguments": {"symbol": "ghost"}}}),
         )
         .unwrap();
-        assert_eq!(miss["result"]["isError"], true);
+        assert_eq!(miss["result"]["isError"], false);
+        let text = miss["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("0 definition(s), 0 reference(s)"));
+        assert!(text.contains("searched kinds:"));
+        let bad_args = mcp_handle(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                    "params": {"name": "references", "arguments": {"symbol": "  "}}}),
+        )
+        .unwrap();
+        assert_eq!(bad_args["result"]["isError"], true);
         // unknown method -> -32601
         let nope = mcp_handle(
             &state,
@@ -2942,7 +4577,12 @@ mod tests {
         assert_eq!(r.status, 200);
         assert_eq!(json_of(&r)["count"], 1);
         assert_eq!(route(&state, "GET", "/find", b"").status, 400);
-        assert_eq!(route(&state, "GET", "/references?symbol=ghost", b"").status, 404);
+        // absent symbol: 200 with zero hits, not 404 - the map has an answer
+        let ghost = route(&state, "GET", "/references?symbol=ghost", b"");
+        assert_eq!(ghost.status, 200);
+        assert_eq!(json_of(&ghost)["counts"]["references"], 0);
+        // a malformed request is still a 400
+        assert_eq!(route(&state, "GET", "/references?symbol=", b"").status, 400);
         assert_eq!(route(&state, "GET", "/nope", b"").status, 404);
         assert_eq!(route(&state, "GET", "/mcp", b"").status, 405);
         // MCP notification over HTTP -> 202
@@ -3090,10 +4730,15 @@ mod tests {
         let html = html_of(&hit);
         assert!(html.contains("lib/money.rs"));
         assert!(html.contains("match(es)"));
-        // soft errors are 200 with inline styling, so HTMX always swaps
+        // a miss is 200 with zero counts and its nearest-name hint inline, so
+        // HTMX always swaps and the panel never dead-ends
         let miss = route(&state, "GET", "/fragment/references?symbol=ghost", b"");
         assert_eq!(miss.status, 200);
-        assert!(html_of(&miss).contains("not found"));
+        assert!(html_of(&miss).contains("0 definition(s), 0 reference(s)"));
+        // malformed input is still the inline error styling
+        let bad_req = route(&state, "GET", "/fragment/references?symbol=", b"");
+        assert_eq!(bad_req.status, 200);
+        assert!(html_of(&bad_req).contains("empty symbol"));
         // dependencies: whole graph and per-file
         let graph = route(&state, "GET", "/fragment/dependencies", b"");
         assert!(html_of(&graph).contains("edge(s)"));

@@ -121,6 +121,7 @@ pub struct Import {
     pub line: usize,
     pub module: String,
     pub names: Vec<String>,
+    pub reexport: bool,
 }
 
 // everything extracted from a single source file.
@@ -153,16 +154,29 @@ impl FileCache {
             consts: self.consts.len(),
             refs: self.refs.len(),
             notes: self.notes.len(),
+            mods: self.modules.len(),
+            reexports: self
+                .imports
+                .iter()
+                .filter(|i| i.reexport)
+                .map(|i| i.names.len().max(1))
+                .sum(),
         }
     }
 }
 
+// The per-file tally the index reports
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counts {
     pub funcs: usize,
     pub consts: usize,
     pub refs: usize,
     pub notes: usize,
+    // submodules/namespaces this file declares (Rust `mod x;`, a Go package
+    // clause, a TS `namespace`)
+    pub mods: usize,
+    // bindings this file re-exports rather than consumes (Rust `pub use`)
+    pub reexports: usize,
 }
 
 impl Counts {
@@ -171,5 +185,7 @@ impl Counts {
         self.consts += other.consts;
         self.refs += other.refs;
         self.notes += other.notes;
+        self.mods += other.mods;
+        self.reexports += other.reexports;
     }
 }

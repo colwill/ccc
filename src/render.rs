@@ -16,6 +16,26 @@ pub fn render_file(fc: &FileCache, ts: &str) -> String {
     let _ = writeln!(out, "# {} ({}) UTC", fc.display_name, ts);
     let _ = writeln!(out, "# source: {} [{}]", fc.rel_path.display(), fc.language.as_str());
 
+    // structure before contents: a module root declares the graph its siblings
+    // hang off, and used to render as four empty sections
+    let _ = writeln!(out, "# modules");
+    for m in &fc.modules {
+        let _ = writeln!(out, "    - {m}");
+    }
+
+    let _ = writeln!(out, "# imports");
+    for i in &fc.imports {
+        let names = if i.names.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", i.names.join(", "))
+        };
+        // `pub` marks a re-export - the file is a route to those names, not just
+        // a consumer of them
+        let vis = if i.reexport { "pub " } else { "" };
+        let _ = writeln!(out, "    - L{}@{}{}{}", i.line, vis, i.module, names);
+    }
+
     let _ = writeln!(out, "# const");
     for c in &fc.consts {
         match &c.ty {
@@ -84,9 +104,12 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     let _ = writeln!(out, "ContextCodeCache - agent guide");
     let _ = writeln!(out);
     let _ = writeln!(out, "what:  a GENERATED map of this project's source. Each source file has a");
-    let _ = writeln!(out, "        `<module>-<file>.<ext>.md` entry listing its constants, functions");
+    let _ = writeln!(out, "        `<module>-<file>.<ext>.md` entry listing the submodules it declares,");
+    let _ = writeln!(out, "        its imports (`pub` marks a re-export), its constants, functions");
     let _ = writeln!(out, "        (L<line>:<col>@name:return), intra-file call graph (refs), and");
-    let _ = writeln!(out, "        marker notes (TODO/FIXME/...). See the `# files` list below.");
+    let _ = writeln!(out, "        marker notes (TODO/FIXME/...). See the `# files` list below -");
+    let _ = writeln!(out, "        counts read Nf/Nc/Nr/Nn, plus Nm modules and Nx re-exports when a");
+    let _ = writeln!(out, "        file has them. A module root defines nothing and is not empty.");
     let _ = writeln!(out, "why:   lets agents orient in the codebase cheaply - skim `.ccc` first to");
     let _ = writeln!(out, "        find where things live, then open the real source for detail.");
     let _ = writeln!(out, "        `tokens.bin`/`tokens.json`, if present, hold this content pre-encoded");
@@ -108,27 +131,38 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     let _ = writeln!(out, "### project: {}", root_label);
     let _ = writeln!(
         out,
-        "### totals: {} files, {} funcs, {} consts, {} refs, {} notes",
+        "### totals: {} files, {} funcs, {} consts, {} refs, {} notes, {} mods, {} re-exports",
         caches.len(),
         totals.funcs,
         totals.consts,
         totals.refs,
-        totals.notes
+        totals.notes,
+        totals.mods,
+        totals.reexports
     );
     let _ = writeln!(out, "### regenerate: `ccc scan`");
     let _ = writeln!(out, "### files");
     for c in caches {
         let n = c.counts();
+        // `m`/`x` are only printed when non-zero: they matter on the handful of
+        // files that are structure, and would be noise on every other row
+        let structure = match (n.mods, n.reexports) {
+            (0, 0) => String::new(),
+            (m, 0) => format!("/{m}m"),
+            (0, x) => format!("/{x}x"),
+            (m, x) => format!("/{m}m/{x}x"),
+        };
         let _ = writeln!(
             out,
-            "    - [{}]({}) [{}] {}f/{}c/{}r/{}n",
+            "    - [{}]({}) [{}] {}f/{}c/{}r/{}n{}",
             c.rel_path.display(),
             c.cache_name,
             c.language.as_str(),
             n.funcs,
             n.consts,
             n.refs,
-            n.notes
+            n.notes,
+            structure
         );
     }
 

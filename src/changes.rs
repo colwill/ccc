@@ -18,9 +18,7 @@ use std::process::Command;
 pub const SCHEMA: &str = "ccc-changes/1";
 // service map config, under `.ccc/`
 pub const CONFIG_NAME: &str = "map.json";
-// Names this file has had, still honoured on load, never written. Silently
-// falling back to directory-derived services would rename every service in the
-// report and quietly change what CI tests, so an old name keeps working.
+// prior config map names
 pub const LEGACY_CONFIG_NAMES: &[&str] = &["surf.json"];
 const MAX_EDGE_SYMBOLS: usize = 100;
 // `tested_by` is evidence, not an exhaustive index - a helper called by
@@ -36,7 +34,7 @@ pub struct ChangesOptions {
     pub service_flags: Vec<(String, String)>,
     // Diff the base against the *working tree* rather than HEAD, so
     // uncommitted edits and untracked files count as changes. CI wants the
-    // committed view (the default); an engineer at a keyboard wants this one.
+    // committed view (the default); an engineer wants this one.
     pub worktree: bool,
 }
 
@@ -441,6 +439,7 @@ struct Indexes {
     project_services: BTreeMap<String, BTreeSet<String>>,
     // file -> imported name -> services that name was imported from
     imports: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    wildcard_imports: BTreeMap<String, BTreeSet<String>>,
     calls: Vec<OwnedCall>,
     type_refs: Vec<TypeRef>,
     // callee name -> the named test functions calling it. A present key with an
@@ -464,6 +463,7 @@ fn build_indexes(
         calls: Vec::new(),
         type_refs: Vec::new(),
         test_callers: BTreeMap::new(),
+        wildcard_imports: BTreeMap::new(),
     };
 
     // pass 1: definitions, types and module identities
@@ -513,6 +513,7 @@ fn build_indexes(
         let typed = cache.language.is_typed();
 
         // which services each imported name could have come from
+        let mut wildcard: BTreeSet<String> = BTreeSet::new();
         let bound = idx.imports.entry(rel.clone()).or_default();
         for imp in &cache.imports {
             let mut from: BTreeSet<String> = BTreeSet::new();
@@ -535,9 +536,16 @@ fn build_indexes(
             if from.is_empty() {
                 continue;
             }
+            if imp.names.is_empty() {
+                wildcard.extend(from.iter().cloned());
+            }
             for n in &imp.names {
                 bound.entry(n.clone()).or_default().extend(from.iter().cloned());
             }
+        }
+
+        if !wildcard.is_empty() {
+            idx.wildcard_imports.entry(rel.clone()).or_default().extend(wildcard);
         }
 
         for c in &cache.calls {
@@ -742,7 +750,7 @@ fn resolve_call(call: &OwnedCall, idx: &Indexes) -> Result<(String, Via), (Strin
         set.iter().filter(|s| **s != call.service).cloned().collect()
     };
 
-    // 1. the receiver's declared type addresses the method exactly
+    // the receiver's declared type addresses the method exactly
     if let Some(ty) = &call.recv_type {
         if let Some(svcs) = idx.method_services.get(&(ty.clone(), call.name.clone())) {
             let cands = others(svcs);
@@ -762,7 +770,7 @@ fn resolve_call(call: &OwnedCall, idx: &Indexes) -> Result<(String, Via), (Strin
         return Err(("local".into(), Vec::new()));
     }
 
-    // 2. a qualifier naming the target's module, type, service or project
+    // a qualifier naming the target's module, type, service or project
     if let Some(q) = call.qualifier.as_deref() {
         let mut named: BTreeSet<String> = BTreeSet::new();
         for seg in module_segments(q) {
@@ -790,7 +798,7 @@ fn resolve_call(call: &OwnedCall, idx: &Indexes) -> Result<(String, Via), (Strin
         }
     }
 
-    // 3. the callee was imported from the target
+    // the callee was imported from the target
     if let Some(from) = idx.imports.get(&call.file).and_then(|m| m.get(&call.name)) {
         let cands: Vec<String> = defined_elsewhere.intersection(from).cloned().collect();
         match cands.len() {
@@ -800,7 +808,17 @@ fn resolve_call(call: &OwnedCall, idx: &Indexes) -> Result<(String, Via), (Strin
         }
     }
 
-    // 4. untyped languages only: a single definer, on the name alone
+    // the whole of a target was made available, and it defines the callee
+    if let Some(from) = idx.wildcard_imports.get(&call.file) {
+        let cands: Vec<String> = defined_elsewhere.intersection(from).cloned().collect();
+        match cands.len() {
+            1 => return Ok((cands[0].clone(), Via::Import)),
+            0 => {}
+            _ => return Err(("ambiguous".into(), cands)),
+        }
+    }
+
+    // untyped languages only: a single definer, on the name alone
     if !call.typed && defined_elsewhere.len() == 1 {
         return Ok((
             defined_elsewhere.iter().next().unwrap().clone(),
@@ -814,10 +832,6 @@ fn resolve_call(call: &OwnedCall, idx: &Indexes) -> Result<(String, Via), (Strin
 }
 
 // Detect cross-service edges, then overlay declared deps.
-//
-// Returns the edges, a per-symbol caller map (for `called_from`), and the
-// calls that matched a definition but could not be attributed with evidence -
-// reported rather than dropped, so a missing edge is visible.
 fn detect_edges(
     idx: &Indexes,
     declared: &BTreeMap<String, Vec<String>>,
@@ -1297,6 +1311,7 @@ diff --git a/gone.rs b/gone.rs
             module_services: BTreeMap::new(),
             project_services: BTreeMap::new(),
             imports: BTreeMap::new(),
+            wildcard_imports: BTreeMap::new(),
             calls,
             type_refs: Vec::new(),
             test_callers: BTreeMap::new(),
