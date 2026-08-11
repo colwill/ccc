@@ -4,7 +4,7 @@ What grammars/languages the `ccc` static analyser supports
 
 ## Status
 
-Every language ccc parses. Each entry is verified by running ccc over a fixture.
+Every language ccc can analyse.
 
 | | grammar | detect | funcs | consts | calls | imports | types | modules | metrics | x-file | tests |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -14,13 +14,15 @@ Every language ccc parses. Each entry is verified by running ccc over a fixture.
 | Go         | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | JavaScript | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | ✅ | ✅ |
 | Odin       | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Python     | ✅ | ✅ | ✅ | ✅¹ | ✅ | ✅ | ✅ | n/a | ✅ | ✅ | ✅ |
+| Python     | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | ✅ | ✅ |
 | Rust       | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | TypeScript | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | TSX        | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Zig        | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | n/a | ✅ | ✅ | ✅ |
 
-✅ done · n/a the language has no such concept
+✅ - done 
+
+n/a - the language has no such concept
 
 
 ### Extension mapping
