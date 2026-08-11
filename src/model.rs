@@ -108,7 +108,7 @@ pub struct Ref {
     pub target_ret: Option<String>,
 }
 
-// A free-form note (TODO/FIXME/NOTE/...).
+// A free-form "note" (TODO/FIXME/NOTE/...).
 #[derive(Debug, Clone)]
 pub struct Note {
     pub line: usize,
