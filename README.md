@@ -129,7 +129,7 @@ The `.ccc/map.json` file is used to hint to ccc where to find dependencies, for 
 
 #### Note: If you're not using `ccc serve`, you can generate a `.ccc` directory using `ccc scan` and then add a block to your AGENTS.md file  to scan the `.ccc` directory instead.
 
-For those using `ccc serve` and the MCP tools add the following block to an AGENTS.md file at the root of your project - agents that read an [`AGENTS.md`](https://agents.md) at the repo root pick this up automatically e.g. Copilot, Claude, Cursor etc.
+(recommended) For those using `ccc serve` and the MCP tools; add the following block to an AGENTS.md file at the root of your project - agents that read an [`AGENTS.md`](https://agents.md) at the repo root pick this up automatically e.g. Copilot, Claude, Cursor etc.
 
 ```md
 # AGENTS.md
