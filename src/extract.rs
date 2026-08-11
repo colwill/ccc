@@ -2057,14 +2057,49 @@ fn self_method(obj: Node, name: String, ctx: &Ctx) -> Option<CallKind> {
 
 const MARKERS: &[&str] = &["TODO", "FIXME", "XXX", "HACK", "BUG", "NOTE", "SAFETY"];
 
+// counts only where an author would actually write one: as a whole
+// word that opens the comment or follows whitespace, and that is punctuated
+// with a colon
+fn has_marker(body: &str) -> bool {
+    let is_marker = |start: usize, end: usize| {
+        if !MARKERS.contains(&body[start..end].to_ascii_uppercase().as_str()) {
+            return false;
+        }
+        let opens = match body[..start].chars().next_back() {
+            Some(c) => c.is_whitespace(),
+            None => true,
+        };
+        // step over an owner group, `TODO(alice):`, before looking for the colon
+        let tail = &body[end..];
+        let tail = match tail.strip_prefix('(') {
+            Some(rest) => match rest.find(')') {
+                Some(close) => &rest[close + 1..],
+                None => return false,
+            },
+            None => tail,
+        };
+        opens && tail.starts_with(':')
+    };
+    let mut word: Option<usize> = None;
+    for (i, c) in body.char_indices() {
+        match (c.is_ascii_alphanumeric(), word) {
+            (true, None) => word = Some(i),
+            (false, Some(start)) => {
+                if is_marker(start, i) {
+                    return true;
+                }
+                word = None;
+            }
+            _ => {}
+        }
+    }
+    word.is_some_and(|start| is_marker(start, body.len()))
+}
+
 fn maybe_note(node: Node, ctx: &mut Ctx) {
     let raw = text(node, ctx.src);
     let body = strip_comment(raw);
-    // Match markers on word boundaries so `notes` / `notation` don't trigger.
-    let has_marker = body
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|word| MARKERS.contains(&word.to_ascii_uppercase().as_str()));
-    if !has_marker {
+    if !has_marker(&body) {
         return;
     }
     let one = oneline(&body);
@@ -3076,6 +3111,46 @@ mod tests {
         let ex = extract(Language::Rust, src).unwrap();
         assert_eq!(ex.notes.len(), 1);
         assert!(ex.notes[0].text.contains("TODO"));
+    }
+
+    #[test]
+    fn note_marker_requires_a_colon() {
+        // a marker word loose in prose is not an annotation, however it is
+        // cased; an owner group between the marker and its colon still is.
+        let src = "// a real TODO must be punctuated\n\
+                   fn a() {}\n\
+                   // the coverage note into the markdown\n\
+                   fn b() {}\n\
+                   // fixes bug where cache_name wasnt unique\n\
+                   fn c() {}\n\
+                   // TODO(alice): wire this up\n\
+                   fn d() {}\n\
+                   // FIXME: broken\n\
+                   fn e() {}\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        let texts: Vec<&str> = ex.notes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts.len(), 2, "got {texts:?}");
+        assert!(texts[0].contains("TODO(alice)"));
+        assert!(texts[1].contains("FIXME"));
+    }
+
+    #[test]
+    fn note_marker_must_follow_whitespace() {
+        // a marker quoted or bracketed is prose about markers, not an
+        // annotation; one opening its comment or following a space is real.
+        let src = "// a free-form marker (TODO/FIXME/NOTE/...)\n\
+                   fn a() {}\n\
+                   // \"NOTE\" must not trigger\n\
+                   fn b() {}\n\
+                   /* SAFETY: the pointer is non-null */\n\
+                   fn c() {}\n\
+                   // trailing HACK: still counts\n\
+                   fn d() {}\n";
+        let ex = extract(Language::Rust, src).unwrap();
+        let texts: Vec<&str> = ex.notes.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(texts.len(), 2, "got {texts:?}");
+        assert!(texts[0].contains("SAFETY"));
+        assert!(texts[1].contains("HACK"));
     }
 
     #[test]

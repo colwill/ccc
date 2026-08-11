@@ -1,6 +1,6 @@
 [package]
 name = "codecache"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 rust-version = "1.77"
 description = "ContextCodeCache (.ccc) generates an agent friendly local source map"

@@ -137,10 +137,13 @@ The `.ccc/map.json` file is used to hint to ccc where to find dependencies, for 
 This repo has a ContextCodeCache - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
 as the entry point for everything you do here.
 
+- no bash, grep or sed usage for exploring the project
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
 - All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, file, notes, changes, test_triggers, test_targets, lints, hot, services refresh)
+- When I ask to *see* the analysis, call `insights` - it opens the insights UI in my browser (needs `ccc serve --html`)
 - Make code changes in the source, never to the in-memory map.
-- After changing tracked source call the `ccc` tool with `refresh` to ensure you have the latest changes in-memory. 
+- After changing tracked source call the `ccc` tool with `refresh` to ensure you have the latest changes in-memory.
+
 ```
 
 Because the agent loads `AGENTS.md` at the start of a session, this wires the

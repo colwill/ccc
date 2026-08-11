@@ -48,6 +48,7 @@ struct MapState {
     facade: Option<String>,
     watch_secs: Option<u64>,
     html: bool,
+    origin: String,
     analysis: Mutex<Option<Analysis>>,
 }
 
@@ -76,6 +77,11 @@ impl MapState {
             facade: cargo_package_name(root),
             watch_secs: None,
             html: false,
+            // `--port 0` picks one at runtime
+            origin: {
+                let d = ServeOptions::default();
+                format!("http://{}:{}", d.addr, d.port)
+            },
             analysis: Mutex::new(None),
         })
     }
@@ -1550,6 +1556,14 @@ fn mcp_tools() -> Value {
             }),
             &[],
         ),
+
+        // the one tool aimed at the person rather than the agent
+        tool(
+            "insights",
+            "CALL THIS WHEN THE USER ASKS TO SEE the analysis - show me the insights, open the dashboard, what does this codebase look like. Opens the human-facing insights UI (`/insights`) in their browser: the flame graph of the static call tree, hot paths, the service map, this branch's changes, test triggers and targets, lints and per-language totals - the same analysis pass the other tools read, laid out to be looked at rather than parsed. Returns the URL and the headline totals, so you can talk about the page while they read it. Needs the server started with `ccc serve --html`; without it the tool says so, and the data is at /insights.json either way.",
+            json!({}),
+            &[],
+        ),
     ]})
 }
 
@@ -1601,7 +1615,10 @@ fn mcp_initialize(params: &Value) -> Value {
             rescan. Analysis: `changes` what this branch touched, `test_triggers` the \
             tests those changes make necessary, `test_targets` where a missing test \
             would cost most, `lints` syntax-level findings, `hot` call-graph shape, \
-            `services` the service map and the calls crossing it. The analysis tools are \
+            `services` the service map and the calls crossing it. For a person rather \
+            than an agent: `insights` opens the UI over that same analysis in their \
+            browser - call it when they ask to *see* the code, not to read about it. \
+            The analysis tools are \
             heuristics over a syntax tree - no type inference, data flow or runtime \
             profile - so each result carries its evidence and limits; read those before \
             acting. They page rather than truncate: on `showing 1-40 of 152`, pass \
@@ -1654,7 +1671,7 @@ fn md_section(out: &mut String, title: &str, body: &str) {
 }
 
 // one map hit - covers every kind `find` and `references` emit (func, const,
-// note, call, use), printing only the fields that kind carries
+// "note", call, use), printing only the fields that kind carries
 fn md_hit(r: &Value) -> String {
     let mut line = format!("{}:{}", jstr(r, "file"), jnum(r, "line"));
     if let Some(col) = r.get("col").and_then(|x| x.as_i64()) {
@@ -2716,6 +2733,83 @@ fn md_services(v: &Value, only: Option<&str>, page: Page) -> String {
     out
 }
 
+fn browser_origin(addr: &std::net::SocketAddr) -> String {
+    let port = addr.port();
+    match addr.ip() {
+        ip if ip.is_unspecified() => format!("http://127.0.0.1:{port}"),
+        std::net::IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
+        ip => format!("http://{ip}:{port}"),
+    }
+}
+
+fn open_in_browser(url: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("open", &[])
+    } else if cfg!(target_os = "windows") {
+        // the empty string is `start`'s window-title argument; without it a
+        // quoted URL would be taken as the title
+        ("cmd", &["/C", "start", ""])
+    } else {
+        ("xdg-open", &[])
+    };
+    Command::new(program)
+        .args(args)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|mut child| {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
+        .map_err(|e| format!("{program}: {e}"))
+}
+
+// open the insights page
+fn q_insights(map: &MapState, open: impl Fn(&str) -> Result<(), String>) -> Result<String, String> {
+    let url = format!("{}/insights", map.origin);
+    if !map.html {
+        return Err(format!(
+            "the insights UI is disabled; restart the server with `ccc serve --html` to \
+             serve it at {url} (the analysis itself is at {}/insights.json, and the \
+             `changes`, `test_triggers`, `test_targets`, `lints`, `hot` and `services` \
+             tools read the same pass)",
+            map.origin
+        ));
+    }
+    let opened = open(&url);
+    let a = map.analysis(None);
+    let t = &a["totals"];
+    let mut out = format!("# insights\n{url}\n\n");
+    out.push_str(match &opened {
+        Ok(()) => "opened in the user's browser - tell them to look at it.\n",
+        Err(_) => "could not open a browser here; give the user the URL above.\n",
+    });
+    if let Err(e) = &opened {
+        out.push_str(&format!("reason: {e}\n"));
+    }
+    out.push_str(&format!(
+        "\n{} file(s), {} line(s), {} function(s), {} call edge(s), {} root(s)\n\
+         generated {} in {} ms\n",
+        jnum(t, "files"),
+        jnum(t, "lines"),
+        jnum(t, "functions"),
+        jnum(t, "edges"),
+        jnum(t, "roots"),
+        jstr(&a, "generated"),
+        a["took_ns"].as_u64().unwrap_or(0) / 1_000_000,
+    ));
+    out.push_str(
+        "\ntabs: flame (static call tree), hot (call-graph shape), services, changes, \
+         test triggers, test targets, lints, languages. The page reads /insights.json \
+         live and has its own refresh button.\n",
+    );
+    Ok(out)
+}
+
 fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
@@ -2812,6 +2906,7 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
                 Page::from(&args, 25),
             ))
         }
+        "insights" => q_insights(&map, open_in_browser),
         _ => return Err((-32602, format!("unknown tool '{name}'"))),
     };
     Ok(match out {
@@ -3322,6 +3417,13 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     let server = tiny_http::Server::http(&bind)
         .map_err(|e| anyhow::anyhow!("binding {bind}: {e}"))?;
     let addr = server.server_addr();
+    {
+        let mut map = state.write().expect("map lock poisoned");
+        map.origin = match addr.clone().to_ip() {
+            Some(ip) => browser_origin(&ip),
+            None => format!("http://{}:{}", opts.addr, opts.port),
+        };
+    }
     {
         let map = state.read().expect("map lock poisoned");
         println!(
@@ -3916,7 +4018,7 @@ mod tests {
             .map(|k| k.as_str().unwrap())
             .collect();
         assert!(searched.contains(&"type") && searched.contains(&"import"));
-        // a miss carries suggestions and the coverage note into the markdown
+        // a miss carries suggestions and the coverage "note" into the markdown
         let miss = q_find(&map, "Baskett", "any").unwrap();
         assert_eq!(miss["count"], 0);
         assert!(md_find(&miss).contains("nearest indexed names: Basket"));
@@ -4496,6 +4598,7 @@ mod tests {
                 "lints",
                 "hot",
                 "services",
+                "insights", // for user only
             ]
         );
         // tools/call find
@@ -4536,6 +4639,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(nope["error"]["code"], -32601);
+    }
+
+
+    // verify all tools dispatch as expected
+    #[test]
+    fn every_advertised_tool_dispatches() {
+        let registry = mcp_tools();
+        let tools = registry["tools"].as_array().unwrap();
+        assert!(!tools.is_empty(), "the registry advertises no tools");
+
+        for t in tools {
+            let name = t["name"].as_str().unwrap();
+            let schema = &t["inputSchema"];
+
+            let mut args = json!({});
+            let obj = args.as_object_mut().unwrap();
+            for req in schema["required"].as_array().unwrap() {
+                let key = req.as_str().unwrap();
+                let placeholder = match schema["properties"][key]["type"].as_str() {
+                    Some("integer") => json!(1),
+                    Some("boolean") => json!(false),
+                    _ => json!("charge"), // a name the fixture actually has
+                };
+                obj.insert(key.to_string(), placeholder);
+            }
+
+            let state = RwLock::new(fixture());
+            let reply = mcp_handle(
+                &state,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": name, "arguments": args}}),
+            )
+            .unwrap_or_else(|| panic!("{name}: a tools/call with an id must be answered"));
+
+            assert!(
+                reply.get("error").is_none(),
+                "{name} is advertised by tools/list but does not dispatch: {}",
+                reply["error"]
+            );
+
+            assert!(
+                reply["result"]["content"][0]["text"].is_string(),
+                "{name}: dispatched without content: {reply}"
+            );
+        }
     }
 
     #[test]
@@ -4719,6 +4867,58 @@ mod tests {
         assert!(!v["generated"].as_str().unwrap().is_empty());
         // the flame view is grouped, so per-service trees have somewhere to go
         assert!(!v["flame"]["groups"].as_array().unwrap().is_empty());
+    }
+
+    // The `insights` tool is the one that acts on the user's machine, so the
+    // browser call is injected: these assertions must never launch anything.
+    #[test]
+    fn the_insights_tool_hands_the_user_a_reachable_url() {
+        let mut map = fixture();
+        map.origin = "http://127.0.0.1:7788".into();
+
+        // disabled UI: the error names the flag and the JSON way in, and no
+        // browser is opened for a page that would 404
+        let err = q_insights(&map, |_| panic!("must not open a browser with --html off"))
+            .expect_err("the UI is off in the fixture");
+        assert!(err.contains("ccc serve --html"), "{err}");
+        assert!(err.contains("http://127.0.0.1:7788/insights.json"), "{err}");
+
+        map.html = true;
+        let asked = Mutex::new(Vec::new());
+        let out = q_insights(&map, |url| {
+            asked.lock().unwrap().push(url.to_string());
+            Ok(())
+        })
+        .expect("the UI is enabled");
+        assert_eq!(
+            asked.into_inner().unwrap(),
+            vec!["http://127.0.0.1:7788/insights".to_string()]
+        );
+        assert!(out.contains("http://127.0.0.1:7788/insights"), "{out}");
+        assert!(out.contains("opened in the user's browser"), "{out}");
+        // the headline figures the agent talks about while they read
+        assert!(out.contains("function(s)"), "{out}");
+        assert!(out.contains("call edge(s)"), "{out}");
+
+        // a headless box has nothing to open: still an answer, with the URL and
+        // the reason, not an error
+        let headless = q_insights(&map, |_| Err("xdg-open: not found".into()))
+            .expect("a missing browser is not a failed tool call");
+        assert!(headless.contains("give the user the URL"), "{headless}");
+        assert!(headless.contains("xdg-open: not found"), "{headless}");
+        assert!(headless.contains("http://127.0.0.1:7788/insights"), "{headless}");
+    }
+
+    #[test]
+    fn a_wildcard_bind_is_advertised_as_loopback() {
+        let wild: std::net::SocketAddr = "0.0.0.0:6767".parse().unwrap();
+        assert_eq!(browser_origin(&wild), "http://127.0.0.1:6767");
+        let v6: std::net::SocketAddr = "[::]:80".parse().unwrap();
+        assert_eq!(browser_origin(&v6), "http://127.0.0.1:80");
+        let lan: std::net::SocketAddr = "192.168.1.9:6767".parse().unwrap();
+        assert_eq!(browser_origin(&lan), "http://192.168.1.9:6767");
+        let loop6: std::net::SocketAddr = "[::1]:6767".parse().unwrap();
+        assert_eq!(browser_origin(&loop6), "http://[::1]:6767");
     }
 
     #[test]
