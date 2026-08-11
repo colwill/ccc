@@ -25,7 +25,7 @@ graph, and marker notes (TODO/FIXME/...).
 It is designed to give engineers a always-fresh index of a project, the latest changes, how those changes impact tests or other branches (compare working branch against any other branch). In addition it also provides language models a local MCP server for an always up-to-date map of your codebase, dependencies, call-graph and cross-service calls. 
 
 Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`, `Odin`, `TypeScript`
-& `JavaScript` - see [`LANGUAGES.md`](LANGUAGES.md) for what each one resolves.
+& `JavaScript` - see [`LANGUAGES.md`](docs/LANGUAGES.md) for what each one resolves.
 
 ## Table of content
 
