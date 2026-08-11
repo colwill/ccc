@@ -1,11 +1,11 @@
 <p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="ContextCodeCache Logo"></a></p>
 
-[![Release ContextCodeCache](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
+[![Release CodeCaChe](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
 
 
-# ContextCodeCache (`ccc`)
+# CodeCaChe (`ccc`)
 
-ContextCodeCache provides insight into your code and improves developer experience by:
+CodeCaChe provides insight into your code and improves developer experience by:
 
   - highlighting which tests will be ran with your changes
   
@@ -17,7 +17,7 @@ ContextCodeCache provides insight into your code and improves developer experien
 
   - triggering specific testing tools based on your changes
 
-**ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and generates the **ContextCodeCache** in memory. 
+**ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and generates the **CodeCaChe** in memory. 
 This is a human and machine readable map of the source tree including every source file; its
 constants, functions (with return types and doc summaries), intra-file call
 graph, and marker notes (TODO/FIXME/...). 
