@@ -208,7 +208,7 @@ impl Language {
         }
     }
 
-    // Does this language declare types where the syntax tree can read them?
+    // does this language declare types where the syntax tree can read them?
     pub fn is_typed(self) -> bool {
         matches!(
             self,
@@ -221,6 +221,28 @@ impl Language {
                 | Language::Odin
                 | Language::TypeScript
                 | Language::Tsx
+        )
+    }
+
+    // languages whose code can call each other's functions directly
+    pub fn family(self) -> &'static str {
+        match self {
+            Language::C | Language::Cpp => "c",
+            Language::JavaScript | Language::TypeScript | Language::Tsx => "js",
+            Language::Rust => "rust",
+            Language::Python => "python",
+            Language::Go => "go",
+            Language::CSharp => "csharp",
+            Language::Zig => "zig",
+            Language::Odin => "odin",
+        }
+    }
+
+    // does an unqualified name reach the rest of its directory
+    pub fn package_scoped(self) -> bool {
+        matches!(
+            self,
+            Language::Go | Language::CSharp | Language::C | Language::Cpp
         )
     }
 
@@ -388,9 +410,7 @@ impl Language {
             Language::Python => &["with_statement"],
             Language::Go | Language::Odin => &["defer_statement"],
             // `errdefer` releases on the error path only, so counting it as a
-            // guard is an approximation - but the alternative is reading a
-            // correctly written cleanup as a leak, which is the worse of the
-            // two given the heuristic is name-matched anyway
+            // guard is an approximation
             Language::Zig => &["defer_statement", "errdefer_statement"],
             // `using (var f = ...)` disposes on scope exit - the same promise
             // python's `with` makes

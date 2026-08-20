@@ -48,6 +48,21 @@ enum Command {
         #[arg(long, default_value = "o200k_base")]
         encoding: String,
     },
+    // publish what this project serves and calls across process boundaries
+    Export {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // name other repos will know this one by; defaults to the directory
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        // "owner/repo", recorded for display on the consuming side
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        // where to write it; defaults to `<path>/.ccc/ccc-surface.json`.
+        // `-` writes to stdout.
+        #[arg(short, long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
     // surface branch changes to a continuous-testing suite: which services
     // changed, who calls them, and what needs testing (JSON by default).
     // `surf` was the original name; kept so existing scripts keep working.
@@ -176,6 +191,50 @@ fn run() -> Result<ExitCode> {
             } else {
                 Ok(ExitCode::FAILURE)
             }
+        }
+        Command::Export {
+            path,
+            name,
+            repo,
+            out,
+        } => {
+            let root = canonical(&path);
+            let files = codecache::scan::collect_files(&root)?;
+            let caches = codecache::scan::build_caches(&root, &files);
+            let label = name.unwrap_or_else(|| path_str(&root));
+            let mut surface = codecache::Surface::from_caches(
+                &label,
+                &codecache::render::now_ts(),
+                &caches,
+            );
+            surface.repo = repo;
+            let body = serde_json::to_string_pretty(&surface)?;
+
+            match out.as_deref() {
+                Some(p) if p == Path::new("-") => println!("{body}"),
+                other => {
+                    let target = match other {
+                        Some(p) => p.to_path_buf(),
+                        None => root
+                            .join(".ccc")
+                            .join(codecache::externals::SURFACE_NAME),
+                    };
+                    if let Some(dir) = target.parent() {
+                        std::fs::create_dir_all(dir)
+                            .with_context(|| format!("creating {}", dir.display()))?;
+                    }
+                    std::fs::write(&target, format!("{body}\n"))
+                        .with_context(|| format!("writing {}", target.display()))?;
+                    eprintln!(
+                        "{}: {} provided, {} consumed -> {}",
+                        surface.name,
+                        surface.provides.len(),
+                        surface.consumes.len(),
+                        target.display()
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
         }
         Command::Tokenize { path, encoding } => {
             let root = canonical(&path);

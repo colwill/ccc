@@ -1,0 +1,513 @@
+{
+  "name": "ccc-codecache",
+  "displayName": "CodeCaChe (ccc)",
+  "description": "Test-coverage, untested-changes and cross-service hints from the ccc static analyser, inline in your editor.",
+  "version": "1.4.2",
+  "publisher": "colwill",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colwill/ccc"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing",
+    "Linters",
+    "Visualization"
+  ],
+  "keywords": [
+    "coverage",
+    "tests",
+    "static analysis",
+    "microservices",
+    "tree-sitter"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "ccc spawns a local static-analyser process against your workspace."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "ccc reads files from disk and needs a real filesystem path."
+    }
+  },
+  "contributes": {
+    "colors": [
+      {
+        "id": "ccc.complexity1",
+        "description": "Complexity band 1 of 10: straight through, no decision points.",
+        "defaults": { "dark": "descriptionForeground", "light": "descriptionForeground", "highContrast": "descriptionForeground", "highContrastLight": "descriptionForeground" }
+      },
+      {
+        "id": "ccc.complexity2",
+        "description": "Complexity band 2 of 10: nearly straight through.",
+        "defaults": { "dark": "editor.foreground", "light": "editor.foreground", "highContrast": "editor.foreground", "highContrastLight": "editor.foreground" }
+      },
+      {
+        "id": "ccc.complexity7",
+        "description": "Complexity band 7 of 10: worth a second look.",
+        "defaults": { "dark": "#b07d48", "light": "#8a5a2b", "highContrast": "#d19a66", "highContrastLight": "#6d4520" }
+      },
+      {
+        "id": "ccc.complexity8",
+        "description": "Complexity band 8 of 10: worth a second look.",
+        "defaults": { "dark": "#d9a441", "light": "#a4700a", "highContrast": "#ffcc66", "highContrastLight": "#7d5400" }
+      }
+    ],
+    "commands": [
+      {
+        "command": "ccc.refresh",
+        "title": "Refresh Hints",
+        "category": "ccc",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ccc.restartServer",
+        "title": "Restart Analyser",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.stopServer",
+        "title": "Stop Analyser",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.toggleHints",
+        "title": "Toggle Inline Hints",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.showOutput",
+        "title": "Show Log",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.openInsights",
+        "title": "Open Insights UI in Browser",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.selectBaseRef",
+        "title": "Select Git Base Ref...",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.copyTestCommand",
+        "title": "Copy Test Command for Changes",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.openLocation",
+        "title": "Open Location",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.showReferences",
+        "title": "Find All References",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.showTests",
+        "title": "Show Covering Tests",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.explainUntested",
+        "title": "Explain Untested Change",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.openCrossing",
+        "title": "Open Boundary Handler",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.explainCrossing",
+        "title": "Explain Unanswered Key",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.showCallers",
+        "title": "Show Callers",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.runTestCommand",
+        "title": "Run Test Command",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.refreshTestTriggers",
+        "title": "Refresh Test Triggers",
+        "category": "ccc",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ccc.filterComplexityByName",
+        "title": "Filter Complexity by Name",
+        "category": "ccc",
+        "icon": "$(search)"
+      },
+      {
+        "command": "ccc.filterComplexityByArity",
+        "title": "Filter Complexity by Parameter Count",
+        "category": "ccc",
+        "icon": "$(symbol-parameter)"
+      },
+      {
+        "command": "ccc.filterComplexityByScore",
+        "title": "Filter Complexity by Score",
+        "category": "ccc",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "ccc.clearComplexityFilters",
+        "title": "Clear Complexity Filters",
+        "category": "ccc",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "ccc.toggleComplexityTests",
+        "title": "Show or Hide Test Functions in Complexity",
+        "category": "ccc",
+        "icon": "$(beaker)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "ccc.runTestCommand",
+          "when": "false"
+        },
+        {
+          "command": "ccc.showCallers",
+          "when": "false"
+        },
+        {
+          "command": "ccc.explainCrossing",
+          "when": "false"
+        },
+        {
+          "command": "ccc.openCrossing",
+          "when": "false"
+        },
+        {
+          "command": "ccc.explainUntested",
+          "when": "false"
+        },
+        {
+          "command": "ccc.showTests",
+          "when": "false"
+        },
+        {
+          "command": "ccc.openLocation",
+          "when": "false"
+        },
+        {
+          "command": "ccc.showReferences",
+          "when": "false"
+        },
+        {
+          "command": "ccc.filterComplexityByName",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.filterComplexityByArity",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.filterComplexityByScore",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.clearComplexityFilters",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.toggleComplexityTests",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.refresh",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.stopServer",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.openInsights",
+          "when": "ccc.active"
+        },
+        {
+          "command": "ccc.copyTestCommand",
+          "when": "ccc.active"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "ccc.refreshTestTriggers",
+          "when": "view == ccc.testTriggers",
+          "group": "navigation"
+        },
+        {
+          "command": "ccc.filterComplexityByName",
+          "when": "view == ccc.complexity",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ccc.filterComplexityByArity",
+          "when": "view == ccc.complexity",
+          "group": "navigation@2"
+        },
+        {
+          "command": "ccc.filterComplexityByScore",
+          "when": "view == ccc.complexity",
+          "group": "navigation@3"
+        },
+        {
+          "command": "ccc.toggleComplexityTests",
+          "when": "view == ccc.complexity",
+          "group": "navigation@4"
+        },
+        {
+          "command": "ccc.clearComplexityFilters",
+          "when": "view == ccc.complexity && ccc.complexityFiltered",
+          "group": "navigation@5"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ccc",
+      "properties": {
+        "ccc.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch for inline hints."
+        },
+        "ccc.binaryPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Absolute path to the `ccc` binary. Empty searches PATH, then `target/release/ccc`, then `target/debug/ccc` in the workspace folder."
+        },
+        "ccc.baseRef": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Git ref to diff against. Empty lets the server pick the first of `origin/main`, `main`, `origin/master`, `master`."
+        },
+        "ccc.server.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start an analyser process automatically for each workspace folder."
+        },
+        "ccc.server.address": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Address the analyser binds to. Loopback by default; think twice before widening."
+        },
+        "ccc.server.port": {
+          "type": "number",
+          "default": 0,
+          "markdownDescription": "0 picks a free port (recommended). A fixed port collides across windows."
+        },
+        "ccc.server.watchIntervalSec": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "markdownDescription": "0 starts the analyser with `--no-watch`; the extension drives rescans on save and window focus instead. Greater than 0 passes `--watch-interval`."
+        },
+        "ccc.server.startupTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "description": "How long to wait for the analyser to report a listening port. A cold first scan of a large repo is genuinely slow."
+        },
+        "ccc.server.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra arguments appended to the `ccc serve` command line."
+        },
+        "ccc.hints.testTriggers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight changed functions that tests cover, with links to those tests."
+        },
+        "ccc.hints.untested": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight changed functions that no test covers, with a suggested test kind."
+        },
+        "ccc.hints.outbound": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight calls into another service or dependency."
+        },
+        "ccc.hints.inbound": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight functions called by another service or dependency."
+        },
+        "ccc.hints.hotPaths": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Highlight structurally hot functions: the most called, the most complex, the widest fan-out, the head of the deepest call chain, and members of a call cycle. Derived from the call graph, so these appear whether or not anything changed."
+        },
+        "ccc.hints.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show hints as CodeLens lines above the function or call. Turn this off and set `#ccc.decorations.style#` to `badge+gutter` for end-of-line badges instead."
+        },
+        "ccc.hints.includeTestFiles": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also decorate changed functions inside test files."
+        },
+        "ccc.hints.crossServiceMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "always",
+            "off"
+          ],
+          "default": "auto",
+          "markdownDescription": "`auto` shows cross-service hints only when `.ccc/map.json` names services, or when the fallback grouping is by directory. It stays quiet when the grouping degenerates to one unit per file, where every import looks like a service call."
+        },
+        "ccc.hints.minEvidence": {
+          "type": "string",
+          "enum": [
+            "any",
+            "evidence"
+          ],
+          "default": "evidence",
+          "markdownDescription": "`evidence` drops `via: \"name-only\"` edges, the untyped-language fallback that is the main false-positive source."
+        },
+        "ccc.untested.showUncoveredTargets": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When the git diff is unavailable, still hint the highest-priority uncovered functions from `test_targets`."
+        },
+        "ccc.untested.minPriority": {
+          "type": "number",
+          "default": 0,
+          "description": "Minimum ccc priority score for uncovered-target hints."
+        },
+        "ccc.decorations.style": {
+          "type": "string",
+          "enum": [
+            "badge+gutter",
+            "badge",
+            "gutter"
+          ],
+          "default": "gutter",
+          "markdownDescription": "Which decorations to draw alongside the CodeLens. `gutter` is the default because the detail now lives above the code; `badge` adds an end-of-line summary."
+        },
+        "ccc.decorations.badgeMaxLength": {
+          "type": "number",
+          "default": 60,
+          "description": "Truncate end-of-line badges past this many characters."
+        },
+        "ccc.decorations.dimWhenDirty": {
+          "type": "boolean",
+          "default": true,
+          "description": "Fade hints once the file has unsaved edits: ccc reads from disk, so hints cannot reflect them."
+        },
+        "ccc.decorations.overviewRuler": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mark untested changes in the scrollbar overview ruler."
+        },
+        "ccc.complexity.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show each function's complexity as a circled number (\u2776-\u277f) between its name and its signature. Measured cyclomatic-style: one path, plus one per decision point and loop."
+        },
+        "ccc.complexity.minScore": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Lowest complexity band still worth marking, 1-10. Raise it to mark only the functions worth a second look; at 1 every measured function is marked."
+        },
+        "ccc.refresh.onSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Rescan and re-analyse when a file in the workspace is saved."
+        },
+        "ccc.refresh.onWindowFocus": {
+          "type": "boolean",
+          "default": true,
+          "description": "Rescan when the window regains focus, to catch git checkouts and edits made elsewhere."
+        },
+        "ccc.refresh.intervalSec": {
+          "type": "number",
+          "default": 0,
+          "description": "Background poll interval in seconds. 0 disables it."
+        },
+        "ccc.refresh.debounceMs": {
+          "type": "number",
+          "default": 400,
+          "description": "Debounce window for coalescing refresh triggers."
+        },
+        "ccc.trace": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Logging detail in the ccc output channel."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ccc",
+          "title": "CodeCaChe",
+          "icon": "media/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "ccc": [
+        {
+          "id": "ccc.testTriggers",
+          "name": "Triggers",
+          "contextualTitle": "CodeCaChe \u2014 tests your changes invoke"
+        },
+        {
+          "id": "ccc.complexity",
+          "name": "Complexity",
+          "contextualTitle": "CodeCaChe \u2014 how complex each function is"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "check": "tsc --noEmit",
+    "package": "vsce package --no-dependencies --allow-missing-repository -o ../../dist/ccc-codecache.vsix",
+    "install-local": "code --install-extension ../../dist/ccc-codecache.vsix",
+    "vscode:prepublish": "npm run check && npm run build -- --minify"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -60,6 +60,23 @@ impl FuncMetrics {
     pub fn max_loop_depth(&self) -> usize {
         self.loops.iter().map(|l| l.depth).max().unwrap_or(0)
     }
+
+    // `complexity` on a 1-10 scale, for anything that has to *show* it rather
+    // than rank by it, the usual cyclomatic risk advice
+    pub fn complexity_score(&self) -> u8 {
+        match self.complexity() {
+            0..=1 => 1,
+            2 => 2,
+            3 => 3,
+            4..=5 => 4,
+            6..=7 => 5,
+            8..=10 => 6,
+            11..=15 => 7,
+            16..=20 => 8,
+            21..=30 => 9,
+            _ => 10,
+        }
+    }
 }
 
 // function / method definition.
@@ -115,6 +132,38 @@ pub struct Note {
     pub text: String,
 }
 
+// Which side of a boundary an annotation describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Boundary {
+    // this function handles the key: `ccc:serves grpc billing.v1.Charge`
+    Serves,
+    // this function reaches out to the key: `ccc:calls grpc billing.v1.Charge`
+    Calls,
+}
+
+impl Boundary {
+    pub fn label(self) -> &'static str {
+        match self {
+            Boundary::Serves => "serves",
+            Boundary::Calls => "calls",
+        }
+    }
+}
+
+// An author-written hint that a call leaves this process
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub line: usize,
+    pub boundary: Boundary,
+    // grpc | rest | http | graphql | queue | event | webhook | ffi | cli, or
+    // "unspecified" when the author named only a key
+    pub transport: String,
+    // the rendezvous key, matched verbatim against the other end
+    pub key: String,
+    // the function it was attached to, or `<top>` for a file-level hint
+    pub function: String,
+}
+
 // one import/use/include statement, in loose form
 #[derive(Debug, Clone)]
 pub struct Import {
@@ -145,6 +194,8 @@ pub struct FileCache {
     pub imports: Vec<Import>,
     pub types: Vec<TypeDef>,
     pub modules: Vec<String>,
+    // `ccc:serves` / `ccc:calls` hints written in comments
+    pub annotations: Vec<Annotation>,
 }
 
 impl FileCache {
@@ -161,6 +212,53 @@ impl FileCache {
                 .filter(|i| i.reexport)
                 .map(|i| i.names.len().max(1))
                 .sum(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(branches: usize, loops: usize) -> FuncMetrics {
+        FuncMetrics {
+            branches,
+            loops: (0..loops)
+                .map(|_| LoopInfo { line: 1, kind: "for".into(), depth: 1, trip: None })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_complexity_band_spans_one_to_ten_and_never_leaves_the_range() {
+        // a straight-line function is the floor, not zero: there is always one
+        // path through it
+        assert_eq!(metrics(0, 0).complexity(), 1);
+        assert_eq!(metrics(0, 0).complexity_score(), 1);
+        // the ordinary range keeps its resolution rather than collapsing
+        assert_eq!(metrics(1, 0).complexity_score(), 2);
+        assert_eq!(metrics(2, 0).complexity_score(), 3);
+        assert_eq!(metrics(4, 0).complexity_score(), 4);
+        assert_eq!(metrics(6, 0).complexity_score(), 5);
+        assert_eq!(metrics(9, 0).complexity_score(), 6);
+        // 11-20 is the "worth a second look" band
+        assert_eq!(metrics(10, 0).complexity_score(), 7);
+        assert_eq!(metrics(15, 0).complexity_score(), 8);
+        // and 21+ is where it stops being testable in one sitting
+        assert_eq!(metrics(20, 0).complexity_score(), 9);
+        assert_eq!(metrics(30, 0).complexity_score(), 10);
+        assert_eq!(metrics(4_000, 0).complexity_score(), 10);
+        // loops count toward the same score as branches do
+        assert_eq!(metrics(2, 2).complexity(), 5);
+        assert_eq!(metrics(2, 2).complexity_score(), 4);
+        // monotonic, and never outside 1..=10
+        let mut last = 0;
+        for b in 0..200 {
+            let s = metrics(b, 0).complexity_score();
+            assert!((1..=10).contains(&s), "{b} branches scored {s}");
+            assert!(s >= last, "score went backwards at {b} branches");
+            last = s;
         }
     }
 }

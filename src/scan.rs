@@ -155,6 +155,7 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
         imports: ex.imports,
         types: ex.types,
         modules: ex.modules,
+        annotations: ex.annotations,
     })
 }
 
