@@ -7,6 +7,7 @@
 //! line and measurement it came from so a reader can check it. The UI is
 //! labelled accordingly; do not present these as proofs.
 
+use crate::coverage::{self, CoverageIndex, TestSite};
 use crate::extract::TOP_LEVEL;
 use crate::languages::Language;
 use crate::model::{FileCache, Func, FuncMetrics};
@@ -30,12 +31,10 @@ const MAX_FLAME_GROUPS: usize = 12;
 const MAX_EDGE_SITES: usize = 60;
 // recommended test targets kept in the payload
 const MAX_TARGETS: usize = 60;
-// how many facades an import is chased through (`__main__` -> package
-// `__init__` -> the module that defines the name). Bounded so a barrel that
-// re-exports a barrel cannot walk the whole tree.
-const MAX_FACADE_HOPS: usize = 3;
-// file stems that stand for their directory rather than for themselves
-const FACADE_STEMS: &[&str] = &["__init__", "index", "mod"];
+// Functions listed in the complexity table. Far larger than the other caps
+// because this one is filtered by the reader rather than ranked for them, and
+// a filter over a truncated list quietly lies about what is there.
+const MAX_COMPLEXITY_ROWS: usize = 2000;
 
 // one function definition, addressed by (file, index into that file's funcs).
 // An index one past the end of that slice addresses the file's module scope
@@ -72,6 +71,13 @@ impl<'a> Graph<'a> {
     }
     fn node_file(&self, i: usize) -> usize {
         self.nodes[i].0
+    }
+    // the definition this node addresses, as `coverage` keys them. A module
+    // frame's index is past the end of its file's `funcs`, so it matches
+    // nothing there - which is right, nothing covers a file's top level.
+    fn node_def(&self, i: usize) -> (usize, usize) {
+        let NodeId(f, k) = self.nodes[i];
+        (f, k)
     }
     // nothing but itself calls this: an entry point
     fn is_root(&self, i: usize) -> bool {
@@ -150,39 +156,10 @@ fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
         call_sites: vec![0; n],
     };
 
-    // Every name a qualifier could use to reach a file: its stem, the modules
-    // it declares (go `package`, c++ `namespace`, rust `mod`), the types it
-    // defines, and its own directory names. Generic path segments are excluded
-    // so `src::foo` cannot match every file in the tree.
-    const GENERIC_DIRS: &[&str] = &[
-        "src", "pkg", "internal", "cmd", "app", "lib", "test", "tests", "include",
-    ];
-    let stems: Vec<&str> = caches
-        .iter()
-        .map(|c| c.rel_path.file_stem().and_then(|s| s.to_str()).unwrap_or(""))
-        .collect();
-    let aliases: Vec<BTreeSet<String>> = caches
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let mut set: BTreeSet<String> = BTreeSet::new();
-            set.insert(stems[i].to_string());
-            set.extend(c.modules.iter().cloned());
-            set.extend(c.types.iter().map(|t| t.name.clone()));
-            // directory names, so a qualifier can name the service/package dir
-            if let Some(parent) = c.rel_path.parent() {
-                for comp in parent.components() {
-                    if let Some(d) = comp.as_os_str().to_str() {
-                        if !GENERIC_DIRS.contains(&d) {
-                            set.insert(d.to_string());
-                        }
-                    }
-                }
-            }
-            set.remove("");
-            set
-        })
-        .collect();
+    // What a qualifier can name, and what each file imports from where. Built
+    // in `coverage` and shared with it, so a qualifier means the same thing to
+    // the call graph and to the coverage relation derived beside it.
+    let aliases = coverage::file_aliases(caches);
     // (owning type, method) -> nodes, for receiver-typed calls
     let mut by_owner: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (pos, NodeId(fi, ki)) in g.nodes.iter().copied().enumerate() {
@@ -192,101 +169,7 @@ fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
             by_owner.entry((owner, f.name.as_str())).or_default().push(pos);
         }
     }
-    // per file: which name was imported from which files
-    let mut imported: Vec<BTreeMap<&str, BTreeSet<usize>>> = vec![BTreeMap::new(); caches.len()];
-    let mut stem_files: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for (i, s) in stems.iter().enumerate() {
-        stem_files.entry(s).or_default().push(i);
-    }
-    // a facade is imported under its directory
-    for (i, c) in caches.iter().enumerate() {
-        if !FACADE_STEMS.contains(&stems[i]) {
-            continue;
-        }
-        if let Some(dir) = c.rel_path.parent().and_then(Path::file_name).and_then(|d| d.to_str()) {
-            stem_files.entry(dir).or_default().push(i);
-        }
-    }
-    for (a, c) in caches.iter().enumerate() {
-        let files_named = |s: &str| {
-            stem_files
-                .get(s)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|&b| b != a)
-                .collect::<Vec<usize>>()
-        };
-        for imp in &c.imports {
-            let segs: Vec<&str> = imp
-                .module
-                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
-                .filter(|s| !s.is_empty())
-                .collect();
-            // The last segment names the module the statement actually reaches;
-            // the ones before it are the packages on the way there. Preferring
-            // it keeps `from mypkg.cli import main` pointed at `cli.py` even
-            // when the package root defines a `main` of its own. Earlier
-            // segments still get their say when the last matches nothing, which
-            // is what carries a C++ `#include "foo/bar.h"` to `bar`.
-            let mut targets: BTreeSet<usize> = segs
-                .last()
-                .map(|s| files_named(s))
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            if targets.is_empty() {
-                targets.extend(segs.iter().flat_map(|s| files_named(s)));
-            }
-            // `from pkg import cli` binds a name that is itself a module
-            targets.extend(imp.names.iter().flat_map(|n| files_named(n)));
-            for name in &imp.names {
-                imported[a].entry(name.as_str()).or_default().extend(&targets);
-            }
-            // An import that binds no names is not empty of meaning - it makes
-            // a whole file's surface available instead of picking from it. A C
-            // or C++ `#include` is the case that matters most, since the
-            // language has no other import form, and without this every call
-            // into another translation unit is unresolvable. A Rust `use m::*`
-            // and a plain C# `using Lib;` say the same thing and are treated
-            // the same way. The single-candidate rule below still applies, so
-            // widening what is available cannot invent an ambiguous edge.
-            if imp.names.is_empty() {
-                for &b in &targets {
-                    for f in &caches[b].funcs {
-                        imported[a].entry(f.name.as_str()).or_default().insert(b);
-                    }
-                }
-            }
-        }
-    }
-    // Chase each binding through the facades it passes: the name `__main__.py`
-    // imported from `mypkg` is one `mypkg/__init__.py` imported from
-    // `mypkg/cli.py`, and the definition is in the latter. Only files that
-    // import the same name are followed, and the evidence test below still
-    // requires the file it lands on to define that name - so this can widen the
-    // search without loosening what counts as proof.
-    for _ in 0..MAX_FACADE_HOPS {
-        let mut grew = false;
-        for a in 0..caches.len() {
-            for name in imported[a].keys().copied().collect::<Vec<&str>>() {
-                let hops: BTreeSet<usize> = imported[a][name]
-                    .iter()
-                    .filter_map(|&b| imported[b].get(name))
-                    .flatten()
-                    .copied()
-                    .filter(|&b| b != a)
-                    .collect();
-                let reached = imported[a].entry(name).or_default();
-                let before = reached.len();
-                reached.extend(hops);
-                grew |= reached.len() != before;
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
+    let imported = coverage::imported_names(caches);
 
     // Which definition of `name` in file `fi` a call on `line` belongs to.
     // With one candidate this is the old behaviour; with several - an overload
@@ -860,6 +743,10 @@ struct ServiceCtx {
     // the grouping degenerated to one unit per file, so "service" means
     // "module" here - not a boundary worth fanning a flame graph out over
     per_file: bool,
+    // peer repositories from `map.json` `externals`, resolved or not
+    externals: Vec<crate::externals::ExternalService>,
+    // `ccc:calls` joined to `ccc:serves`, here and across repositories
+    crossings: Vec<crate::externals::Crossing>,
 }
 
 impl ServiceCtx {
@@ -923,12 +810,23 @@ fn service_ctx(g: &Graph, root: &Path) -> ServiceCtx {
             .collect(),
         Err(_) => vec![Vec::new(); g.caches.len()],
     };
+    // Peer repositories, and the boundary crossings that reach them. Resolving
+    // a peer may parse a whole other checkout, so this rides the same memoised
+    // analysis as everything else rather than running per request.
+    let externals = crate::externals::resolve_all(root, &cfg.externals);
+    let crossings = match changes::build_matchers(&map) {
+        Ok(matchers) => changes::detect_crossings(&g.caches, &matchers, &externals),
+        Err(_) => Vec::new(),
+    };
+
     ServiceCtx {
         per_file: source.starts_with("one unit per file"),
         source: source.to_string(),
         map,
         deps: cfg.deps,
         of_file,
+        externals,
+        crossings,
     }
 }
 
@@ -1011,9 +909,56 @@ fn services(g: &Graph, ctx: &ServiceCtx) -> Value {
         }
     }
 
+    // Boundary crossings are edges too, and the only ones whose far end may be
+    // another repository. They carry a site at each end, so the reader can go
+    // from the call here to the handler there.
+    let external_names: BTreeSet<&str> = ctx.externals.iter().map(|e| e.name.as_str()).collect();
+    for crossing in &ctx.crossings {
+        if crossing.from.is_empty() || crossing.to.is_empty() {
+            continue;
+        }
+        let e = edges
+            .entry((crossing.from.clone(), crossing.to.clone()))
+            .or_default();
+        if !e.symbols.insert(crossing.key.clone()) || e.sites.len() >= MAX_EDGE_SITES {
+            continue;
+        }
+        let remote = crossing.remote.as_ref();
+        e.sites.push(json!({
+            "symbol": crossing.key,
+            "transport": crossing.transport,
+            // the far side, which may live in another repository entirely
+            "target_file": remote.map(|r| r.file.clone()),
+            "target_line": remote.map(|r| r.line),
+            "target_function": remote.map(|r| r.function.clone()),
+            "caller": crossing.function,
+            "caller_file": crossing.file,
+            "caller_line": crossing.line,
+            "calls_on": [],
+            // set when the target is a peer repository rather than a service here
+            "external": crossing.external,
+            "via": "annotation",
+        }));
+    }
+
     json!({
         "source": ctx.source,
         "declared_deps": ctx.deps,
+        "externals": ctx.externals.iter().map(|e| e.json()).collect::<Vec<_>>(),
+        "external_names": external_names.iter().collect::<Vec<_>>(),
+        "crossings": ctx.crossings.iter().map(|c| json!({
+            "key": c.key,
+            "transport": c.transport,
+            "from": c.from,
+            "to": c.to,
+            "file": c.file,
+            "line": c.line,
+            "function": c.function,
+            "external": c.external,
+            "remote": c.remote.as_ref().map(|r| json!({
+                "function": r.function, "file": r.file, "line": r.line, "service": r.service,
+            })),
+        })).collect::<Vec<_>>(),
         "services": map.keys().map(|s| json!({
             "name": s,
             "globs": map[s],
@@ -1066,56 +1011,8 @@ fn depth_below(g: &Graph) -> Vec<usize> {
     memo
 }
 
-// Which functions any test refers to, by name. Same rule `changes` uses for
-// `tested_by`: a call from a test file, a test scope, or a test-named function.
-// Name-matched, so it answers "is this exercised at all", not "is its behaviour
-// asserted" - the UI says so.
-fn test_references(g: &Graph) -> BTreeMap<String, BTreeSet<String>> {
-    test_sites(g)
-        .into_iter()
-        .map(|(k, v)| (k, v.into_iter().map(|t| t.name).take(10).collect()))
-        .collect()
-}
-
-// A test function, addressed well enough for a runner to select it.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct TestSite {
-    name: String,
-    file: String,
-    line: usize,
-    language: &'static str,
-}
-
-// callee name -> the test functions that call it, with their locations
-fn test_sites(g: &Graph) -> BTreeMap<String, BTreeSet<TestSite>> {
-    let mut out: BTreeMap<String, BTreeSet<TestSite>> = BTreeMap::new();
-    for c in g.caches {
-        let path = changes::path_str(&c.rel_path);
-        let file_is_test = changes::is_test_path(&path);
-        for call in &c.calls {
-            if !(file_is_test || call.test_ctx || changes::is_test_fn_name(&call.caller)) {
-                continue;
-            }
-            if call.caller == "<top>" {
-                continue; // file-level setup is not a selectable test
-            }
-            // the line the test is defined on, not the call
-            let line = c
-                .funcs
-                .iter()
-                .find(|f| f.name == call.caller)
-                .map(|f| f.line)
-                .unwrap_or(call.line);
-            out.entry(call.name.clone()).or_default().insert(TestSite {
-                name: call.caller.clone(),
-                file: path.clone(),
-                line,
-                language: c.language.as_str(),
-            });
-        }
-    }
-    out
-}
+// how many covering tests a target row names before it stops listing them
+const MAX_COVERED_BY: usize = 10;
 
 // The kinds of test this recommends, and what each one is for. Published with
 // the payload so the tab can explain itself.
@@ -1140,10 +1037,14 @@ pub fn test_kind_rubric() -> Value {
 }
 
 // recommend tests for the gaps; self explanatory
-fn test_targets(g: &Graph, ctx: &ServiceCtx, must_keep: &BTreeSet<(String, String)>) -> Value {
+fn test_targets(
+    g: &Graph,
+    cov: &CoverageIndex,
+    ctx: &ServiceCtx,
+    must_keep: &BTreeSet<(String, String)>,
+) -> Value {
     let n = g.nodes.len();
     let depth = depth_below(g);
-    let refs = test_references(g);
 
     // "hot" is relative to this codebase: the top decile of call sites
     let mut sites: Vec<usize> = (0..n).map(|i| g.call_sites[i]).filter(|&c| c > 0).collect();
@@ -1177,11 +1078,26 @@ fn test_targets(g: &Graph, ctx: &ServiceCtx, must_keep: &BTreeSet<(String, Strin
             .filter_map(|&c| ctx.of_node(g, c))
             .filter(|s| Some(*s) != own)
             .collect();
-        let covered_by: Vec<String> = refs
-            .get(&f.name)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
-        let covered = refs.contains_key(&f.name);
+        let covering = cov.covering(g.node_def(i));
+        let covered_by: Vec<String> = covering
+            .iter()
+            .take(MAX_COVERED_BY)
+            .map(|r| r.site.name.clone())
+            .collect();
+        let covered_by_sites: Vec<Value> = covering
+            .iter()
+            .take(MAX_COVERED_BY)
+            .map(|r| {
+                json!({
+                    "test": r.site.name,
+                    "file": r.site.file,
+                    "line": r.site.line,
+                    "language": r.site.language,
+                    "evidence": r.evidence.label(),
+                })
+            })
+            .collect();
+        let covered = cov.is_covered(g.node_def(i));
 
         let pinned = must_keep.contains(&(g.file(i), f.name.clone()));
         // a trivial leaf nobody calls is noise, not a gap - unless the branch
@@ -1331,6 +1247,7 @@ fn test_targets(g: &Graph, ctx: &ServiceCtx, must_keep: &BTreeSet<(String, Strin
                 "priority": score,
                 "covered": covered,
                 "covered_by": covered_by,
+                "covered_by_sites": covered_by_sites,
                 "suggest": suggest,
                 "why": why,
                 "semantics": semantics,
@@ -1380,9 +1297,11 @@ fn test_targets(g: &Graph, ctx: &ServiceCtx, must_keep: &BTreeSet<(String, Strin
         "truncated": truncated,
         "summary": {"functions": total, "untested": uncovered, "by_kind": by_kind},
         "rubric": test_kind_rubric(),
-        "note": "Ranked by structural risk, then by whether any test mentions the function. \
-                 `covered` means a test refers to it by name - not that its behaviour is \
-                 asserted, and not that the recommended *kind* of test exists.",
+        "note": "Ranked by structural risk, then by whether any test reaches the function. \
+                 `covered` means a test calls *this definition* - matched through its receiver \
+                 type, its file, an import or a qualifier, with the evidence named per row in \
+                 `covered_by_sites`. It does not mean the behaviour is asserted, and not that \
+                 the recommended *kind* of test exists.",
     })
 }
 
@@ -1390,6 +1309,69 @@ fn test_targets(g: &Graph, ctx: &ServiceCtx, must_keep: &BTreeSet<(String, Strin
 // `test_targets`, and referred to everywhere else by this handle.
 fn target_id(file: &str, function: &str) -> String {
     format!("{file}::{function}")
+}
+
+// Every function the map holds, with its complexity band and its arity.
+//
+// `hot.most_complex` answers "what is worst"; this answers "show me the ones
+// that look like X", which is a different question - a reader filtering for
+// dyadic functions scoring 7 needs the whole set to filter, not a top ten. It
+// is ranked by complexity so that if the cap does bite, what it keeps is the
+// end of the list anyone came here for.
+fn complexity_table(g: &Graph, ctx: &ServiceCtx) -> Value {
+    let mut rows: Vec<(usize, Value)> = Vec::new();
+    for i in 0..g.nodes.len() {
+        if g.is_module(i) {
+            continue; // a file's top level is a frame, not a function anyone wrote
+        }
+        let f = g.func(i);
+        let cx = f.metrics.complexity();
+        rows.push((
+            cx,
+            json!({
+                "id": target_id(&g.file(i), &f.name),
+                "function": f.name,
+                "file": g.file(i),
+                "line": f.line,
+                "language": g.lang(i).as_str(),
+                "service": ctx.of_node(g, i),
+                "complexity": cx,
+                "score": f.metrics.complexity_score(),
+                // Clean Code's names for arity, because "how many arguments"
+                // is the other axis people scan a function list along
+                "params": f.metrics.params,
+                "arity": arity(f.metrics.params),
+                "loop_depth": f.metrics.max_loop_depth(),
+                "lines": f.metrics.body_lines,
+                "recursive": f.metrics.recursive,
+                // a test's own complexity is real, but it is not code anyone
+                // ships - the panel defaults to hiding these
+                "test": g.is_test(i),
+            }),
+        ));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let total = rows.len();
+    let truncated = total > MAX_COMPLEXITY_ROWS;
+    json!({
+        "functions": rows.into_iter().take(MAX_COMPLEXITY_ROWS).map(|(_, v)| v).collect::<Vec<_>>(),
+        "total": total,
+        "truncated": truncated,
+        "note": "`complexity` is cyclomatic-style: one path, plus one per decision point and \
+                 loop. `score` bands it onto 1-10 for display. `arity` is the parameter count \
+                 named the way Clean Code names it.",
+    })
+}
+
+// Parameter count as a name. Beyond three the distinctions stop being useful -
+// what matters is that it is too many - so they all read as variadic.
+fn arity(params: usize) -> &'static str {
+    match params {
+        0 => "niladic",
+        1 => "monadic",
+        2 => "dyadic",
+        _ => "variadic",
+    }
 }
 
 // The branch's change set, diffed against `base`, over the map already parsed.
@@ -1486,7 +1468,7 @@ struct Triggered {
     any_change: bool,
 }
 
-fn triggered(g: &Graph, report: &changes::ChangesReport) -> Triggered {
+fn triggered(g: &Graph, cov: &CoverageIndex, report: &changes::ChangesReport) -> Triggered {
     // changed function names -> graph nodes
     let mut seeds: Vec<usize> = Vec::new();
     for i in 0..g.nodes.len() {
@@ -1521,8 +1503,9 @@ fn triggered(g: &Graph, report: &changes::ChangesReport) -> Triggered {
         }
     }
 
-    // a test is triggered when it references anything in the impacted set
-    let sites = test_sites(g);
+    // A test is triggered when it covers anything in the impacted set. The
+    // last hop uses the same evidence rule as the rest of the report: a test
+    // that merely shares a name with an impacted function is not selected.
     let mut by_test: BTreeMap<(String, String), (TestSite, usize, BTreeSet<String>)> =
         BTreeMap::new();
     for (&node, &d) in &distance {
@@ -1530,12 +1513,11 @@ fn triggered(g: &Graph, report: &changes::ChangesReport) -> Triggered {
             continue;
         }
         let name = g.name(node).to_string();
-        let Some(tests) = sites.get(&name) else { continue };
-        for t in tests {
-            let key = (t.file.clone(), t.name.clone());
+        for r in cov.covering(g.node_def(node)) {
+            let key = (r.site.file.clone(), r.site.name.clone());
             let entry = by_test
                 .entry(key)
-                .or_insert_with(|| (t.clone(), d, BTreeSet::new()));
+                .or_insert_with(|| (r.site.clone(), d, BTreeSet::new()));
             entry.1 = entry.1.min(d);
             if entry.2.len() < 8 {
                 entry.2.insert(name.clone());
@@ -1565,17 +1547,13 @@ fn triggered(g: &Graph, report: &changes::ChangesReport) -> Triggered {
         .map(|c| (c.file.clone(), c.function.clone(), c.lines.to_vec()))
         .collect();
 
-    let total_tests = sites
-        .values()
-        .flatten()
-        .map(|t| (t.file.as_str(), t.name.as_str()))
-        .collect::<BTreeSet<_>>()
-        .len();
-
     Triggered {
         run,
         gaps,
-        total_tests,
+        // every test in the map, not only the ones whose calls resolved: this
+        // is the denominator for "just run everything", so gating what counts
+        // as coverage must not quietly shrink the suite it compares against
+        total_tests: cov.total_tests(),
         any_change: !report.changed_functions.is_empty(),
     }
 }
@@ -1726,6 +1704,13 @@ pub fn insights(
 ) -> Value {
     let started = Instant::now();
     let g = build_graph(caches);
+    // The coverage relation, built from the same evidence rules as the graph
+    // and shared by every section that reports what a test reaches.
+    let project_ids: BTreeSet<String> = changes::manifest_identities(root)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let cov = coverage::build(caches, &project_ids);
     let ctx = service_ctx(&g, root);
     let n = g.nodes.len();
 
@@ -1736,7 +1721,7 @@ pub fn insights(
     let change_set = change_set(&g, root, root_label, base);
     // The trigger walk runs first: its gap list is exactly the set of target
     // rows that must survive truncation, since `add` cites them by id alone.
-    let trig = change_set.as_ref().ok().map(|r| triggered(&g, r));
+    let trig = change_set.as_ref().ok().map(|r| triggered(&g, &cov, r));
     let must_keep: BTreeSet<(String, String)> = trig
         .as_ref()
         .map(|t| {
@@ -1746,7 +1731,7 @@ pub fn insights(
                 .collect()
         })
         .unwrap_or_default();
-    let targets = test_targets(&g, &ctx, &must_keep);
+    let targets = test_targets(&g, &cov, &ctx, &must_keep);
     let (changes_section, triggers) = match (&change_set, &trig) {
         (Ok(r), Some(t)) => (
             serde_json::to_value(r).unwrap_or(Value::Null),
@@ -1921,6 +1906,7 @@ pub fn insights(
             "note": "structural, not measured: ranks by call-graph shape, not execution frequency.",
         },
         "services": services(&g, &ctx),
+        "complexity": complexity_table(&g, &ctx),
         // the one canonical change set; `test_triggers` refers to it
         "changes": changes_section,
         "test_targets": targets,
@@ -1972,6 +1958,60 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    // The Complexity panel filters this list rather than reading a ranking, so
+    // it needs every function present, each with the two axes it filters on.
+    #[test]
+    fn the_complexity_table_carries_every_function_with_its_band_and_arity() {
+        let (dir, caches) = map(
+            "cxtable",
+            &[
+                (
+                    "src/lib.rs",
+                    "pub fn flat() -> u64 { 0 }\n\
+                     pub fn one(a: u64) -> u64 { if a > 0 { a } else { 0 } }\n\
+                     pub fn two(a: u64, b: u64) -> u64 { a + b }\n\
+                     pub fn many(a: u64, b: u64, c: u64, d: u64) -> u64 { a + b + c + d }\n",
+                ),
+                (
+                    "src/lib_test.rs",
+                    "#[test]\nfn checks() { assert_eq!(1, 1); }\n",
+                ),
+            ],
+        );
+        let v = insights(&caches, dir.path(), "demo", "ts", None);
+        let rows = v["complexity"]["functions"].as_array().unwrap();
+        let row = |name: &str| {
+            rows.iter()
+                .find(|r| r["function"] == name)
+                .unwrap_or_else(|| panic!("no {name} in {rows:#?}"))
+        };
+
+        // arity is the parameter count, named
+        assert_eq!(row("flat")["arity"], "niladic");
+        assert_eq!(row("one")["arity"], "monadic");
+        assert_eq!(row("two")["arity"], "dyadic");
+        assert_eq!(row("many")["arity"], "variadic");
+        assert_eq!(row("many")["params"], 4);
+
+        // the band travels with the raw count that produced it
+        assert_eq!(row("flat")["score"], 1);
+        assert_eq!(row("flat")["complexity"], 1);
+        assert!(
+            row("one")["score"].as_u64().unwrap() > row("flat")["score"].as_u64().unwrap(),
+            "a branch has to outscore a straight line"
+        );
+
+        // tests are measured but flagged, so the panel can default to hiding them
+        assert_eq!(row("checks")["test"], true);
+        assert_eq!(row("flat")["test"], false);
+
+        // ranked worst-first, so a cap keeps the end of the list anyone wants
+        let scores: Vec<u64> = rows.iter().map(|r| r["complexity"].as_u64().unwrap()).collect();
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?} is not ranked");
+        assert_eq!(v["complexity"]["total"], rows.len());
+        assert_eq!(v["complexity"]["truncated"], false);
     }
 
     #[test]

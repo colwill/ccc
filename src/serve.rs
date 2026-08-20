@@ -1396,6 +1396,12 @@ fn q_file(map: &MapState, key: &str) -> Result<Value, String> {
         "funcs": c.funcs.iter().map(|f| json!({
             "line": f.line, "col": f.col, "name": f.name, "ret": f.ret,
             "doc": f.comment, "span": [f.start_line, f.end_line],
+            // the raw count and the 1-10 band it falls in
+            "complexity": f.metrics.complexity(),
+            "complexity_score": f.metrics.complexity_score(),
+            "branches": f.metrics.branches,
+            "loop_depth": f.metrics.max_loop_depth(),
+            "body_lines": f.metrics.body_lines,
         })).collect::<Vec<_>>(),
         "refs": c.refs.iter().map(|r| json!({
             "caller": r.caller, "call_line": r.call_line,
@@ -1548,7 +1554,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "services",
-            "ANSWERS how the parts of this system talk to each other, and which code carries each hop. The service map and the call edges between services, with the call sites behind them. Services come from `.ccc/map.json` when present, top-level directories otherwise. An edge is `declared` if the config lists it, `detected` if calls were resolved across it - both are reported, since a declared HTTP or queue link resolves no calls by design.",
+            "ANSWERS how the parts of this system talk to each other, and which code carries each hop. The service map and the call edges between services, with the call sites behind them. Services come from `.ccc/map.json` when present, top-level directories otherwise. An edge is `declared` if the config lists it, `detected` if calls were resolved across it - both are reported, since a declared HTTP or queue link resolves no calls by design. Edges also cross repositories: `externals` in `.ccc/map.json` names peer repos (a local checkout, or a surface they published with `ccc export`), and `ccc:calls` / `ccc:serves` comments naming the same key join a call here to its handler there, whatever language that repo is written in.",
             json!({
                 "service": {"type": "string", "description": "drill into one service: its definition plus every edge touching it"},
                 "limit": {"type": "integer", "description": "edges per page (default 25, max 500)"},
@@ -2711,20 +2717,78 @@ fn md_services(v: &Value, only: Option<&str>, page: Page) -> String {
             );
             // the call sites are the drill-down: what actually carries the hop
             for s in jarr(e, "sites").iter().take(6) {
+                // a crossing names its transport and, when the far side is a
+                // peer repository, says so - the target file is over there
+                let hop = match jstr(s, "transport").as_str() {
+                    "" => String::new(),
+                    t if jbool(s, "external") => format!(" [{t}, other repo]"),
+                    t => format!(" [{t}]"),
+                };
                 l.push_str(&format!(
-                    "  {}:{} {} -> {} ({}:{})\n",
+                    "  {}:{} {} -> {} ({}:{}){}\n",
                     jstr(s, "caller_file"),
                     jnum(s, "caller_line"),
                     jstr(s, "caller"),
                     jstr(s, "symbol"),
                     jstr(s, "target_file"),
                     jnum(s, "target_line"),
+                    hop,
                 ));
             }
             l
         })
         .collect();
     md_section(&mut out, &format!("edges {note}"), &body);
+
+    let externals = jarr(v, "externals");
+    if !externals.is_empty() && only.is_none() {
+        let body: String = externals
+            .iter()
+            .map(|e| {
+                let status = if jbool(e, "resolved") {
+                    format!(
+                        "{} provided, {} consumed",
+                        jnum(e, "provides"),
+                        jnum(e, "consumes")
+                    )
+                } else {
+                    format!("UNRESOLVED - {}", jstr(e, "error"))
+                };
+                format!(
+                    "{} ({}) via {} - {}\n",
+                    svc(&jstr(e, "name")),
+                    jstr(e, "repo"),
+                    jstr(e, "source"),
+                    status
+                )
+            })
+            .collect();
+        md_section(&mut out, &format!("external repos ({})", externals.len()), &body);
+    }
+
+    // A `ccc:calls` naming a key nothing answers is either a typo at one end
+    // or a peer nobody configured, and both are worth saying out loud.
+    let dangling: Vec<Value> = jarr(v, "crossings")
+        .into_iter()
+        .filter(|c| c.get("remote").map(|r| r.is_null()).unwrap_or(true))
+        .collect();
+    if !dangling.is_empty() && only.is_none() {
+        let body: String = dangling
+            .iter()
+            .take(20)
+            .map(|c| {
+                format!(
+                    "{}:{} {} calls '{}' [{}] - nothing serves this key\n",
+                    jstr(c, "file"),
+                    jnum(c, "line"),
+                    jstr(c, "function"),
+                    jstr(c, "key"),
+                    jstr(c, "transport"),
+                )
+            })
+            .collect();
+        md_section(&mut out, &format!("unanswered keys ({})", dangling.len()), &body);
+    }
 
     let unassigned = jnames(v, "unassigned_files");
     if !unassigned.is_empty() && only.is_none() {
@@ -3700,6 +3764,50 @@ mod tests {
         let api = md_file_structured(&q_file(&map, "src/api.rs").unwrap());
         assert!(api.contains("1 crate::store (Basket)"), "{api}");
         assert!(!api.contains("pub crate::store"), "{api}");
+    }
+
+    // The editor draws one glyph per function from this
+    #[test]
+    fn the_file_tool_scores_every_function_it_reports() {
+        let dir = std::env::temp_dir().join(format!("ccc-serve-cx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("src/shapes.rs"),
+            "pub fn flat(n: u64) -> u64 { n }\n\
+             pub fn forked(n: u64) -> u64 { if n > 1 { n } else { 0 } }\n\
+             pub fn knotted(n: u64) -> u64 {\n\
+             \x20   let mut t = 0;\n\
+             \x20   for i in 0..n { for j in 0..i { if j > 2 { t += 1; } else if j > 1 { t += 2; } } }\n\
+             \x20   if t > 9 { t } else if t > 4 { t + 1 } else { 0 }\n\
+             }\n",
+        )
+        .unwrap();
+        let map = MapState::build(&dir).unwrap();
+        let v = q_file(&map, "src/shapes.rs").unwrap();
+        let funcs = v["funcs"].as_array().unwrap();
+        assert_eq!(funcs.len(), 3, "{funcs:#?}");
+
+        let band = |name: &str| -> u64 {
+            funcs
+                .iter()
+                .find(|f| f["name"] == name)
+                .unwrap_or_else(|| panic!("no {name} in {funcs:#?}"))["complexity_score"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name} carries no band"))
+        };
+        // a straight-line body is the floor of the scale, not zero
+        assert_eq!(band("flat"), 1);
+        // and more decisions never score lower than fewer
+        assert!(band("forked") > band("flat"), "{funcs:#?}");
+        assert!(band("knotted") > band("forked"), "{funcs:#?}");
+        for f in funcs {
+            let s = f["complexity_score"].as_u64().unwrap();
+            assert!((1..=10).contains(&s), "band {s} out of range: {f:#?}");
+            // the raw count is what makes the band checkable, so it ships too
+            assert!(f["complexity"].as_u64().unwrap() >= 1, "{f:#?}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

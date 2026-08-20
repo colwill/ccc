@@ -3,8 +3,9 @@
 //! Groups source files into named services (from `.ccc/map.json` and/or
 //! `--service` flags), diffs the branch against a base ref.
 
-use crate::extract::{BDD_REGISTRARS, TOP_LEVEL};
-use crate::model::FileCache;
+use crate::coverage;
+use crate::extract::BDD_REGISTRARS;
+use crate::model::{Boundary, FileCache};
 use crate::scan;
 use anyhow::{anyhow, bail, Context, Result};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -21,9 +22,6 @@ pub const CONFIG_NAME: &str = "map.json";
 // prior config map names
 pub const LEGACY_CONFIG_NAMES: &[&str] = &["surf.json"];
 const MAX_EDGE_SYMBOLS: usize = 100;
-// `tested_by` is evidence, not an exhaustive index - a helper called by
-// hundreds of tests would otherwise dominate the report
-const MAX_TESTED_BY: usize = 25;
 
 
 #[derive(Debug, Default)]
@@ -47,6 +45,10 @@ pub struct ChangesConfig {
     pub services: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub deps: BTreeMap<String, Vec<String>>,
+    // peer repositories: another checkout, or a published surface. Their names
+    // are service names too, so `deps` may point at them.
+    #[serde(default)]
+    pub externals: BTreeMap<String, crate::externals::ExternalRepo>,
 }
 
 impl ChangesConfig {
@@ -86,11 +88,26 @@ pub struct ChangedFunction {
     pub function: String,
     pub lines: [usize; 2],
     pub tested: bool,
-    // named test functions that call this one, capped at MAX_TESTED_BY. Empty
+    // named test functions that cover this one, capped at MAX_TESTED_BY. Empty
     // while `tested` is true means the only test references came from code
     // outside any named test function (e.g. file-level setup).
     pub tested_by: Vec<String>,
+    // the same tests, addressed rather than named: where each one is defined
+    // and what tied it to this function. A name alone cannot be joined back to
+    // a test without guessing, which is how a reader ends up looking at a
+    // same-named test in another language.
+    pub tested_by_sites: Vec<TestedBySite>,
     pub called_from: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TestedBySite {
+    pub test: String,
+    pub file: String,
+    pub line: usize,
+    pub language: String,
+    // receiver-type | same-file | import | qualifier | name-only, weakest last
+    pub evidence: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -135,6 +152,15 @@ pub struct ChangesCounts {
     pub changed_functions: usize,
     pub untested: usize,
     pub unresolved_calls: usize,
+    // calls from test code that leave the project (`std::fs::write`) and so
+    // cover nothing here. Reported rather than dropped in silence: it is the
+    // difference between "no test covers this" and "the analyser discarded the
+    // evidence", and the two want different reactions.
+    pub external_test_calls: usize,
+    pub externals: usize,
+    pub crossings: usize,
+    // crossings whose key nothing answers: a typo, or a peer not configured
+    pub unmatched_crossings: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +181,10 @@ pub struct ChangesReport {
     // calls that matched a definition in another service but carried no
     // evidence naming it; surfaced so a missing edge can be explained
     pub unresolved_calls: Vec<UnresolvedCall>,
+    // peer repositories named in `.ccc/map.json`, and whether each resolved
+    pub externals: Vec<Value>,
+    // `ccc:calls` / `ccc:serves` pairs, including the ones that leave the repo
+    pub crossings: Vec<Value>,
     pub counts: ChangesCounts,
 }
 
@@ -186,19 +216,33 @@ pub fn changes_with_caches(
         // no config: the whole root is one service "." no cross-service edges
         config.services.insert(".".into(), vec!["**".into()]);
     }
+    // A peer repository is a service too - it owns no files here, but `deps`
+    // may name it and edges may end at it.
     for (from, tos) in &config.deps {
         for t in std::iter::once(from).chain(tos) {
-            if !config.services.contains_key(t) {
-                bail!(
-                    "map.json deps mention unknown service '{t}' \
-                     (known: {})",
-                    config.services.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
+            if config.services.contains_key(t) || config.externals.contains_key(t) {
+                continue;
             }
+            let mut known: Vec<String> = config.services.keys().cloned().collect();
+            known.extend(config.externals.keys().cloned());
+            bail!(
+                "map.json deps mention unknown service '{t}' \
+                 (known: {})",
+                known.join(", ")
+            );
+        }
+    }
+    for name in config.externals.keys() {
+        if config.services.contains_key(name) {
+            bail!(
+                "map.json names '{name}' as both a service and an external; \
+                 a name is either code in this repo or code in another one"
+            );
         }
     }
     let matchers = build_matchers(&config.services)?;
     let service_names: Vec<String> = config.services.keys().cloned().collect();
+    let externals = crate::externals::resolve_all(root, &config.externals);
 
     let (base_label, base_sha) = resolve_base(root, opts.base.as_deref())?;
     let head_sha = git(root, &["rev-parse", "HEAD"])?.trim().to_string();
@@ -246,9 +290,19 @@ pub fn changes_with_caches(
     };
 
     let idx = build_indexes(root, caches, &matchers);
+    // Which tests reach which definitions. One relation, shared with
+    // `insights`, so the two reports cannot disagree about what is covered.
+    let project_ids: BTreeSet<String> =
+        manifest_identities(root).into_iter().map(|(id, _)| id).collect();
+    let cov = coverage::build(caches, &project_ids);
 
     // cross-service edges + per-symbol caller map
-    let (edges, symbol_callers, unresolved_calls) = detect_edges(&idx, &config.deps);
+    let (mut edges, symbol_callers, unresolved_calls) = detect_edges(&idx, &config.deps);
+
+    // boundary crossings: the calls that leave the process, which the call
+    // graph cannot see and the author had to name
+    let crossings = detect_crossings(caches, &matchers, &externals);
+    merge_crossings(&mut edges, &crossings);
 
     // changed files -> services
     let mut changed_files = Vec::new();
@@ -274,12 +328,12 @@ pub fn changes_with_caches(
 
     // changed functions: hunk ranges vs function spans
     let mut changed_functions = Vec::new();
-    for cache in caches {
+    for (fi, cache) in caches.iter().enumerate() {
         let rel = path_str(&cache.rel_path);
         let Some(ranges) = hunks.get(&rel) else { continue };
         let services = assign(&matchers, &rel);
         let file_is_test = is_test_path(&rel);
-        for f in &cache.funcs {
+        for (ki, f) in cache.funcs.iter().enumerate() {
             let touched = ranges
                 .iter()
                 .any(|&(s, e)| s <= f.end_line && f.start_line <= e);
@@ -287,11 +341,23 @@ pub fn changes_with_caches(
                 continue;
             }
             let is_test_code = file_is_test || f.test_ctx;
-            let test_refs = idx.test_callers.get(&f.name);
-            let tested = is_test_code || test_refs.is_some();
-            let tested_by: Vec<String> = test_refs
-                .map(|names| names.iter().take(MAX_TESTED_BY).cloned().collect())
-                .unwrap_or_default();
+            // Coverage is looked up by *definition*, not by name: two functions
+            // sharing a name - in another module, or another language - are two
+            // different things, and only one of them is the one that changed.
+            let covering = cov.covering((fi, ki));
+            let tested = is_test_code || cov.is_covered((fi, ki));
+            let tested_by: Vec<String> =
+                covering.iter().map(|r| r.site.name.clone()).collect();
+            let tested_by_sites: Vec<TestedBySite> = covering
+                .iter()
+                .map(|r| TestedBySite {
+                    test: r.site.name.clone(),
+                    file: r.site.file.clone(),
+                    line: r.site.line,
+                    language: r.site.language.to_string(),
+                    evidence: r.evidence.label().to_string(),
+                })
+                .collect();
             let called_from: Vec<String> = symbol_callers
                 .get(&f.name)
                 .map(|callers| {
@@ -309,6 +375,7 @@ pub fn changes_with_caches(
                 lines: [f.start_line, f.end_line],
                 tested,
                 tested_by,
+                tested_by_sites,
                 called_from,
             });
         }
@@ -325,12 +392,17 @@ pub fn changes_with_caches(
         .cloned()
         .collect();
 
+    let unmatched_crossings = crossings.iter().filter(|c| c.remote.is_none()).count();
     let counts = ChangesCounts {
         services_to_test: services_to_test.len(),
         changed_files: changed_files.len(),
         changed_functions: changed_functions.len(),
         untested: untested.len(),
         unresolved_calls: unresolved_calls.len(),
+        external_test_calls: cov.external_calls(),
+        externals: externals.len(),
+        crossings: crossings.len(),
+        unmatched_crossings,
     };
 
     Ok(ChangesReport {
@@ -348,7 +420,29 @@ pub fn changes_with_caches(
         untested,
         unassigned_files: unassigned.into_iter().collect(),
         unresolved_calls,
+        externals: externals.iter().map(|e| e.json()).collect(),
+        crossings: crossings.iter().map(crossing_json).collect(),
         counts,
+    })
+}
+
+fn crossing_json(c: &crate::externals::Crossing) -> Value {
+    serde_json::json!({
+        "key": c.key,
+        "transport": c.transport,
+        "from": c.from,
+        "to": c.to,
+        "file": c.file,
+        "line": c.line,
+        "function": c.function,
+        "external": c.external,
+        // absent when nothing answers this key
+        "remote": c.remote.as_ref().map(|r| serde_json::json!({
+            "function": r.function,
+            "file": r.file,
+            "line": r.line,
+            "service": r.service,
+        })),
     })
 }
 
@@ -442,10 +536,6 @@ struct Indexes {
     wildcard_imports: BTreeMap<String, BTreeSet<String>>,
     calls: Vec<OwnedCall>,
     type_refs: Vec<TypeRef>,
-    // callee name -> the named test functions calling it. A present key with an
-    // empty set is still a test reference (the call sat outside any named
-    // function), which is what `tested` keys off.
-    test_callers: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn build_indexes(
@@ -462,7 +552,6 @@ fn build_indexes(
         imports: BTreeMap::new(),
         calls: Vec::new(),
         type_refs: Vec::new(),
-        test_callers: BTreeMap::new(),
         wildcard_imports: BTreeMap::new(),
     };
 
@@ -509,7 +598,6 @@ fn build_indexes(
     for cache in caches {
         let rel = path_str(&cache.rel_path);
         let services = assign(matchers, &rel);
-        let file_is_test = is_test_path(&rel);
         let typed = cache.language.is_typed();
 
         // which services each imported name could have come from
@@ -549,13 +637,6 @@ fn build_indexes(
         }
 
         for c in &cache.calls {
-            if file_is_test || c.test_ctx || is_test_fn_name(&c.caller) {
-                let named = idx.test_callers.entry(c.name.clone()).or_default();
-                // `<top>` is the file level, not a function
-                if c.caller != TOP_LEVEL && named.len() < MAX_TESTED_BY {
-                    named.insert(c.caller.clone());
-                }
-            }
             for s in &services {
                 idx.calls.push(OwnedCall {
                     service: s.clone(),
@@ -596,7 +677,7 @@ fn build_indexes(
 }
 
 // identifier-ish segments of an import path
-fn module_segments(module: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn module_segments(module: &str) -> impl Iterator<Item = &str> {
     module
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
         .filter(|s| !s.is_empty())
@@ -605,7 +686,7 @@ fn module_segments(module: &str) -> impl Iterator<Item = &str> {
 // Does an import path name a project? Matches a go module path by prefix
 // (`github.com/acme/billing/pkg/money` under `github.com/acme/billing`) and a
 // crate / npm package by its first segment.
-fn names_project(module: &str, id: &str) -> bool {
+pub(crate) fn names_project(module: &str, id: &str) -> bool {
     if module == id || module.starts_with(&format!("{id}/")) {
         return true;
     }
@@ -621,11 +702,37 @@ fn project_identities(
     root: &Path,
     matchers: &[(String, GlobSet)],
 ) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (id, rel_dir) in manifest_identities(root) {
+        // the manifest's directory decides which services own the project
+        let probe = if rel_dir.is_empty() {
+            "src/lib".to_string()
+        } else {
+            format!("{rel_dir}/src/lib")
+        };
+        let services = assign(matchers, &probe);
+        let services = if services.is_empty() {
+            assign(matchers, &format!("{rel_dir}/x"))
+        } else {
+            services
+        };
+        if !services.is_empty() {
+            out.entry(id).or_default().extend(services);
+        }
+    }
+    out
+}
+
+// Every project identity a manifest declares, with the directory it governs.
+// `coverage` wants the names alone - a qualifier naming the crate is a call
+// staying inside the project - while `project_identities` maps them to
+// services, so the walk is shared rather than written twice.
+pub(crate) fn manifest_identities(root: &Path) -> Vec<(String, String)> {
     const MANIFESTS: &[&str] = &["Cargo.toml", "go.mod", "package.json"];
     const SKIP: &[&str] = &[
         ".git", "target", "node_modules", "dist", "build", "out", "vendor", ".ccc",
     ];
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     // bounded walk: manifests live near the top of a tree, not deep inside it
     let mut budget = 2_000usize;
@@ -649,26 +756,12 @@ fn project_identities(
             }
             let Ok(text) = fs::read_to_string(&path) else { continue };
             let Some(id) = manifest_identity(&name, &text) else { continue };
-            // the manifest's directory decides which services own the project
             let rel_dir = path
                 .parent()
                 .and_then(|p| p.strip_prefix(root).ok())
                 .map(path_str)
                 .unwrap_or_default();
-            let probe = if rel_dir.is_empty() {
-                "src/lib".to_string()
-            } else {
-                format!("{rel_dir}/src/lib")
-            };
-            let services = assign(matchers, &probe);
-            let services = if services.is_empty() {
-                assign(matchers, &format!("{rel_dir}/x"))
-            } else {
-                services
-            };
-            if !services.is_empty() {
-                out.entry(id).or_default().extend(services);
-            }
+            out.push((id, rel_dir));
         }
     }
     out
@@ -714,6 +807,9 @@ fn manifest_identity(file: &str, text: &str) -> Option<String> {
 // receiver is the only one that identifies a target without any inference.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Via {
+    // an author wrote `ccc:calls` - a stated fact, not an inference, and the
+    // only evidence that can cross a process boundary
+    Annotation,
     ReceiverType,
     Qualifier,
     Import,
@@ -725,6 +821,7 @@ enum Via {
 impl Via {
     fn label(self) -> &'static str {
         match self {
+            Via::Annotation => "annotation",
             Via::ReceiverType => "receiver-type",
             Via::Qualifier => "qualifier",
             Via::Import => "import",
@@ -944,15 +1041,215 @@ fn detect_edges(
     (edges, symbol_callers, unresolved)
 }
 
+// Join `ccc:calls` here to `ccc:serves` there, on the key both sides wrote.
+//
+// Three shapes fall out of one rule. Both ends in this repo but in different
+// services is a local HTTP or queue hop. One end here and one in a peer's
+// surface is a cross-repository call, and it does not matter whether that peer
+// is a sibling checkout, another corner of a monorepo, or a published surface
+// from a repo in a language we cannot even parse.
+pub(crate) fn detect_crossings(
+    caches: &[FileCache],
+    matchers: &[(String, GlobSet)],
+    externals: &[crate::externals::ExternalService],
+) -> Vec<crate::externals::Crossing> {
+    use crate::externals::{norm_key, Crossing, Endpoint};
+
+    // every handler this repo publishes, by key
+    let mut local_handlers: BTreeMap<String, Vec<(String, Endpoint)>> = BTreeMap::new();
+    for cache in caches {
+        let file = path_str(&cache.rel_path);
+        let services = assign(matchers, &file);
+        for ann in &cache.annotations {
+            if ann.boundary != Boundary::Serves {
+                continue;
+            }
+            let endpoint = Endpoint {
+                key: ann.key.clone(),
+                transport: ann.transport.clone(),
+                function: ann.function.clone(),
+                file: file.clone(),
+                line: ann.line,
+                service: services.first().cloned(),
+            };
+            for service in services.iter() {
+                local_handlers
+                    .entry(norm_key(&ann.key))
+                    .or_default()
+                    .push((service.clone(), endpoint.clone()));
+            }
+            if services.is_empty() {
+                local_handlers
+                    .entry(norm_key(&ann.key))
+                    .or_default()
+                    .push((String::new(), endpoint.clone()));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+
+    // outbound: a call here, matched against peers first, then against this
+    // repo's own handlers
+    for cache in caches {
+        let file = path_str(&cache.rel_path);
+        let services = assign(matchers, &file);
+        for ann in &cache.annotations {
+            if ann.boundary != Boundary::Calls {
+                continue;
+            }
+            let key = norm_key(&ann.key);
+            let from = services.first().cloned().unwrap_or_default();
+
+            let mut matched = false;
+            for external in externals {
+                let Some(surface) = &external.surface else {
+                    continue;
+                };
+                for endpoint in surface.provides.iter().filter(|e| norm_key(&e.key) == key) {
+                    matched = true;
+                    out.push(Crossing {
+                        key: ann.key.clone(),
+                        transport: pick_transport(&ann.transport, &endpoint.transport),
+                        from: from.clone(),
+                        to: external.name.clone(),
+                        file: file.clone(),
+                        line: ann.line,
+                        function: ann.function.clone(),
+                        remote: Some(endpoint.clone()),
+                        external: true,
+                    });
+                }
+            }
+
+            for (service, endpoint) in local_handlers.get(&key).into_iter().flatten() {
+                // a handler in the same service is an internal detail, not a
+                // boundary crossing
+                if service == &from {
+                    continue;
+                }
+                matched = true;
+                out.push(Crossing {
+                    key: ann.key.clone(),
+                    transport: pick_transport(&ann.transport, &endpoint.transport),
+                    from: from.clone(),
+                    to: service.clone(),
+                    file: file.clone(),
+                    line: ann.line,
+                    function: ann.function.clone(),
+                    remote: Some(endpoint.clone()),
+                    external: false,
+                });
+            }
+
+            // A call naming a key nobody answers is worth reporting: it is
+            // either a typo at one end, or a peer that was never configured.
+            if !matched {
+                out.push(Crossing {
+                    key: ann.key.clone(),
+                    transport: ann.transport.clone(),
+                    from,
+                    to: String::new(),
+                    file: file.clone(),
+                    line: ann.line,
+                    function: ann.function.clone(),
+                    remote: None,
+                    external: false,
+                });
+            }
+        }
+    }
+
+    // inbound: a peer says it calls a key this repo serves. Nothing local can
+    // observe that, so it only exists because the peer published it.
+    for external in externals {
+        let Some(surface) = &external.surface else {
+            continue;
+        };
+        for consumed in &surface.consumes {
+            let key = norm_key(&consumed.key);
+            for (service, endpoint) in local_handlers.get(&key).into_iter().flatten() {
+                out.push(Crossing {
+                    key: consumed.key.clone(),
+                    transport: pick_transport(&consumed.transport, &endpoint.transport),
+                    from: external.name.clone(),
+                    to: service.clone(),
+                    file: endpoint.file.clone(),
+                    line: endpoint.line,
+                    function: endpoint.function.clone(),
+                    remote: Some(consumed.clone()),
+                    external: true,
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        (&a.from, &a.to, &a.key, &a.file, a.line).cmp(&(&b.from, &b.to, &b.key, &b.file, b.line))
+    });
+    out
+}
+
+// One side may name a transport and the other leave it out; prefer whichever
+// actually said something.
+fn pick_transport(a: &str, b: &str) -> String {
+    if a != "unspecified" {
+        a.to_string()
+    } else {
+        b.to_string()
+    }
+}
+
+// Fold crossings into the service edges, so a cross-repo call is an edge of
+// the same graph as every other dependency rather than a separate report.
+fn merge_crossings(edges: &mut Vec<ServiceEdge>, crossings: &[crate::externals::Crossing]) {
+    for crossing in crossings {
+        if crossing.from.is_empty() || crossing.to.is_empty() {
+            continue;
+        }
+        let symbol = EdgeSymbol {
+            symbol: crossing.key.clone(),
+            file: crossing.file.clone(),
+            line: crossing.line,
+            via: Via::Annotation.label().to_string(),
+            kind: crossing.transport.clone(),
+        };
+        match edges
+            .iter_mut()
+            .find(|e| e.from == crossing.from && e.to == crossing.to)
+        {
+            Some(edge) => {
+                if !edge
+                    .symbols
+                    .iter()
+                    .any(|s| s.symbol == symbol.symbol && s.line == symbol.line && s.file == symbol.file)
+                {
+                    edge.symbols.push(symbol);
+                }
+                edge.detected = true;
+            }
+            None => edges.push(ServiceEdge {
+                from: crossing.from.clone(),
+                to: crossing.to.clone(),
+                declared: false,
+                detected: true,
+                symbols: vec![symbol],
+            }),
+        }
+    }
+    edges.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+}
+
 // strongest evidence first, so an edge reports the best reason it has
 fn via_rank(via: &str) -> usize {
     match via {
-        "receiver-type" => 0,
-        "qualifier" => 1,
-        "project" => 2,
-        "import" => 3,
-        "type-reference" => 4,
-        _ => 5,
+        "annotation" => 0,
+        "receiver-type" => 1,
+        "qualifier" => 2,
+        "project" => 3,
+        "import" => 4,
+        "type-reference" => 5,
+        _ => 6,
     }
 }
 
@@ -1241,7 +1538,7 @@ pub(crate) fn is_test_path(path: &str) -> bool {
     false
 }
 
-pub(crate) fn path_str(p: &Path) -> String {
+pub fn path_str(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
@@ -1314,7 +1611,6 @@ diff --git a/gone.rs b/gone.rs
             wildcard_imports: BTreeMap::new(),
             calls,
             type_refs: Vec::new(),
-            test_callers: BTreeMap::new(),
         }
     }
 
@@ -1423,6 +1719,223 @@ diff --git a/gone.rs b/gone.rs
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].symbols[0].kind, "type");
         assert_eq!(edges[0].symbols[0].via, "type-reference");
+    }
+
+    fn fixture(lang: crate::languages::Language, rel: &str, src: &str) -> FileCache {
+        let ex = crate::extract::extract(lang, src).expect("parse");
+        FileCache {
+            rel_path: PathBuf::from(rel),
+            cache_name: rel.replace('/', "-"),
+            display_name: rel.to_string(),
+            language: lang,
+            lines: src.lines().count(),
+            consts: ex.consts,
+            funcs: ex.funcs,
+            refs: ex.refs,
+            notes: ex.notes,
+            calls: ex.calls,
+            uses: ex.uses,
+            imports: ex.imports,
+            types: ex.types,
+            modules: ex.modules,
+            annotations: ex.annotations,
+        }
+    }
+
+    fn two_service_matchers() -> Vec<(String, GlobSet)> {
+        let mut services = BTreeMap::new();
+        services.insert("gateway".to_string(), vec!["gateway/**".to_string()]);
+        services.insert("shared".to_string(), vec!["shared/**".to_string()]);
+        build_matchers(&services).expect("globs")
+    }
+
+    // The monorepo case: two directories in one repo, joined by a key rather
+    // than by a call the parser could ever follow.
+    #[test]
+    fn a_key_joins_two_services_in_one_repo() {
+        let caches = vec![
+            fixture(
+                crate::languages::Language::Rust,
+                "gateway/main.rs",
+                "pub fn emit() {\n    // ccc:calls queue audit.events\n    let _ = 1;\n}\n",
+            ),
+            fixture(
+                crate::languages::Language::Rust,
+                "shared/audit.rs",
+                "// ccc:serves queue audit.events\npub fn record(e: &str) -> usize { e.len() }\n",
+            ),
+        ];
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        assert_eq!(crossings.len(), 1, "{crossings:?}");
+        let c = &crossings[0];
+        assert_eq!((c.from.as_str(), c.to.as_str()), ("gateway", "shared"));
+        assert_eq!(c.transport, "queue");
+        assert_eq!(c.file, "gateway/main.rs");
+        assert_eq!(c.line, 2, "the call site is the comment, not the function");
+        assert!(!c.external);
+        let remote = c.remote.as_ref().expect("handler");
+        assert_eq!((remote.file.as_str(), remote.function.as_str()), ("shared/audit.rs", "record"));
+    }
+
+    // The cross-repo case: the far end is a surface, in another language, and
+    // no source from it is ever parsed here.
+    #[test]
+    fn a_key_joins_a_call_here_to_a_handler_in_a_peer_repo() {
+        let caches = vec![fixture(
+            crate::languages::Language::Rust,
+            "gateway/main.rs",
+            "pub fn checkout() {\n    // ccc:calls grpc billing.v1.Charge\n    let _ = 1;\n}\n",
+        )];
+        let peer = crate::externals::ExternalService {
+            name: "billing".to_string(),
+            config: Default::default(),
+            source: "surface test".to_string(),
+            surface: Some(crate::externals::Surface {
+                schema: crate::externals::SURFACE_SCHEMA.to_string(),
+                name: "billing".to_string(),
+                generated: "t".to_string(),
+                repo: Some("acme/billing".to_string()),
+                languages: vec!["go".to_string()],
+                provides: vec![crate::externals::Endpoint {
+                    key: "billing.v1.Charge".to_string(),
+                    transport: "grpc".to_string(),
+                    function: "Charge".to_string(),
+                    file: "svc/charge.go".to_string(),
+                    line: 42,
+                    service: None,
+                }],
+                consumes: Vec::new(),
+            }),
+            error: None,
+        };
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[peer]);
+        assert_eq!(crossings.len(), 1, "{crossings:?}");
+        let c = &crossings[0];
+        assert_eq!(c.to, "billing");
+        assert!(c.external, "the far end is another repository");
+        let remote = c.remote.as_ref().expect("handler");
+        assert_eq!((remote.file.as_str(), remote.line), ("svc/charge.go", 42));
+    }
+
+    // Keys are written by hand at both ends; case and padding are not identity.
+    #[test]
+    fn key_matching_ignores_case_and_padding() {
+        let caches = vec![
+            fixture(
+                crate::languages::Language::Rust,
+                "gateway/main.rs",
+                "pub fn a() {\n    // ccc:calls grpc Billing.V1.Charge\n}\n",
+            ),
+            fixture(
+                crate::languages::Language::Go,
+                "shared/b.go",
+                "package b\n\n// ccc:serves grpc billing.v1.charge\nfunc Charge() {}\n",
+            ),
+        ];
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        assert_eq!(crossings.len(), 1, "{crossings:?}");
+        assert!(crossings[0].remote.is_some());
+    }
+
+    // A call nobody answers is a finding, not silence: it is a typo at one end
+    // or a peer nobody configured.
+    #[test]
+    fn a_key_nothing_serves_is_reported_unmatched() {
+        let caches = vec![fixture(
+            crate::languages::Language::Rust,
+            "gateway/main.rs",
+            "pub fn a() {\n    // ccc:calls grpc nobody.Answers\n}\n",
+        )];
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        assert_eq!(crossings.len(), 1);
+        assert!(crossings[0].remote.is_none());
+        assert_eq!(crossings[0].to, "");
+    }
+
+    // Calling a handler in your own service is an ordinary call, not a hop.
+    #[test]
+    fn a_key_served_inside_the_same_service_is_not_a_crossing() {
+        let caches = vec![fixture(
+            crate::languages::Language::Rust,
+            "gateway/main.rs",
+            "// ccc:serves queue x.y\npub fn h() {}\n\npub fn a() {\n    // ccc:calls queue x.y\n}\n",
+        )];
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        assert!(crossings.iter().all(|c| c.remote.is_none()), "{crossings:?}");
+    }
+
+    // A peer publishes what it consumes, which is the only way this repo can
+    // learn that something out there calls in.
+    #[test]
+    fn a_peer_consuming_our_key_is_an_inbound_crossing() {
+        let caches = vec![fixture(
+            crate::languages::Language::Rust,
+            "shared/audit.rs",
+            "// ccc:serves grpc audit.v1.Record\npub fn record() {}\n",
+        )];
+        let peer = crate::externals::ExternalService {
+            name: "billing".to_string(),
+            config: Default::default(),
+            source: "surface test".to_string(),
+            surface: Some(crate::externals::Surface {
+                schema: crate::externals::SURFACE_SCHEMA.to_string(),
+                name: "billing".to_string(),
+                generated: "t".to_string(),
+                repo: None,
+                languages: vec!["go".to_string()],
+                provides: Vec::new(),
+                consumes: vec![crate::externals::Endpoint {
+                    key: "audit.v1.Record".to_string(),
+                    transport: "grpc".to_string(),
+                    function: "Charge".to_string(),
+                    file: "svc/charge.go".to_string(),
+                    line: 7,
+                    service: None,
+                }],
+            }),
+            error: None,
+        };
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[peer]);
+        assert_eq!(crossings.len(), 1, "{crossings:?}");
+        let c = &crossings[0];
+        assert_eq!((c.from.as_str(), c.to.as_str()), ("billing", "shared"));
+        assert_eq!(c.file, "shared/audit.rs", "the local handler carries the hint");
+    }
+
+    // A surface round-trips: what one repo exports is what another reads.
+    #[test]
+    fn a_surface_round_trips_through_json() {
+        let caches = vec![fixture(
+            crate::languages::Language::Go,
+            "svc/charge.go",
+            "package svc\n\n// ccc:serves grpc billing.v1.Charge\nfunc Charge() {}\n\nfunc C() {\n\t// ccc:calls grpc ledger.v1.Write\n}\n",
+        )];
+        let surface = crate::externals::Surface::from_caches("billing", "t", &caches);
+        assert_eq!(surface.provides.len(), 1);
+        assert_eq!(surface.consumes.len(), 1);
+        assert_eq!(surface.languages, vec!["go".to_string()]);
+        let json = serde_json::to_string(&surface).expect("serialize");
+        let back: crate::externals::Surface = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.provides[0].key, "billing.v1.Charge");
+        assert_eq!(back.provides[0].function, "Charge");
+    }
+
+    // `deps` may name a peer, but a name cannot be both a local service and a
+    // repository somewhere else.
+    #[test]
+    fn a_dep_may_name_an_external_but_a_name_cannot_be_both() {
+        let cfg: ChangesConfig = serde_json::from_str(
+            r#"{"services":{"gateway":["gateway/**"]},
+                "deps":{"gateway":["billing"]},
+                "externals":{"billing":{"path":"../billing"}}}"#,
+        )
+        .expect("parse");
+        assert!(cfg.externals.contains_key("billing"));
+        assert_eq!(cfg.externals["billing"].path.as_deref(), Some("../billing"));
+        // unknown keys stay ignored, so an older ccc reads a newer map.json
+        let old: ChangesConfig =
+            serde_json::from_str(r#"{"services":{},"deps":{},"future_field":42}"#).expect("parse");
+        assert!(old.services.is_empty());
     }
 
     #[test]

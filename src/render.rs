@@ -83,6 +83,22 @@ pub fn render_file(fc: &FileCache, ts: &str) -> String {
         let _ = writeln!(out, "    - @L{} {}", n.line, n.text);
     }
 
+    // author-written boundary hints: the calls that leave this process
+    if !fc.annotations.is_empty() {
+        let _ = writeln!(out, "# boundary");
+        for a in &fc.annotations {
+            let _ = writeln!(
+                out,
+                "    - @L{} {}@{} {} {}",
+                a.line,
+                a.function,
+                a.boundary.label(),
+                a.transport,
+                a.key
+            );
+        }
+    }
+
     out
 }
 

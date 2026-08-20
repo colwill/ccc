@@ -512,7 +512,7 @@ const table = (cols, rows, narrow = []) => {
   </table></div>` : '<p class="text-sm text-slate-500">nothing to show</p>';
 };
 
-// ---- flame: nested bars whose width is the child's share of its parent ----
+// flame - nested bars whose width is the child's share of its parent
 // Static call tree, so width is reachable call sites and not sampled time.
 const HUES = ['bg-indigo-500/70','bg-sky-500/70','bg-emerald-500/70','bg-amber-500/70','bg-rose-500/70','bg-fuchsia-500/70','bg-teal-500/70','bg-violet-500/70'];
 

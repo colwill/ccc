@@ -2,7 +2,7 @@
 
 use crate::languages::Language;
 use crate::model::{
-    CallSite, Const, Func, FuncMetrics, Import, LoopInfo, Note, Ref, ResourceOp, TypeDef,
+    Annotation, Boundary, CallSite, Const, Func, FuncMetrics, Import, LoopInfo, Note, Ref, ResourceOp, TypeDef,
 };
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
@@ -26,6 +26,8 @@ pub struct Extracted {
     pub types: Vec<TypeDef>,
     // module identities declared here (go `package`, c++ `namespace`, rust `mod`)
     pub modules: Vec<String>,
+    // `ccc:serves` / `ccc:calls` boundary hints written in comments
+    pub annotations: Vec<Annotation>,
 }
 
 enum CallKind {
@@ -62,6 +64,9 @@ struct Ctx<'a> {
     imports: Vec<Import>,
     types: Vec<TypeDef>,
     modules: Vec<String>,
+    annotations: Vec<Annotation>,
+    // 1-based lines of `ccc:skip` directives, resolved after the walk
+    skips: Vec<usize>,
     // variable name -> declared type, one frame per lexical scope. Lets a
     // method call be attributed to its receiver's type instead of guessed at
     // from the method name alone.
@@ -147,12 +152,22 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         type_env: vec![HashMap::new()],
         free_index: HashMap::new(),
         method_index: HashMap::new(),
+        annotations: Vec::new(),
+        skips: Vec::new(),
         scope_stack: Vec::new(),
         test_mod_depth: 0,
         import_depth: 0,
         enum_types: Vec::new(),
     };
     visit(tree.root_node(), &mut ctx);
+
+    // Honour `ccc:skip` before anything is derived from the walk: a marker on
+    // a function removes that function, any other placement withdraws the
+    // whole file - which reports the same `None` as an unparseable file, so
+    // every consumer already handles it.
+    if !apply_skips(&mut ctx) {
+        return None;
+    }
 
     // resolve calls to same-file definitions
     let mut refs = Vec::new();
@@ -202,6 +217,9 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
     ctx.uses
         .sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
     ctx.imports.sort_by_key(|i| i.line);
+    // after `funcs` is final: a directive is bound to a definition by position
+    ctx.annotations.sort_by_key(|a| a.line);
+    bind_annotations(&mut ctx.annotations, &ctx.funcs);
 
     Some(Extracted {
         consts: ctx.consts,
@@ -213,6 +231,7 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         modules: ctx.modules,
         uses: ctx.uses,
         imports: ctx.imports,
+        annotations: ctx.annotations,
     })
 }
 
@@ -368,6 +387,8 @@ fn visit(node: Node, ctx: &mut Ctx) {
         }
     } else if lang.comment_kinds().contains(&kind) {
         maybe_note(node, ctx);
+        maybe_annotations(node, ctx);
+        maybe_skips(node, ctx);
     } else if lang == Language::Rust && kind == "token_tree" {
         // macro bodies (`assert_eq!(charge(1), 31)`) are token trees, not
         // expressions - approximate the calls inside so `changes` sees them
@@ -1665,6 +1686,7 @@ fn is_reexport(lang: Language, stmt: &str) -> bool {
 }
 
 // split one import statement into (module, bound names) pairs.
+// ccc:calls
 fn parse_import(lang: Language, stmt: &str) -> Vec<(String, Vec<String>)> {
     let idents = |s: &str| -> Vec<String> {
         s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -2112,6 +2134,230 @@ fn maybe_note(node: Node, ctx: &mut Ctx) {
     });
 }
 
+// Transports we name in prose. Anything else an author writes is still
+// accepted - it just travels as part of the key rather than as a transport.
+const TRANSPORTS: &[&str] = &[
+    "grpc", "rest", "http", "https", "graphql", "queue", "event", "webhook", "ffi", "cli", "soap",
+    "websocket", "ws", "sql", "rpc",
+];
+
+const ANNOTATION_PREFIX: &str = "ccc:";
+
+// `ccc:serves grpc billing.v1.Charge` and `ccc:calls grpc billing.v1.Charge`,
+// written in whatever comment syntax the language uses. One spelling for every
+// language: `strip_comment` has already removed the delimiters by the time we
+// see the body, so nothing here is language-specific.
+//
+// A comment can carry more than one directive when it is a block, so every
+// line is examined.
+fn maybe_annotations(node: Node, ctx: &mut Ctx) {
+    let raw = text(node, ctx.src);
+    if !raw.contains(ANNOTATION_PREFIX) {
+        return;
+    }
+    let start = pos(node).0;
+    let body = strip_comment(raw);
+    for (offset, line) in body.lines().enumerate() {
+        let Some(parsed) = parse_annotation(line) else {
+            continue;
+        };
+        let (boundary, transport, key) = parsed;
+        ctx.annotations.push(Annotation {
+            line: start + offset,
+            boundary,
+            transport,
+            key,
+            // rewritten once the file's functions are known; a directive above
+            // a definition sits outside it, so the enclosing scope is wrong
+            function: String::new(),
+        });
+    }
+}
+
+// One directive, already stripped of its comment delimiters.
+fn parse_annotation(line: &str) -> Option<(Boundary, String, String)> {
+    let at = line.find(ANNOTATION_PREFIX)?;
+    // must open the comment or follow whitespace, so `// see ccc:serves` and a
+    // URL like `http://x/ccc:serves` are not directives
+    if !line[..at]
+        .chars()
+        .next_back()
+        .map_or(true, |c| c.is_whitespace())
+    {
+        return None;
+    }
+    let rest = &line[at + ANNOTATION_PREFIX.len()..];
+    let mut words = rest.split_whitespace();
+    let boundary = match words.next()?.to_ascii_lowercase().as_str() {
+        "serves" | "provides" | "handles" => Boundary::Serves,
+        "calls" | "consumes" | "uses" => Boundary::Calls,
+        _ => return None,
+    };
+
+    let tail = rest
+        .split_once(char::is_whitespace)
+        .map(|(_, t)| t.trim())
+        .unwrap_or_default();
+    if tail.is_empty() {
+        return None;
+    }
+    // A leading known transport is metadata; anything else is all key, so
+    // `ccc:calls billing.v1.Charge` works without naming a transport.
+    let (transport, key) = match tail.split_once(char::is_whitespace) {
+        Some((head, rest)) if TRANSPORTS.contains(&head.to_ascii_lowercase().as_str()) => {
+            (head.to_ascii_lowercase(), rest.trim())
+        }
+        _ if TRANSPORTS.contains(&tail.to_ascii_lowercase().as_str()) => {
+            // a transport and nothing else names no key, so there is nothing
+            // for the far end to match on
+            return None;
+        }
+        _ => ("unspecified".to_string(), tail),
+    };
+    if key.is_empty() {
+        return None;
+    }
+    Some((boundary, transport, truncate(key, 160)))
+}
+
+// `ccc:skip`, in whatever comment syntax the language uses: the delimiters
+// are already gone by the time the body is examined, so `// ccc:skip`,
+// `# ccc:skip`, `/* ccc:skip */` and `-- ccc:skip` all read the same. Trailing
+// prose is allowed - `// ccc:skip generated` - so an author can say why.
+fn maybe_skips(node: Node, ctx: &mut Ctx) {
+    let raw = text(node, ctx.src);
+    if !raw.contains(ANNOTATION_PREFIX) {
+        return;
+    }
+    let start = pos(node).0;
+    let body = strip_comment(raw);
+    for (offset, line) in body.lines().enumerate() {
+        if is_skip_directive(line) {
+            ctx.skips.push(start + offset);
+        }
+    }
+}
+
+// Same guard as `parse_annotation`: the marker must open the comment or follow
+// whitespace, so prose like `see ccc:skip` in a URL is not a directive.
+fn is_skip_directive(line: &str) -> bool {
+    let Some(at) = line.find(ANNOTATION_PREFIX) else {
+        return false;
+    };
+    if !line[..at]
+        .chars()
+        .next_back()
+        .map_or(true, |c| c.is_whitespace())
+    {
+        return false;
+    }
+    let rest = &line[at + ANNOTATION_PREFIX.len()..];
+    rest.split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("skip"))
+}
+
+// Resolve every `ccc:skip` the walk collected. Returns `false` when the whole
+// file is withdrawn.
+//
+// Placement decides the scope, and the file is the default: at the very top
+// of the file the marker withdraws the file, even when a definition opens it.
+// Inside a function, or directly above one - attribute and decorator lines
+// may sit between, a blank line may not - it withdraws just that function.
+// Anywhere else it is a file-level statement and withdraws the file.
+fn apply_skips(ctx: &mut Ctx) -> bool {
+    if ctx.skips.is_empty() {
+        return true;
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for &line in &ctx.skips {
+        let at_top = ctx
+            .src
+            .lines()
+            .take(line.saturating_sub(1))
+            .all(|l| l.trim().is_empty());
+        if at_top {
+            return false;
+        }
+        if let Some(f) = ctx
+            .funcs
+            .iter()
+            .filter(|f| line >= f.start_line && line <= f.end_line)
+            .max_by_key(|f| f.start_line)
+        {
+            spans.push((f.start_line, f.end_line));
+            continue;
+        }
+        let below = ctx
+            .funcs
+            .iter()
+            .filter(|f| f.start_line > line && f.start_line - line <= MAX_ANNOTATION_GAP)
+            .min_by_key(|f| f.start_line)
+            // "directly above": every line between the marker and the
+            // definition is non-blank, so a detached comment stays file-wide
+            .filter(|f| {
+                ctx.src
+                    .lines()
+                    .skip(line)
+                    .take(f.start_line - line - 1)
+                    .all(|l| !l.trim().is_empty())
+            });
+        match below {
+            Some(f) => spans.push((f.start_line, f.end_line)),
+            None => return false,
+        }
+    }
+
+    // Drop the skipped functions and everything the walk saw inside them,
+    // including their entries in the call-target indices: a skipped function
+    // is neither a definition nor a place calls resolve to.
+    let hit = |l: usize| spans.iter().any(|&(s, e)| l >= s && l <= e);
+    ctx.funcs.retain(|f| !hit(f.start_line));
+    ctx.consts.retain(|c| !hit(c.line));
+    ctx.notes.retain(|n| !hit(n.line));
+    ctx.calls.retain(|c| !hit(c.call_line));
+    ctx.loose_calls.retain(|c| !hit(c.line));
+    ctx.uses.retain(|u| !hit(u.line));
+    ctx.imports.retain(|i| !hit(i.line));
+    ctx.annotations.retain(|a| !hit(a.line));
+    ctx.free_index.retain(|_, &mut (l, _, _)| !hit(l));
+    ctx.method_index.retain(|_, &mut (l, _, _)| !hit(l));
+    true
+}
+
+// Bind each directive to a function.
+//
+// A directive inside a function body belongs to that function - that is where
+// `ccc:calls` naturally sits, on the call it describes. A directive above a
+// definition belongs to the definition below it, which is where `ccc:serves`
+// naturally sits, in the doc block of a handler. `MAX_ANNOTATION_GAP` keeps a
+// file-header comment from being claimed by the first function far below it.
+const MAX_ANNOTATION_GAP: usize = 10;
+
+fn bind_annotations(annotations: &mut [Annotation], funcs: &[Func]) {
+    for ann in annotations.iter_mut() {
+        // innermost enclosing function, if any
+        let enclosing = funcs
+            .iter()
+            .filter(|f| ann.line >= f.start_line && ann.line <= f.end_line)
+            .max_by_key(|f| f.start_line);
+        if let Some(f) = enclosing {
+            ann.function = f.name.clone();
+            continue;
+        }
+        // otherwise the nearest definition below, allowing for the attribute
+        // or decorator lines a language may put in between
+        let below = funcs
+            .iter()
+            .filter(|f| f.start_line > ann.line && f.start_line - ann.line <= MAX_ANNOTATION_GAP)
+            .min_by_key(|f| f.start_line);
+        ann.function = match below {
+            Some(f) => f.name.clone(),
+            None => TOP_LEVEL.to_string(),
+        };
+    }
+}
+
 // nearest comment immediately preceding a function definition, used as its
 // one-line inline/doc comment
 fn preceding_comment(node: Node, ctx: &Ctx) -> Option<String> {
@@ -2240,6 +2486,128 @@ fn strip_comment(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn annotations_of(lang: Language, src: &str) -> Vec<(usize, &'static str, String, String, String)> {
+        extract(lang, src)
+            .expect("parse")
+            .annotations
+            .into_iter()
+            .map(|a| (a.line, a.boundary.label(), a.transport, a.key, a.function))
+            .collect()
+    }
+
+    // The whole point of the comment form: one spelling, every language, no
+    // build-time dependency anywhere.
+    #[test]
+    fn boundary_hints_parse_in_every_language() {
+        for (lang, src, want_fn) in [
+            (
+                Language::Rust,
+                "// ccc:serves grpc billing.v1.Charge\npub fn charge(n: u64) -> u64 { n }\n",
+                "charge",
+            ),
+            (
+                Language::Go,
+                "package p\n\n// ccc:serves grpc billing.v1.Charge\nfunc Charge(n int) int { return n }\n",
+                "Charge",
+            ),
+            (
+                Language::Python,
+                "# ccc:serves grpc billing.v1.Charge\ndef charge(n):\n    return n\n",
+                "charge",
+            ),
+            (
+                Language::TypeScript,
+                "// ccc:serves grpc billing.v1.Charge\nexport function charge(n: number) { return n; }\n",
+                "charge",
+            ),
+            (
+                Language::CSharp,
+                "class C {\n  // ccc:serves grpc billing.v1.Charge\n  int Charge(int n) { return n; }\n}\n",
+                "Charge",
+            ),
+        ] {
+            let got = annotations_of(lang, src);
+            assert_eq!(got.len(), 1, "{lang:?}: {got:?}");
+            let (_, boundary, transport, key, function) = &got[0];
+            assert_eq!(*boundary, "serves", "{lang:?}");
+            assert_eq!(transport, "grpc", "{lang:?}");
+            assert_eq!(key, "billing.v1.Charge", "{lang:?}");
+            assert_eq!(function, want_fn, "{lang:?}");
+        }
+    }
+
+    // A directive above a definition belongs to it; one inside a body belongs
+    // to the function it sits in, which is where a call is described.
+    #[test]
+    fn a_hint_binds_above_a_definition_and_inside_a_body() {
+        let got = annotations_of(
+            Language::Rust,
+            "// ccc:serves grpc a.Serve\npub fn outer() {\n    // ccc:calls grpc b.Call\n    inner();\n}\n",
+        );
+        assert_eq!(got[0].1, "serves");
+        assert_eq!(got[0].4, "outer", "a hint above a definition names it");
+        assert_eq!(got[1].1, "calls");
+        assert_eq!(got[1].4, "outer", "a hint in a body names its function");
+    }
+
+    // Decorators and attributes sit between the comment and the definition,
+    // and must not break the binding.
+    #[test]
+    fn a_hint_survives_decorators_and_attributes() {
+        let py = annotations_of(
+            Language::Python,
+            "# ccc:serves rest GET /health\n@app.route(\"/health\")\n@cached\ndef health():\n    return 1\n",
+        );
+        assert_eq!(py[0].4, "health");
+        assert_eq!(py[0].3, "GET /health", "the whole remainder is the key");
+
+        let rs = annotations_of(
+            Language::Rust,
+            "/// Refund money.\n/// ccc:serves rest POST /refund\n#[inline]\npub fn refund(x: u64) -> u64 { x }\n",
+        );
+        assert_eq!(rs[0].4, "refund", "a directive below a doc summary still binds");
+    }
+
+    // The transport is optional; without one there is still a key to match on.
+    #[test]
+    fn a_hint_without_a_transport_is_all_key() {
+        let got = annotations_of(Language::Rust, "// ccc:calls billing.v1.Charge\nfn f() {}\n");
+        assert_eq!(got[0].2, "unspecified");
+        assert_eq!(got[0].3, "billing.v1.Charge");
+    }
+
+    // A transport and nothing else names no key, so there is nothing for the
+    // far end to match - better to ignore it than to invent an empty edge.
+    #[test]
+    fn a_hint_naming_only_a_transport_is_not_a_directive() {
+        assert!(annotations_of(Language::Rust, "// ccc:calls grpc\nfn f() {}\n").is_empty());
+    }
+
+    // `ccc:` has to be written as a directive, not merely contained.
+    #[test]
+    fn prose_and_urls_are_not_directives() {
+        for src in [
+            "// see http://example.com/ccc:serves for details\nfn f() {}\n",
+            "// notccc:serves grpc a.B\nfn f() {}\n",
+            "// ccc:whatever grpc a.B\nfn f() {}\n",
+        ] {
+            assert!(annotations_of(Language::Rust, src).is_empty(), "{src}");
+        }
+    }
+
+    // A file-header hint has no definition to attach to and must not be
+    // dragged onto whatever function happens to appear much later.
+    #[test]
+    fn a_far_away_hint_stays_at_file_level() {
+        let mut src = String::from("// ccc:serves grpc a.B\n");
+        for _ in 0..20 {
+            src.push_str("//\n");
+        }
+        src.push_str("fn much_later() {}\n");
+        let got = annotations_of(Language::Rust, &src);
+        assert_eq!(got[0].4, TOP_LEVEL);
+    }
 
     struct LangFixture {
         lang: Language,
@@ -3322,5 +3690,94 @@ mod tests {
         assert!(ex.consts.iter().any(|c| c.name == "KEEP"));
         assert!(!ex.consts.iter().any(|c| c.name == "drop"));
         assert!(!ex.consts.iter().any(|c| c.name == "also"));
+    }
+
+    // `ccc:skip` at the very top withdraws the file, in every comment syntax.
+    #[test]
+    fn skip_at_the_top_withdraws_the_file_in_every_language() {
+        for (lang, src) in [
+            (Language::Rust, "// ccc:skip\npub fn a() {}\npub fn b() {}\n"),
+            (Language::Go, "// ccc:skip\npackage p\n\nfunc A() {}\n"),
+            (Language::Python, "# ccc:skip\ndef a():\n    return 1\n"),
+            (Language::TypeScript, "// ccc:skip generated\nexport function a() {}\n"),
+            (Language::JavaScript, "/* ccc:skip */\nfunction a() {}\n"),
+        ] {
+            assert!(extract(lang, src).is_none(), "{lang:?}");
+        }
+    }
+
+    // Directly above a definition it withdraws only that definition: the
+    // function, its calls, and its slot as a call target.
+    #[test]
+    fn skip_above_a_definition_withdraws_only_it() {
+        let src = "pub fn kept() {\n    helper();\n}\n\n\
+                   // ccc:skip\npub fn dropped() {\n    helper();\n}\n\n\
+                   pub fn helper() {}\n";
+        let ex = extract(Language::Rust, src).expect("parse");
+        let names: Vec<&str> = ex.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["kept", "helper"]);
+        assert!(ex.refs.iter().any(|r| r.caller == "kept"));
+        assert!(!ex.refs.iter().any(|r| r.caller == "dropped"));
+        assert!(ex.calls.iter().all(|c| c.caller != "dropped"));
+    }
+
+    // A skipped function is not a call target either: calls to it stay loose
+    // instead of resolving to a definition the analysis no longer has.
+    #[test]
+    fn calls_to_a_skipped_function_do_not_resolve() {
+        let src = "pub fn caller() {\n    hidden();\n}\n\n\
+                   // ccc:skip\npub fn hidden() {}\n";
+        let ex = extract(Language::Rust, src).expect("parse");
+        assert!(!ex.refs.iter().any(|r| r.target_name == "hidden"));
+        // the loose form survives - `changes` may still match it elsewhere
+        assert!(ex.calls.iter().any(|c| c.name == "hidden"));
+    }
+
+    // Attribute and decorator lines may sit between the marker and the
+    // definition; a blank line detaches it and makes it file-wide.
+    #[test]
+    fn skip_reaches_through_attributes_but_not_blank_lines() {
+        let through = "pub fn kept() {}\n\n\
+                       // ccc:skip\n#[inline]\npub fn dropped() {}\n";
+        let ex = extract(Language::Rust, through).expect("parse");
+        let names: Vec<&str> = ex.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["kept"]);
+
+        let detached = "pub fn kept() {}\n\n// ccc:skip\n\npub fn other() {}\n";
+        assert!(extract(Language::Rust, detached).is_none());
+    }
+
+    // Inside a body the marker withdraws the function it sits in.
+    #[test]
+    fn skip_inside_a_body_withdraws_that_function() {
+        let src = "pub fn kept() {}\n\n\
+                   pub fn dropped() {\n    // ccc:skip\n    let _ = 1;\n}\n";
+        let ex = extract(Language::Rust, src).expect("parse");
+        let names: Vec<&str> = ex.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["kept"]);
+    }
+
+    // Not a directive: prose around the marker, or a different word after the
+    // prefix.
+    #[test]
+    fn skip_lookalikes_are_not_directives() {
+        for src in [
+            "// see http://x/ccc:skip\npub fn a() {}\n",
+            "// ccc:skipped\npub fn a() {}\n",
+        ] {
+            let ex = extract(Language::Rust, src).expect("parse");
+            assert!(ex.funcs.iter().any(|f| f.name == "a"), "{src}");
+        }
+    }
+
+    // Python decorators sit between the marker and the `def` and must not
+    // detach it.
+    #[test]
+    fn skip_reaches_through_python_decorators() {
+        let src = "def kept():\n    return 1\n\n\
+                   # ccc:skip\n@staticmethod\ndef dropped():\n    return 2\n";
+        let ex = extract(Language::Python, src).expect("parse");
+        let names: Vec<&str> = ex.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["kept"]);
     }
 }

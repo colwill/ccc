@@ -2,3 +2,8 @@
 *.bin
 /example/
 bench/
+/dist
+
+# written by the vscode extension on every analyser start, carrying that run's ephemeral port
+/.mcp.json
+/.vscode/mcp.json

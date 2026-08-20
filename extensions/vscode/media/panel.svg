@@ -1,0 +1,32 @@
+<!-- The ccc mark: a banded disc with a C cut through it.
+
+     Drawn for 24px, the only size the activity bar uses. The bands are thinner
+     than the logo's and the C is heavier, because at this scale equal weights
+     read as texture rather than as a letter; the mask clears a gap around the C
+     so the bands cannot run into it.
+
+     VSCode paints an activity bar icon as a mask and colours it itself, so only
+     the alpha matters here and `currentColor` follows the active theme. That is
+     the opposite of the gutter icons in light/ and dark/, which are drawn as
+     images and so need their fill baked in per theme. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <defs>
+    <clipPath id="disc">
+      <circle cx="12" cy="12" r="11"/>
+    </clipPath>
+    <mask id="halo" maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">
+      <rect width="24" height="24" fill="#fff"/>
+      <path d="M15.44 7.09A6 6 0 1 0 15.44 16.91" fill="none" stroke="#000"
+            stroke-width="7.6" stroke-linecap="round"/>
+    </mask>
+  </defs>
+  <g clip-path="url(#disc)" mask="url(#halo)" fill="currentColor">
+    <rect x="0" y="1.90" width="24" height="1.8"/>
+    <rect x="0" y="6.30" width="24" height="1.8"/>
+    <rect x="0" y="10.70" width="24" height="1.8"/>
+    <rect x="0" y="15.10" width="24" height="1.8"/>
+    <rect x="0" y="19.50" width="24" height="1.8"/>
+  </g>
+  <path d="M15.44 7.09A6 6 0 1 0 15.44 16.91" fill="none" stroke="currentColor"
+        stroke-width="4" stroke-linecap="round"/>
+</svg>
