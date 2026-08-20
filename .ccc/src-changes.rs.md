@@ -1,0 +1,218 @@
+# changes.rs.md (20260820-07-57-23) UTC
+# source: src/changes.rs [rust]
+# modules
+# imports
+    - L6@crate (coverage)
+    - L7@crate::extract (BDD_REGISTRARS)
+    - L8@crate::model (Boundary, FileCache)
+    - L9@crate (scan)
+    - L10@anyhow (anyhow, bail, Context, Result)
+    - L11@globset (GlobBuilder, GlobSet, GlobSetBuilder)
+    - L12@serde (Deserialize, Serialize)
+    - L13@serde_json (Value)
+    - L14@std::collections (BTreeMap, BTreeSet, VecDeque)
+    - L15@std (fs)
+    - L16@std::path (Path, PathBuf)
+    - L17@std::process (Command)
+    - L1056@crate::externals (norm_key, Crossing, Endpoint)
+    - L1547@super
+# const
+    - L19@SCHEMA:&str
+    - L21@CONFIG_NAME:&str
+    - L23@LEGACY_CONFIG_NAMES:&[&str]
+    - L24@MAX_EDGE_SYMBOLS:usize
+    - L812@Annotation:Via
+    - L813@ReceiverType:Via
+    - L814@Qualifier:Via
+    - L815@Import:Via
+    - L816@Project:Via
+    - L817@TypeReference:Via
+    - L818@NameOnly:Via
+    - L2164@PAIR_MAP_JSON:&str
+# funcs
+    - L55:12@load:Result<ChangesConfig>
+    - L65:12@path:Option<PathBuf> // the config actually in use, current name first
+    - L192:8@changes:Result<ChangesReport> // Analyze `root` and build the changes report, parsing the tree first.
+    - L200:8@changes_with_caches:Result<ChangesReport> // Same analysis against an already-parsed map, so a caller that holds one
+    - L429:4@crossing_json:Value
+    - L450:8@init_config:Result<PathBuf> // scaffold a starter `.ccc/map.json`
+    - L541:4@build_indexes:Indexes
+    - L680:15@module_segments:impl Iterator<Item = &str> // identifier-ish segments of an import path
+    - L689:15@names_project:bool // Does an import path name a project? Matches a go module path by prefix
+    - L701:4@project_identities:BTreeMap<String, BTreeSet<String>> // Project identities declared by manifests, mapped to the services that own
+    - L730:15@manifest_identities:Vec<(String, String)> // Every project identity a manifest declares, with the directory it governs.
+    - L772:4@manifest_identity:Option<String> // package name from a manifest, parsed narrowly enough not to need a toml or
+    - L822:8@label:&'static str
+    - L844:4@resolve_call:Result<(String, Via), (String, Vec<String>)> // Attribute one call to a target service, with the evidence that did it.
+    - L932:4@detect_edges:( Vec<ServiceEdge>, BTreeMap<String, BTreeSet<String>>, Vec<UnresolvedCall>, ) // Detect cross-service edges, then overlay declared deps.
+    - L1051:15@detect_crossings:Vec<crate::externals::Crossing> // Join `ccc:calls` here to `ccc:serves` there, on the key both sides wrote.
+    - L1195:4@pick_transport:String // One side may name a transport and the other leave it out; prefer whichever
+    - L1205:4@merge_crossings // Fold crossings into the service edges, so a cross-repo call is an edge of
+    - L1244:4@via_rank:usize // strongest evidence first, so an edge reports the best reason it has
+    - L1259:15@qualifier_names_service:bool // does a call qualifier (`billing`, `crate::billing`, `self.billing`) name
+    - L1267:4@impact_closure:Vec<Impact> // changed services + everything that (transitively) calls them, BFS so each
+    - L1309:4@git:Result<String>
+    - L1314:4@git_bytes:Result<Vec<u8>>
+    - L1331:4@ref_exists:bool
+    - L1342:4@resolve_base:Result<(String, String)> // resolve diff base
+    - L1372:4@parse_name_status:Vec<(String, String)> // parse `git diff --name-status -z` output into (status, path) pairs.
+    - L1397:4@status_label:&'static str
+    - L1411:4@parse_hunks:BTreeMap<String, Vec<(usize, usize)>> // parse a `--unified=0` diff into per-file changed line ranges on the NEW
+    - L1451:15@build_matchers:Result<Vec<(String, GlobSet)>> // build one matcher per service; bare pattern with no glob is a dir prefix
+    - L1472:4@expand_pattern:Vec<String>
+    - L1482:15@assign:Vec<String> // services whose globs match `path` (sorted; may be several for shared code)
+    - L1495:15@is_test_fn_name:bool // test functions by naming convention: `test_charge`/`TestCharge` (python,
+    - L1516:15@is_test_path:bool // test files by path conventions that I am aware of
+    - L1541:8@path_str:String
+    - L1550:8@hunk_parser_ranges_and_deletions
+    - L1571:8@name_status_rename_splits_old_and_new
+    - L1586:8@bare_patterns_are_directory_prefixes
+    - L1596:8@svc_map:BTreeMap<String, BTreeSet<String>>
+    - L1603:8@test_idx:Indexes
+    - L1617:8@call:OwnedCall
+    - L1634:8@typed_calls_need_evidence_not_just_a_matching_name // In a typed language a bare name is never evidence. The old rule made an
+    - L1667:8@untyped_calls_keep_the_single_definer_fallback // untyped languages have nothing better, so they keep the old fallback -
+    - L1680:8@receiver_type_resolves_a_method_call // the strongest route: the receiver's declared type addresses the method
+    - L1709:8@type_references_in_signatures_are_edges // naming another service's type in a signature is a dependency, even with
+    - L1724:8@fixture:FileCache
+    - L1745:8@two_service_matchers:Vec<(String, GlobSet)>
+    - L1755:8@a_key_joins_two_services_in_one_repo // The monorepo case: two directories in one repo, joined by a key rather
+    - L1783:8@a_key_joins_a_call_here_to_a_handler_in_a_peer_repo // The cross-repo case: the far end is a surface, in another language, and
+    - L1822:8@key_matching_ignores_case_and_padding // Keys are written by hand at both ends; case and padding are not identity.
+    - L1843:8@a_key_nothing_serves_is_reported_unmatched // A call nobody answers is a finding, not silence: it is a typo at one end
+    - L1857:8@a_key_served_inside_the_same_service_is_not_a_crossing // Calling a handler in your own service is an ordinary call, not a hop.
+    - L1870:8@a_peer_consuming_our_key_is_an_inbound_crossing // A peer publishes what it consumes, which is the only way this repo can
+    - L1907:8@a_surface_round_trips_through_json // A surface round-trips: what one repo exports is what another reads.
+    - L1926:8@a_dep_may_name_an_external_but_a_name_cannot_be_both // `deps` may name a peer, but a name cannot be both a local service and a
+    - L1942:8@manifests_identify_projects_for_cross_project_imports
+    - L1966:8@closure_walks_reverse_edges_transitively
+    - L1988:8@test_paths_by_convention // I'm not aware of any other conventions around testing for typescript,
+    - L2005:8@test_function_names_by_convention
+    - L2027:8@top_level_test_calls_mark_tested_without_naming // a call in test context whose enclosing scope is the file itself still
+    - L2047:8@qualifier_segment_matching
+    - L2061:8@every_previous_config_name_still_loads // The service map config was named `surf.json` shipped, now
+    - L2097:8@run
+    - L2110:8@commit_all
+    - L2124:8@rev_head:String
+    - L2133:8@write_files
+    - L2144:8@changes_fixture:ChangesReport // build a throwaway repo: commit `base` files, overlay `head` files as a
+    - L2182:8@changes_language_pair_fixtures // Every language `ccc scan` supports has a pair fixture telling the same
+    - L2355:8@changes_three_services_fixture // Three-service story: gateway calls billing's charge/refund and declares
+    - L2444:8@typed_bare_call_is_reported_not_invented // End to end, in a real repo: a typed call with no evidence must not
+    - L2478:8@receiver_type_disambiguates_across_services // The typed path: the receiver's declared type picks the right service
+    - L2518:8@typed_languages_resolve_by_module_and_receiver // Go, C++ and TypeScript resolve through their own module systems.
+    - L2567:8@changes_end_to_end_git
+    - L2649:8@edge_rule_ignores_unknown_symbols // keep the helper used (constructing Indexes without test_called noise)
+# refs
+    - load@L56 calls L65:12@path:Option<PathBuf>
+    - changes@L195 calls L200:8@changes_with_caches:Result<ChangesReport>
+    - changes_with_caches@L243 calls L1451:15@build_matchers:Result<Vec<(String, GlobSet)>>
+    - changes_with_caches@L247 calls L1342:4@resolve_base:Result<(String, String)>
+    - changes_with_caches@L248 calls L1309:4@git:Result<String>
+    - changes_with_caches@L257 calls L1314:4@git_bytes:Result<Vec<u8>>
+    - changes_with_caches@L257 calls L1372:4@parse_name_status:Vec<(String, String)>
+    - changes_with_caches@L260 calls L1309:4@git:Result<String>
+    - changes_with_caches@L260 calls L1411:4@parse_hunks:BTreeMap<String, Vec<(usize, usize)>>
+    - changes_with_caches@L267 calls L1314:4@git_bytes:Result<Vec<u8>>
+    - changes_with_caches@L281 calls L1314:4@git_bytes:Result<Vec<u8>>
+    - changes_with_caches@L281 calls L1372:4@parse_name_status:Vec<(String, String)>
+    - changes_with_caches@L292 calls L541:4@build_indexes:Indexes
+    - changes_with_caches@L296 calls L730:15@manifest_identities:Vec<(String, String)>
+    - changes_with_caches@L300 calls L932:4@detect_edges:( Vec<ServiceEdge>, BTreeMap<String, BTreeSet<String>>, Vec<UnresolvedCall>, )
+    - changes_with_caches@L304 calls L1051:15@detect_crossings:Vec<crate::externals::Crossing>
+    - changes_with_caches@L305 calls L1205:4@merge_crossings
+    - changes_with_caches@L312 calls L1482:15@assign:Vec<String>
+    - changes_with_caches@L332 calls L1541:8@path_str:String
+    - changes_with_caches@L334 calls L1482:15@assign:Vec<String>
+    - changes_with_caches@L335 calls L1516:15@is_test_path:bool
+    - changes_with_caches@L386 calls L1267:4@impact_closure:Vec<Impact>
+    - build_indexes@L551 calls L701:4@project_identities:BTreeMap<String, BTreeSet<String>>
+    - build_indexes@L560 calls L1541:8@path_str:String
+    - build_indexes@L561 calls L1482:15@assign:Vec<String>
+    - build_indexes@L599 calls L1541:8@path_str:String
+    - build_indexes@L600 calls L1482:15@assign:Vec<String>
+    - build_indexes@L608 calls L680:15@module_segments:impl Iterator<Item = &str>
+    - build_indexes@L614 calls L689:15@names_project:bool
+    - names_project@L695 calls L680:15@module_segments:impl Iterator<Item = &str>
+    - project_identities@L706 calls L730:15@manifest_identities:Vec<(String, String)>
+    - project_identities@L713 calls L1482:15@assign:Vec<String>
+    - project_identities@L715 calls L1482:15@assign:Vec<String>
+    - manifest_identities@L758 calls L772:4@manifest_identity:Option<String>
+    - resolve_call@L873 calls L680:15@module_segments:impl Iterator<Item = &str>
+    - resolve_call@L878 calls L1259:15@qualifier_names_service:bool
+    - resolve_call@L885 calls L689:15@names_project:bool
+    - detect_edges@L951 calls L1244:4@via_rank:usize
+    - detect_edges@L960 calls L844:4@resolve_call:Result<(String, Via), (String, Vec<String>)>
+    - detect_crossings@L1061 calls L1541:8@path_str:String
+    - detect_crossings@L1062 calls L1482:15@assign:Vec<String>
+    - detect_crossings@L1095 calls L1541:8@path_str:String
+    - detect_crossings@L1096 calls L1482:15@assign:Vec<String>
+    - detect_crossings@L1113 calls L1195:4@pick_transport:String
+    - detect_crossings@L1134 calls L1195:4@pick_transport:String
+    - detect_crossings@L1174 calls L1195:4@pick_transport:String
+    - git@L1310 calls L1314:4@git_bytes:Result<Vec<u8>>
+    - resolve_base@L1346 calls L1331:4@ref_exists:bool
+    - resolve_base@L1356 calls L1331:4@ref_exists:bool
+    - resolve_base@L1366 calls L1309:4@git:Result<String>
+    - parse_name_status@L1383 calls L1397:4@status_label:&'static str
+    - parse_name_status@L1390 calls L1397:4@status_label:&'static str
+    - build_matchers@L1456 calls L1472:4@expand_pattern:Vec<String>
+    - hunk_parser_ranges_and_deletions@L1564 calls L1411:4@parse_hunks:BTreeMap<String, Vec<(usize, usize)>>
+    - name_status_rename_splits_old_and_new@L1573 calls L1372:4@parse_name_status:Vec<(String, String)>
+    - bare_patterns_are_directory_prefixes@L1590 calls L1451:15@build_matchers:Result<Vec<(String, GlobSet)>>
+    - typed_calls_need_evidence_not_just_a_matching_name@L1635 calls L1596:8@svc_map:BTreeMap<String, BTreeSet<String>>
+    - typed_calls_need_evidence_not_just_a_matching_name@L1640 calls L1603:8@test_idx:Indexes
+    - typed_calls_need_evidence_not_just_a_matching_name@L1649 calls L932:4@detect_edges:( Vec<ServiceEdge>, BTreeMap<String, BTreeSet<String>>, Vec<UnresolvedCall>, )
+    - untyped_calls_keep_the_single_definer_fallback@L1668 calls L1603:8@test_idx:Indexes
+    - untyped_calls_keep_the_single_definer_fallback@L1669 calls L1596:8@svc_map:BTreeMap<String, BTreeSet<String>>
+    - untyped_calls_keep_the_single_definer_fallback@L1672 calls L932:4@detect_edges:( Vec<ServiceEdge>, BTreeMap<String, BTreeSet<String>>, Vec<UnresolvedCall>, )
+    - receiver_type_resolves_a_method_call@L1681 calls L1603:8@test_idx:Indexes
+    - receiver_type_resolves_a_method_call@L1682 calls L1596:8@svc_map:BTreeMap<String, BTreeSet<String>>
+    - receiver_type_resolves_a_method_call@L1699 calls L932:4@detect_edges:( Vec<ServiceEdge>, BTreeMap<String, BTreeSet<String>>, Vec<UnresolvedCall>, )
+    - type_references_in_signatures_are_edges@L1710 calls L1603:8@test_idx:Indexes
+    - type_references_in_signatures_are_edges@L1718 calls L932:4@detect_edges:( Vec<ServiceEdge>, BTreeMap<String, BTreeSet<String>>, Vec<UnresolvedCall>, )
+    - two_service_matchers@L1749 calls L1451:15@build_matchers:Result<Vec<(String, GlobSet)>>
+    - a_key_joins_two_services_in_one_repo@L1768 calls L1051:15@detect_crossings:Vec<crate::externals::Crossing>
+    - a_key_joins_two_services_in_one_repo@L1768 calls L1745:8@two_service_matchers:Vec<(String, GlobSet)>
+    - a_key_joins_a_call_here_to_a_handler_in_a_peer_repo@L1811 calls L1051:15@detect_crossings:Vec<crate::externals::Crossing>
+    - a_key_joins_a_call_here_to_a_handler_in_a_peer_repo@L1811 calls L1745:8@two_service_matchers:Vec<(String, GlobSet)>
+    - key_matching_ignores_case_and_padding@L1835 calls L1051:15@detect_crossings:Vec<crate::externals::Crossing>
+    - key_matching_ignores_case_and_padding@L1835 calls L1745:8@two_service_matchers:Vec<(String, GlobSet)>
+    - a_key_nothing_serves_is_reported_unmatched@L1849 calls L1051:15@detect_crossings:Vec<crate::externals::Crossing>
+    - a_key_nothing_serves_is_reported_unmatched@L1849 calls L1745:8@two_service_matchers:Vec<(String, GlobSet)>
+    - a_key_served_inside_the_same_service_is_not_a_crossing@L1863 calls L1051:15@detect_crossings:Vec<crate::externals::Crossing>
+    - a_key_served_inside_the_same_service_is_not_a_crossing@L1863 calls L1745:8@two_service_matchers:Vec<(String, GlobSet)>
+    - a_peer_consuming_our_key_is_an_inbound_crossing@L1898 calls L1051:15@detect_crossings:Vec<crate::externals::Crossing>
+    - a_peer_consuming_our_key_is_an_inbound_crossing@L1898 calls L1745:8@two_service_matchers:Vec<(String, GlobSet)>
+    - closure_walks_reverse_edges_transitively@L1977 calls L1267:4@impact_closure:Vec<Impact>
+    - top_level_test_calls_mark_tested_without_naming@L2036 calls L2144:8@changes_fixture:ChangesReport
+    - commit_all@L2111 calls L2097:8@run
+    - commit_all@L2112 calls L2097:8@run
+    - changes_fixture@L2148 calls L2133:8@write_files
+    - changes_fixture@L2149 calls L2097:8@run
+    - changes_fixture@L2150 calls L2110:8@commit_all
+    - changes_fixture@L2151 calls L2124:8@rev_head:String
+    - changes_fixture@L2152 calls L2133:8@write_files
+    - changes_fixture@L2153 calls L2110:8@commit_all
+    - changes_fixture@L2159 calls L192:8@changes:Result<ChangesReport>
+    - changes_language_pair_fixtures@L2313 calls L2144:8@changes_fixture:ChangesReport
+    - changes_three_services_fixture@L2385 calls L2144:8@changes_fixture:ChangesReport
+    - typed_bare_call_is_reported_not_invented@L2457 calls L2144:8@changes_fixture:ChangesReport
+    - receiver_type_disambiguates_across_services@L2500 calls L2144:8@changes_fixture:ChangesReport
+    - typed_languages_resolve_by_module_and_receiver@L2522 calls L2144:8@changes_fixture:ChangesReport
+    - typed_languages_resolve_by_module_and_receiver@L2537 calls L2144:8@changes_fixture:ChangesReport
+    - typed_languages_resolve_by_module_and_receiver@L2552 calls L2144:8@changes_fixture:ChangesReport
+    - changes_end_to_end_git@L2590 calls L2097:8@run
+    - changes_end_to_end_git@L2591 calls L2110:8@commit_all
+    - changes_end_to_end_git@L2592 calls L2124:8@rev_head:String
+    - changes_end_to_end_git@L2600 calls L2110:8@commit_all
+    - changes_end_to_end_git@L2607 calls L192:8@changes:Result<ChangesReport>
+    - changes_end_to_end_git@L2633 calls L2110:8@commit_all
+    - changes_end_to_end_git@L2634 calls L192:8@changes:Result<ChangesReport>
+    - edge_rule_ignores_unknown_symbols@L2650 calls L1603:8@test_idx:Indexes
+    - edge_rule_ignores_unknown_symbols@L2654 calls L932:4@detect_edges:( Vec<ServiceEdge>, BTreeMap<String, BTreeSet<String>>, Vec<UnresolvedCall>, )
+# note
+    - @L1494 NOTE: This test was generated by a LLM
+    - @L2143 NOTE: This fixture was generated by a LLM
+    - @L2180 NOTE: These fixtures were generated by a LLM
+    - @L2353 NOTE: These fixtures were also generated by a LLM

@@ -1,0 +1,181 @@
+# insights.rs.md (20260820-07-57-23) UTC
+# source: src/insights.rs [rust]
+# modules
+# imports
+    - L10@crate::coverage (CoverageIndex, TestSite)
+    - L11@crate::extract (TOP_LEVEL)
+    - L12@crate::languages (Language)
+    - L13@crate::model (FileCache, Func, FuncMetrics)
+    - L14@crate::changes (ChangesConfig)
+    - L15@serde_json (json, Value)
+    - L16@std::collections (BTreeMap, BTreeSet, VecDeque)
+    - L17@std::path (Path)
+    - L18@std::time (Instant)
+    - L1926@super
+    - L1927@crate (scan)
+# const
+    - L20@SCHEMA:&str
+    - L24@FLAME_NODES:usize
+    - L25@FLAME_DEPTH:usize
+    - L26@TOP_N:usize
+    - L27@MAX_LINTS:usize
+    - L29@MAX_FLAME_GROUPS:usize
+    - L31@MAX_EDGE_SITES:usize
+    - L33@MAX_TARGETS:usize
+    - L37@MAX_COMPLEXITY_ROWS:usize
+    - L1015@MAX_COVERED_BY:usize
+# funcs
+    - L59:8@name:&str
+    - L62:8@file:String
+    - L65:8@func:&Func
+    - L69:8@lang:Language
+    - L72:8@node_file:usize
+    - L78:8@node_def:(usize, usize) // the definition this node addresses, as `coverage` keys them. A module
+    - L83:8@is_root:bool // nothing but itself calls this: an entry point
+    - L86:8@is_test:bool
+    - L90:8@is_module:bool // a file's module scope rather than a function someone defined
+    - L104:4@build_graph:Graph<'a> // Resolve calls to function definitions.
+    - L276:4@flame:(Vec<Value>, bool) // Expand the call graph into a tree for the flame view. Each node's `value` is
+    - L297:4@flame_node:(Value, bool)
+    - L359:4@deepest_chains:Vec<Value> // Longest acyclic call chains, deepest first. "Hot" here is structural: a long
+    - L390:4@longest
+    - L418:4@cycles:Vec<Value> // Strongly connected components larger than one node: mutual recursion, which
+    - L495:8@json:Value
+    - L511:8@rule_catalogue:Value // Rule catalogue, published with the payload so the UI can explain what was
+    - L548:4@lints:(Vec<Value>, bool)
+    - L754:8@of_node:Option<&str> // the service owning a graph node, if exactly one does
+    - L762:4@service_ctx:ServiceCtx
+    - L834:4@services:Value // Roll the file-level call graph up into the service map.
+    - L986:4@depth_below:Vec<usize> // Longest downstream call chain from each node. Cycles contribute nothing,
+    - L990:8@go:usize
+    - L1019:8@test_kind_rubric:Value // The kinds of test this recommends, and what each one is for. Published with
+    - L1040:4@test_targets:Value // recommend tests for the gaps; self explanatory
+    - L1310:4@target_id:String // One representation per fact: a recommendation is written once, in
+    - L1321:4@complexity_table:Value // Every function the map holds, with its complexity band and its arity.
+    - L1368:4@arity:&'static str // Parameter count as a name. Beyond three the distinctions stop being useful -
+    - L1381:4@change_set:Result<changes::ChangesReport, String> // The branch's change set, diffed against `base`, over the map already parsed.
+    - L1399:4@run_command:Option<(String, &'static str)> // How a runner selects a single test, per language. Emitted so a CI job can
+    - L1471:4@triggered:Triggered
+    - L1574:4@test_triggers:Value // Which tests a change makes necessary.
+    - L1690:8@analyse:anyhow::Result<Value> // Analyse `root` from scratch: walk, parse and build the payload
+    - L1697:8@insights:Value // Build the whole insights payload for a parsed map.
+    - L1930:8@map:(tempdir::Dir, Vec<FileCache>) // `tag` must be unique per test: these run in parallel in one process
+    - L1946:20@new:Dir
+    - L1952:20@path:&std::path::Path
+    - L1957:16@drop
+    - L1966:8@the_complexity_table_carries_every_function_with_its_band_and_arity // The Complexity panel filters this list rather than reading a ranking, so
+    - L2018:8@call_graph_resolves_same_file_and_evidenced_cross_file
+    - L2043:8@unevidenced_name_collisions_produce_no_edge
+    - L2060:8@module_scope_calls_make_a_python_entry_point_a_caller
+    - L2094:8@a_package_facade_import_reaches_the_module_that_defines_the_name
+    - L2107:8@a_package_root_defining_the_same_name_does_not_blur_a_direct_import
+    - L2126:8@cross_file_calls_resolve_in_the_newly_added_languages
+    - L2196:8@a_call_is_credited_to_the_definition_whose_body_spans_it
+    - L2221:8@an_include_makes_the_included_file_s_definitions_resolvable
+    - L2255:8@flame_values_nest_and_recursion_is_cut
+    - L2281:8@lints_fire_with_evidence_and_skip_tests
+    - L2321:8@a_release_discharges_every_acquire_that_calls_for_it
+    - L2389:8@map_json_drives_services_deps_and_orphans // `.ccc/map.json` is the source of truth for the service tab: its globs
+    - L2450:8@flame_groups_follow_declared_deps_and_mark_crossings // one flame graph per service that declares deps, with the frames a call
+    - L2485:12@walk // gateway's tree crosses into billing and on into store
+    - L2512:8@service_edges_carry_their_call_sites // the explore view needs the calls that carry each hop, not just its name
+    - L2555:8@test_targets_pick_the_kind_the_signals_justify // The recommendation has to follow the measurements, not the other way
+    - L2621:8@language_semantics_sharpen_the_suggestion // a language's semantics change the advice, not just the kind
+    - L2676:8@per_file_grouping_does_not_fan_out_flame_graphs // per-service flame graphs are only worth drawing when "service" means
+    - L2698:8@declared_deps_are_still_resolved_not_skipped // Declaring a dependency in map.json must never stand in for analysing it
+    - L2745:8@run_git
+    - L2758:8@test_triggers_follow_the_diff_through_the_call_graph // The operational question: given what changed on this branch - including
+    - L2835:8@gaps_cite_a_target_row_that_survives_truncation // Every gap cites a `test_targets` row instead of carrying its own copy of
+    - L2884:8@test_triggers_say_why_when_git_cannot_answer // Outside a git repo the tab must explain itself rather than look empty.
+    - L2898:8@payload_is_shaped_and_services_fall_back_to_directories
+# refs
+    - name@L60 calls L65:8@func:&Func
+    - is_test@L87 calls L62:8@file:String
+    - is_test@L87 calls L65:8@func:&Func
+    - flame@L290 calls L297:4@flame_node:(Value, bool)
+    - flame_node@L319 calls L297:4@flame_node:(Value, bool)
+    - deepest_chains@L365 calls L390:4@longest
+    - longest@L410 calls L390:4@longest
+    - go@L1000 calls L990:8@go:usize
+    - depth_below@L1008 calls L990:8@go:usize
+    - test_targets@L1047 calls L986:4@depth_below:Vec<usize>
+    - test_triggers@L1595 calls L1310:4@target_id:String
+    - test_triggers@L1612 calls L1399:4@run_command:Option<(String, &'static str)>
+    - analyse@L1693 calls L1697:8@insights:Value
+    - insights@L1706 calls L104:4@build_graph:Graph<'a>
+    - insights@L1714 calls L762:4@service_ctx:ServiceCtx
+    - insights@L1721 calls L1381:4@change_set:Result<changes::ChangesReport, String>
+    - insights@L1724 calls L1471:4@triggered:Triggered
+    - insights@L1734 calls L1040:4@test_targets:Value
+    - insights@L1738 calls L1574:4@test_triggers:Value
+    - insights@L1769 calls L276:4@flame:(Vec<Value>, bool)
+    - insights@L1770 calls L548:4@lints:(Vec<Value>, bool)
+    - insights@L1805 calls L276:4@flame:(Vec<Value>, bool)
+    - the_complexity_table_carries_every_function_with_its_band_and_arity@L1967 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - the_complexity_table_carries_every_function_with_its_band_and_arity@L1983 calls L1697:8@insights:Value
+    - call_graph_resolves_same_file_and_evidenced_cross_file@L2019 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - call_graph_resolves_same_file_and_evidenced_cross_file@L2031 calls L104:4@build_graph:Graph<'a>
+    - unevidenced_name_collisions_produce_no_edge@L2045 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - unevidenced_name_collisions_produce_no_edge@L2050 calls L104:4@build_graph:Graph<'a>
+    - module_scope_calls_make_a_python_entry_point_a_caller@L2065 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - module_scope_calls_make_a_python_entry_point_a_caller@L2075 calls L104:4@build_graph:Graph<'a>
+    - module_scope_calls_make_a_python_entry_point_a_caller@L2088 calls L548:4@lints:(Vec<Value>, bool)
+    - a_package_facade_import_reaches_the_module_that_defines_the_name@L2095 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - a_package_facade_import_reaches_the_module_that_defines_the_name@L2100 calls L104:4@build_graph:Graph<'a>
+    - a_package_root_defining_the_same_name_does_not_blur_a_direct_import@L2109 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - a_package_root_defining_the_same_name_does_not_blur_a_direct_import@L2117 calls L104:4@build_graph:Graph<'a>
+    - cross_file_calls_resolve_in_the_newly_added_languages@L2177 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - cross_file_calls_resolve_in_the_newly_added_languages@L2178 calls L104:4@build_graph:Graph<'a>
+    - a_call_is_credited_to_the_definition_whose_body_spans_it@L2199 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - a_call_is_credited_to_the_definition_whose_body_spans_it@L2207 calls L104:4@build_graph:Graph<'a>
+    - an_include_makes_the_included_file_s_definitions_resolvable@L2239 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - an_include_makes_the_included_file_s_definitions_resolvable@L2240 calls L104:4@build_graph:Graph<'a>
+    - flame_values_nest_and_recursion_is_cut@L2256 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - flame_values_nest_and_recursion_is_cut@L2263 calls L104:4@build_graph:Graph<'a>
+    - flame_values_nest_and_recursion_is_cut@L2266 calls L762:4@service_ctx:ServiceCtx
+    - flame_values_nest_and_recursion_is_cut@L2267 calls L276:4@flame:(Vec<Value>, bool)
+    - lints_fire_with_evidence_and_skip_tests@L2282 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - lints_fire_with_evidence_and_skip_tests@L2300 calls L104:4@build_graph:Graph<'a>
+    - lints_fire_with_evidence_and_skip_tests@L2301 calls L548:4@lints:(Vec<Value>, bool)
+    - a_release_discharges_every_acquire_that_calls_for_it@L2322 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - a_release_discharges_every_acquire_that_calls_for_it@L2369 calls L104:4@build_graph:Graph<'a>
+    - a_release_discharges_every_acquire_that_calls_for_it@L2370 calls L548:4@lints:(Vec<Value>, bool)
+    - map_json_drives_services_deps_and_orphans@L2390 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - map_json_drives_services_deps_and_orphans@L2409 calls L104:4@build_graph:Graph<'a>
+    - map_json_drives_services_deps_and_orphans@L2410 calls L762:4@service_ctx:ServiceCtx
+    - map_json_drives_services_deps_and_orphans@L2410 calls L834:4@services:Value
+    - flame_groups_follow_declared_deps_and_mark_crossings@L2451 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - flame_groups_follow_declared_deps_and_mark_crossings@L2473 calls L1697:8@insights:Value
+    - walk@L2492 calls L2485:12@walk
+    - flame_groups_follow_declared_deps_and_mark_crossings@L2497 calls L2485:12@walk
+    - service_edges_carry_their_call_sites@L2513 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - service_edges_carry_their_call_sites@L2533 calls L104:4@build_graph:Graph<'a>
+    - service_edges_carry_their_call_sites@L2534 calls L762:4@service_ctx:ServiceCtx
+    - service_edges_carry_their_call_sites@L2534 calls L834:4@services:Value
+    - test_targets_pick_the_kind_the_signals_justify@L2556 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - test_targets_pick_the_kind_the_signals_justify@L2579 calls L1697:8@insights:Value
+    - language_semantics_sharpen_the_suggestion@L2622 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - language_semantics_sharpen_the_suggestion@L2648 calls L1697:8@insights:Value
+    - per_file_grouping_does_not_fan_out_flame_graphs@L2677 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - per_file_grouping_does_not_fan_out_flame_graphs@L2684 calls L1697:8@insights:Value
+    - declared_deps_are_still_resolved_not_skipped@L2699 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - declared_deps_are_still_resolved_not_skipped@L2716 calls L104:4@build_graph:Graph<'a>
+    - declared_deps_are_still_resolved_not_skipped@L2717 calls L762:4@service_ctx:ServiceCtx
+    - declared_deps_are_still_resolved_not_skipped@L2717 calls L834:4@services:Value
+    - test_triggers_follow_the_diff_through_the_call_graph@L2759 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - test_triggers_follow_the_diff_through_the_call_graph@L2771 calls L2745:8@run_git
+    - test_triggers_follow_the_diff_through_the_call_graph@L2772 calls L2745:8@run_git
+    - test_triggers_follow_the_diff_through_the_call_graph@L2773 calls L2745:8@run_git
+    - test_triggers_follow_the_diff_through_the_call_graph@L2776 calls L2745:8@run_git
+    - test_triggers_follow_the_diff_through_the_call_graph@L2787 calls L1697:8@insights:Value
+    - gaps_cite_a_target_row_that_survives_truncation@L2836 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - gaps_cite_a_target_row_that_survives_truncation@L2844 calls L2745:8@run_git
+    - gaps_cite_a_target_row_that_survives_truncation@L2845 calls L2745:8@run_git
+    - gaps_cite_a_target_row_that_survives_truncation@L2846 calls L2745:8@run_git
+    - gaps_cite_a_target_row_that_survives_truncation@L2848 calls L2745:8@run_git
+    - gaps_cite_a_target_row_that_survives_truncation@L2860 calls L1697:8@insights:Value
+    - test_triggers_say_why_when_git_cannot_answer@L2885 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - test_triggers_say_why_when_git_cannot_answer@L2886 calls L1697:8@insights:Value
+    - payload_is_shaped_and_services_fall_back_to_directories@L2899 calls L1930:8@map:(tempdir::Dir, Vec<FileCache>)
+    - payload_is_shaped_and_services_fall_back_to_directories@L2903 calls L1697:8@insights:Value
+# note

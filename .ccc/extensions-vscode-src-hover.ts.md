@@ -1,0 +1,89 @@
+# hover.ts.md (20260820-07-57-23) UTC
+# source: extensions/vscode/src/hover.ts [typescript]
+# modules
+# imports
+    - L1@vscode (vscode)
+    - L2@./config (Cfg)
+    - L3@./decorations (anchorToRange)
+    - L4@./model (Coverage, FileHints, HintIndex, Hot, InboundRef, LineHint, missingTestPhrase, OutboundRef, SCORE_DESCRIPTION, ServiceMode, TestLink)
+    - L17@./types (FileStructure, Via)
+# const
+    - L20@TRUSTED_COMMANDS
+    - L31@VIA_PROSE:Record<Via, string>
+    - L320@VIEW_NAME:Record<string, string>
+# funcs
+    - L40:17@buildHover:vscode.MarkdownString
+    - L61:10@coverageSection:string
+    - L137:10@testList:string[]
+    - L164:10@evidenceNote:string // only the weak tie is worth a word - the strong ones are what "covered by" already implies
+    - L168:10@outboundSection:string
+    - L238:10@inboundSection:string
+    - L266:10@hotSection:string
+    - L328:10@ordinal:string
+    - L335:17@locationLink:string // command links carry args as a JSON array - VSCode spreads it into the parameters
+    - L342:17@referencesLink:string
+    - L347:10@footer:string
+    - L360:10@code:string
+    - L365:17@escapeMd:string // full escape for identifiers and paths we embed - punctuation that cannot break out is left alone
+    - L370:17@prose:string // the analyser's prose is already markdown - pass it through, neutralising square and angle brackets
+    - L374:10@escapeTitle:string
+    - L392:3@constructor
+    - L397:3@updateConfig:void
+    - L401:9@provideHover:Promise<vscode.Hover | undefined>
+    - L449:10@complexityHover:vscode.MarkdownString // the pop-out behind the circled numeral - the verdict, then the raw counts so the score is checkable
+# refs
+    - buildHover@L49 calls L61:10@coverageSection:string
+    - buildHover@L50 calls L168:10@outboundSection:string
+    - buildHover@L51 calls L238:10@inboundSection:string
+    - buildHover@L53 calls L61:10@coverageSection:string
+    - buildHover@L54 calls L266:10@hotSection:string
+    - buildHover@L57 calls L347:10@footer:string
+    - coverageSection@L62 calls L360:10@code:string
+    - coverageSection@L70 calls L137:10@testList:string[]
+    - coverageSection@L95 calls L370:17@prose:string
+    - coverageSection@L98 calls L370:17@prose:string
+    - coverageSection@L101 calls L360:10@code:string
+    - coverageSection@L113 calls L335:17@locationLink:string
+    - coverageSection@L114 calls L342:17@referencesLink:string
+    - coverageSection@L118 calls L365:17@escapeMd:string
+    - coverageSection@L127 calls L360:10@code:string
+    - coverageSection@L132 calls L370:17@prose:string
+    - testList@L142 calls L360:10@code:string
+    - testList@L154 calls L164:10@evidenceNote:string
+    - testList@L154 calls L335:17@locationLink:string
+    - testList@L157 calls L360:10@code:string
+    - outboundSection@L176 calls L360:10@code:string
+    - outboundSection@L187 calls L360:10@code:string
+    - outboundSection@L189 calls L360:10@code:string
+    - outboundSection@L189 calls L365:17@escapeMd:string
+    - outboundSection@L190 calls L360:10@code:string
+    - outboundSection@L191 calls L365:17@escapeMd:string
+    - outboundSection@L194 calls L360:10@code:string
+    - outboundSection@L202 calls L365:17@escapeMd:string
+    - outboundSection@L205 calls L335:17@locationLink:string
+    - outboundSection@L208 calls L360:10@code:string
+    - outboundSection@L227 calls L342:17@referencesLink:string
+    - outboundSection@L231 calls L365:17@escapeMd:string
+    - inboundSection@L242 calls L360:10@code:string
+    - inboundSection@L249 calls L335:17@locationLink:string
+    - inboundSection@L250 calls L360:10@code:string
+    - inboundSection@L253 calls L360:10@code:string
+    - hotSection@L271 calls L360:10@code:string
+    - hotSection@L272 calls L360:10@code:string
+    - hotSection@L272 calls L328:10@ordinal:string
+    - hotSection@L281 calls L335:17@locationLink:string
+    - hotSection@L292 calls L328:10@ordinal:string
+    - hotSection@L299 calls L328:10@ordinal:string
+    - hotSection@L304 calls L328:10@ordinal:string
+    - hotSection@L315 calls L342:17@referencesLink:string
+    - hotSection@L316 calls L370:17@prose:string
+    - locationLink@L338 calls L365:17@escapeMd:string
+    - locationLink@L339 calls L374:10@escapeTitle:string
+    - referencesLink@L344 calls L365:17@escapeMd:string
+    - referencesLink@L344 calls L374:10@escapeTitle:string
+    - footer@L351 calls L365:17@escapeMd:string
+    - footer@L353 calls L365:17@escapeMd:string
+    - footer@L355 calls L365:17@escapeMd:string
+    - provideHover@L425 calls L449:10@complexityHover:vscode.MarkdownString
+    - provideHover@L437 calls L40:17@buildHover:vscode.MarkdownString
+# note

@@ -1,0 +1,93 @@
+# model.ts.md (20260820-07-57-23) UTC
+# source: extensions/vscode/src/model.ts [typescript]
+# modules
+# imports
+    - L3@node:path (path)
+    - L4@./config (Cfg)
+    - L5@./pathkeys (isTestPath, keyOfPath)
+    - L6@./types (arr, Arity, bool, ChangedFunction, ChangesEdge, ComplexityRow, ChangesSection, Crossing, ExternalRepo, HotChain, HotCycle, HotRow, HotSection, isUnavailable, InsightsPayload, lineSpan, num, ServicesEdge, ServicesSection, str, TestCommand, TestKind, TestedBySite, TestRun, TestTarget, TriggerAdd, TriggersSection, Unavailable, VIA_RANK, Via)
+# const
+    - L42@PRECEDENCE:HintKind[]
+    - L108@SCORE_DESCRIPTION:Record<number, string>
+    - L613@HOT_RANK:Record<HotReasonKind, number>
+    - L1014@ARITIES:Arity[]
+# funcs
+    - L98:17@missingTestPhrase:string // how a missing test is named everywhere - the kind sits inside the phrase, not beside it
+    - L103:17@addTestPhrase:string // the same gap phrased as the fix, for surfaces that already carry a `⚠`
+    - L236:17@buildHintIndex:HintIndex
+    - L547:10@collectHot:{ file: string; line: number; facts: Hot }[] // fold the five `hot` views into one entry per function - the strongest reason drives the badge
+    - L550:9@entry
+    - L621:10@normaliseHotRow:HotRow | undefined
+    - L643:10@classify:CoverageStatus // classifier - three states, not a boolean - `tested` with an empty `tested_by` means the function is…
+    - L650:10@linkTests:TestLink[] // join changed function -> covering tests - `tested_by_sites` is exact, bare names collide
+    - L702:10@hintAt:LineHint | undefined
+    - L728:10@addOutbound:void
+    - L755:10@addInbound:void
+    - L770:10@rememberCoverage:void
+    - L780:10@finalise:void // drop empty hints, then pick each line's primary category and badge text
+    - L795:10@badgeFor:string // segments in a fixed order, truncated from the right - a clipped badge leads with what matters
+    - L821:10@hotBadge:string // one segment for the strongest reason - glyphs not emoji, which render at unpredictable widths
+    - L837:10@shortService:string // a derived service is a directory and a per-file one is a path - a badge cannot show either whole
+    - L844:17@refineAnchors:void // narrow anchors from the definition row to the name token - pure polish, a 404 leaves them put
+    - L887:10@mergeInto:void // fold `from` into `into`, then rebuild the parts that depend on both
+    - L906:17@enclosingFunction:T | undefined // the innermost function containing a line - among containing spans, the latest start wins
+    - L920:17@targetId:string
+    - L924:10@siteKey:string
+    - L928:10@buildSiteIndex:Map<string, ServicesEdge['sites'][number]>
+    - L938:10@modeOf:ServiceMode
+    - L944:10@readChanges:ChangesSection | undefined
+    - L950:10@readTriggers:TriggersSection | undefined
+    - L956:10@readServices:ServicesSection | undefined
+    - L961:10@unavailableOf:Unavailable
+    - L968:10@normaliseChangedFunction:ChangedFunction | undefined
+    - L994:10@normaliseComplexityRow:ComplexityRow // the analyser's numbers clamped to what the view can draw - an out-of-range band picks no glyph
+    - L1016:10@groupBy:Map<string, T[]>
+    - L1027:10@unique:string[]
+    - L1031:10@rank:number
+    - L1035:10@joinPath:string
+# refs
+    - buildHintIndex@L238 calls L944:10@readChanges:ChangesSection | undefined
+    - buildHintIndex@L239 calls L950:10@readTriggers:TriggersSection | undefined
+    - buildHintIndex@L240 calls L956:10@readServices:ServicesSection | undefined
+    - buildHintIndex@L244 calls L938:10@modeOf:ServiceMode
+    - buildHintIndex@L257 calls L961:10@unavailableOf:Unavailable
+    - buildHintIndex@L258 calls L961:10@unavailableOf:Unavailable
+    - buildHintIndex@L283 calls L1016:10@groupBy:Map<string, T[]>
+    - buildHintIndex@L294 calls L968:10@normaliseChangedFunction:ChangedFunction | undefined
+    - buildHintIndex@L298 calls L643:10@classify:CoverageStatus
+    - buildHintIndex@L303 calls L920:17@targetId:string
+    - buildHintIndex@L309 calls L650:10@linkTests:TestLink[]
+    - buildHintIndex@L323 calls L770:10@rememberCoverage:void
+    - buildHintIndex@L324 calls L702:10@hintAt:LineHint | undefined
+    - buildHintIndex@L354 calls L770:10@rememberCoverage:void
+    - buildHintIndex@L355 calls L702:10@hintAt:LineHint | undefined
+    - buildHintIndex@L365 calls L928:10@buildSiteIndex:Map<string, ServicesEdge['sites'][number]>
+    - buildHintIndex@L379 calls L924:10@siteKey:string
+    - buildHintIndex@L380 calls L728:10@addOutbound:void
+    - buildHintIndex@L405 calls L728:10@addOutbound:void
+    - buildHintIndex@L443 calls L728:10@addOutbound:void
+    - buildHintIndex@L476 calls L755:10@addInbound:void
+    - buildHintIndex@L494 calls L755:10@addInbound:void
+    - buildHintIndex@L517 calls L755:10@addInbound:void
+    - buildHintIndex@L533 calls L547:10@collectHot:{ file: string; line: number; facts: Hot }[]
+    - buildHintIndex@L534 calls L702:10@hintAt:LineHint | undefined
+    - buildHintIndex@L542 calls L780:10@finalise:void
+    - collectHot@L569 calls L621:10@normaliseHotRow:HotRow | undefined
+    - collectHot@L574 calls L550:9@entry
+    - collectHot@L585 calls L550:9@entry
+    - collectHot@L597 calls L550:9@entry
+    - hintAt@L704 calls L1035:10@joinPath:string
+    - addOutbound@L735 calls L702:10@hintAt:LineHint | undefined
+    - addOutbound@L740 calls L1031:10@rank:number
+    - addInbound@L756 calls L702:10@hintAt:LineHint | undefined
+    - finalise@L788 calls L795:10@badgeFor:string
+    - badgeFor@L800 calls L98:17@missingTestPhrase:string
+    - badgeFor@L806 calls L837:10@shortService:string
+    - badgeFor@L806 calls L1027:10@unique:string[]
+    - badgeFor@L810 calls L837:10@shortService:string
+    - badgeFor@L810 calls L1027:10@unique:string[]
+    - badgeFor@L814 calls L821:10@hotBadge:string
+    - refineAnchors@L876 calls L887:10@mergeInto:void
+    - mergeInto@L902 calls L795:10@badgeFor:string
+    - buildSiteIndex@L932 calls L924:10@siteKey:string
+# note

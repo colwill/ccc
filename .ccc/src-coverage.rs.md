@@ -1,0 +1,86 @@
+# coverage.rs.md (20260820-07-57-23) UTC
+# source: src/coverage.rs [rust]
+# modules
+# imports
+    - L26@crate::changes (is_test_fn_name, is_test_path, module_segments, names_project, path_str)
+    - L27@crate::extract (TOP_LEVEL)
+    - L28@crate::model (FileCache)
+    - L29@std::collections (BTreeMap, BTreeSet)
+    - L30@std::path (Path)
+    - L552@super
+    - L553@crate::languages (Language)
+    - L554@crate (scan)
+    - L555@std::path (PathBuf)
+# const
+    - L34@MAX_TESTED_BY:usize
+    - L37@FACADE_STEMS:&[&str]
+    - L40@MAX_FACADE_HOPS:usize
+    - L46@RELATIVE_BASES:&[&str]
+    - L49@GENERIC_DIRS:&[&str]
+    - L58@ReceiverType:Evidence
+    - L60@SameFile:Evidence
+    - L63@SamePackage:Evidence
+    - L65@Import:Evidence
+    - L67@Qualifier:Evidence
+    - L69@NameOnly:Evidence
+# funcs
+    - L73:12@label:&'static str
+    - L121:12@covering:&[TestRef] // The tests covering one definition, strongest evidence first, capped.
+    - L127:12@is_covered:bool // Does any test reference this definition at all? True for a definition
+    - L131:12@total_tests:usize
+    - L135:12@external_calls:usize
+    - L146:15@file_aliases:Vec<BTreeSet<String>> // Every name a qualifier could use to reach a file: its stem, the modules it
+    - L171:15@imported_names:Vec<BTreeMap<String, BTreeSet<usize>>> // Per file: which name was imported from which files. Shared with
+    - L266:4@stem_of:&str
+    - L273:8@build:CoverageIndex // Build the coverage relation. `project_ids` are the identities declared by
+    - L436:4@resolve:Option<(Vec<DefId>, Evidence)> // The definitions one test call covers, and the evidence that tied them.
+    - L560:12@new:Dir
+    - L568:12@drop
+    - L573:8@caches:(Dir, Vec<FileCache>)
+    - L585:8@index:CoverageIndex
+    - L589:8@def:(usize, usize)
+    - L605:8@a_stdlib_call_in_a_rust_test_does_not_cover_a_typescript_method // the reported bug: a Rust test writing a fixture must not be presented as
+    - L624:8@an_external_qualifier_covers_nothing_in_its_own_language // the same call must not attach to a same-language function either: it
+    - L635:8@a_lock_guard_is_not_a_covered_method // a receiver the project never defines is not this project's method
+    - L646:8@a_test_module_covers_the_function_beside_it // the dominant genuine case: `mod tests` calling the function above it
+    - L660:8@a_relative_qualifier_is_not_external // `super::parse(..)` names the function above it, not another project
+    - L671:8@a_qualifier_naming_the_defining_file_covers_it // a qualifier naming the defining file resolves across files
+    - L687:8@ambiguous_evidence_covers_nothing // two same-named functions in one family, one qualifier: no link at all
+    - L703:8@an_untyped_language_keeps_the_single_definer_fallback // untyped languages keep the single-definer fallback, labelled as such
+    - L716:8@a_typed_language_gets_no_name_only_fallback // a typed language does not: a bare name is not evidence there
+    - L730:8@file_level_setup_marks_tested_without_naming_a_test // file-level setup in a test file is a reference, but names no test
+    - L746:8@coverage_delta // Measurement, not an assertion: the old bare-name join against the new
+    - L818:8@families_bridge_c_and_cpp_only // C and C++ are one runtime family; Rust and TypeScript are not
+# refs
+    - file_aliases@L151 calls L266:4@stem_of:&str
+    - build@L274 calls L146:15@file_aliases:Vec<BTreeSet<String>>
+    - build@L275 calls L171:15@imported_names:Vec<BTreeMap<String, BTreeSet<usize>>>
+    - build@L330 calls L436:4@resolve:Option<(Vec<DefId>, Evidence)>
+    - index@L586 calls L273:8@build:CoverageIndex
+    - a_stdlib_call_in_a_rust_test_does_not_cover_a_typescript_method@L606 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - a_stdlib_call_in_a_rust_test_does_not_cover_a_typescript_method@L616 calls L585:8@index:CoverageIndex
+    - an_external_qualifier_covers_nothing_in_its_own_language@L625 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - an_external_qualifier_covers_nothing_in_its_own_language@L629 calls L585:8@index:CoverageIndex
+    - a_lock_guard_is_not_a_covered_method@L636 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - a_lock_guard_is_not_a_covered_method@L640 calls L585:8@index:CoverageIndex
+    - a_test_module_covers_the_function_beside_it@L647 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - a_test_module_covers_the_function_beside_it@L651 calls L585:8@index:CoverageIndex
+    - a_test_module_covers_the_function_beside_it@L652 calls L589:8@def:(usize, usize)
+    - a_relative_qualifier_is_not_external@L661 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - a_relative_qualifier_is_not_external@L665 calls L585:8@index:CoverageIndex
+    - a_qualifier_naming_the_defining_file_covers_it@L672 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - a_qualifier_naming_the_defining_file_covers_it@L679 calls L585:8@index:CoverageIndex
+    - a_qualifier_naming_the_defining_file_covers_it@L680 calls L589:8@def:(usize, usize)
+    - ambiguous_evidence_covers_nothing@L688 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - ambiguous_evidence_covers_nothing@L696 calls L585:8@index:CoverageIndex
+    - an_untyped_language_keeps_the_single_definer_fallback@L704 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - an_untyped_language_keeps_the_single_definer_fallback@L708 calls L585:8@index:CoverageIndex
+    - an_untyped_language_keeps_the_single_definer_fallback@L709 calls L589:8@def:(usize, usize)
+    - a_typed_language_gets_no_name_only_fallback@L717 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - a_typed_language_gets_no_name_only_fallback@L724 calls L585:8@index:CoverageIndex
+    - file_level_setup_marks_tested_without_naming_a_test@L731 calls L573:8@caches:(Dir, Vec<FileCache>)
+    - file_level_setup_marks_tested_without_naming_a_test@L735 calls L585:8@index:CoverageIndex
+    - file_level_setup_marks_tested_without_naming_a_test@L736 calls L589:8@def:(usize, usize)
+    - coverage_delta@L765 calls L273:8@build:CoverageIndex
+# note
+    - @L602 the reported bug: a Rust test writing a fixture must not be presented as

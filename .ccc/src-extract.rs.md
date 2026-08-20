@@ -1,0 +1,478 @@
+# extract.rs.md (20260820-07-57-23) UTC
+# source: src/extract.rs [rust]
+# modules
+# imports
+    - L3@crate::languages (Language)
+    - L4@crate::model (Annotation, Boundary, CallSite, Const, Func, FuncMetrics, Import, LoopInfo, Note, Ref, ResourceOp, TypeDef)
+    - L7@std::collections (HashMap)
+    - L8@tree_sitter (Node, Parser)
+    - L2488@super
+# const
+    - L11@TOP_LEVEL:&str
+    - L34@Free:CallKind
+    - L35@Method:CallKind
+    - L47@Func:Scope
+    - L49@Type:Scope
+    - L1078@BDD_REGISTRARS:&[&str]
+    - L2080@MARKERS:&[&str]
+    - L2139@TRANSPORTS:&[&str]
+    - L2144@ANNOTATION_PREFIX:&str
+    - L2335@MAX_ANNOTATION_GAP:usize
+    - L2626@LANG_FIXTURES:&[LangFixture]
+# funcs
+    - L89:8@caller:String // nearest enclosing function name for caller attribution
+    - L101:8@type_of:Option<String> // declared type of a variable, searching innermost scope outwards
+    - L105:8@bind
+    - L115:8@current_type:Option<(String, Option<String>)> // nearest enclosing type scope (its name and receiver token) used to
+    - L122:8@in_function:bool
+    - L126:8@in_type:bool
+    - L135:8@extract:Option<Extracted> // parse `src` as `lang` and extract its symbols returns `None` if the source
+    - L238:4@visit
+    - L430:4@type_scope:Option<(String, Option<String>)>
+    - L464:4@csharp_extension_receiver:Option<(String, Option<String>)> // `static int Charge(this Client c, int amt)`
+    - L482:4@func_owner:Option<(String, Option<String>)> // if it is a method the enclosing type scope or for go... the method's own receiver
+    - L506:4@cpp_function_declarator:Option<Node> // declarator chain of a C++ `function_definition`, stepping through pointer /
+    - L521:4@cpp_qualified_owner:Option<(String, Option<String>)> // For an out-of-line C++ definition `Class::method`, the owning type (`Class`)
+    - L531:4@go_receiver:Option<(String, Option<String>)>
+    - L549:4@const_eligible:bool
+    - L569:4@extract_func:Option<Func> // extract a function definition; returns `None` for anonymous functions we
+    - L602:8@normalize_type:String // Reduce a declared type to the bare name a definition can be looked up by:
+    - L661:4@param_pairs:Vec<(Option<String>, Option<String>)> // (parameter name, declared type) for each parameter of a definition. Either
+    - L724:4@bind_signature // Bind a definition's parameters and receiver into the current scope, so calls
+    - L746:4@bind_declaration // Bind a local variable declaration: `let c: Client`, `c := Client{}`,
+    - L816:4@constructed_type:Option<String> // The type a constructor-ish initialiser produces: `Client::new(..)`,
+    - L858:4@func_metrics:FuncMetrics // Measure a function body: size, decision points, loop nesting, and
+    - L870:4@count_params:usize
+    - L887:4@walk_metrics
+    - L931:4@callee_name:Option<String> // rightmost name of a call's callee (`billing::charge(1)` -> `charge`)
+    - L936:4@loop_label:String
+    - L953:4@resource_op:Option<ResourceOp> // A resource acquire/release call, matched on the callee's rightmost name.
+    - L997:4@literal_trip:Option<usize> // Trip count of a counted loop when every bound is an integer literal. Read
+    - L1048:4@func_name:Option<(String, Node<'a>)>
+    - L1086:4@bdd_test_label:Option<String> // Label for an anonymous function passed to a BDD test registrar, e.g.
+    - L1126:4@cpp_func_name:Option<(String, Node<'a>)> // C++ `function_definition` name: descend the declarator chain to the
+    - L1133:4@cpp_declarator_name:Option<(String, Node<'a>)> // Resolve the various shapes a C++ declarator name can take to a display name
+    - L1150:4@first_child_of_kind:Option<Node<'a>> // First direct child of a given kind
+    - L1157:4@type_def_name:Option<Node<'a>> // The node carrying a type definition's name
+    - L1189:4@func_return:Option<String>
+    - L1211:4@extract_consts
+    - L1399:4@cpp_is_const_decl:bool // True if a C++ `declaration` carries a `const`/`constexpr`/... qualifier.
+    - L1412:4@cpp_const_declarator_name:Option<(String, Node<'a>)> // Name of a single C++ declarator within a `declaration`, if it is a plain
+    - L1423:4@cpp_plain_name:Option<(String, Node<'a>)> // Step through pointer / reference / array declarators to a bare identifier.
+    - L1438:4@is_shouting_snek:bool
+    - L1444:4@has_const_keyword:bool
+    - L1450:4@classify_call:Option<RawCall>
+    - L1468:4@callee_node:Option<Node> // record any call in loose form: rightmost identifier as the name, whatever
+    - L1473:4@loose_call:Option<CallSite>
+    - L1506:4@receiver_type:Option<String> // Declared type of a method call's receiver. `c.charge()` looks `c` up in the
+    - L1539:4@extract_variant // index one enum variant/enumerator as a const-like definition
+    - L1574:4@extract_ts_enum // ts `enum Color { Red, Green = 2 }` - members become const-like definitions
+    - L1600:4@extract_odin_enum // odin `Mode :: enum { Fast, Small }` - the members are bare identifiers with
+    - L1621:4@maybe_use // record a qualified non-call usage (`Encoding::O200kBase`, `http.StatusOK`)
+    - L1663:4@extract_import // record an import/use/include statement in loose textual form: a module path
+    - L1678:4@is_reexport:bool // does the current statement (stmt) hand the names it binds onward
+    - L1690:4@parse_import:Vec<(String, Vec<String>)> // split one import statement into (module, bound names) pairs.
+    - L1894:4@scan_macro_tokens // Approximate calls inside a Rust macro token tree: an identifier directly
+    - L1937:4@loose_name:Option<(Option<String>, String)> // split a callee expression into (qualifier, rightmost name)
+    - L2010:4@resolve_callee:Option<CallKind> // reduce a call target expression to a [`CallKind`]
+    - L2070:4@self_method:Option<CallKind>
+    - L2085:4@has_marker:bool // counts only where an author would actually write one: as a whole
+    - L2121:4@maybe_note
+    - L2153:4@maybe_annotations // `ccc:serves grpc billing.v1.Charge` and `ccc:calls grpc billing.v1.Charge`,
+    - L2178:4@parse_annotation:Option<(Boundary, String, String)> // One directive, already stripped of its comment delimiters.
+    - L2243:4@is_skip_directive:bool // Same guard as `parse_annotation`: the marker must open the comment or follow
+    - L2268:4@apply_skips:bool // Resolve every `ccc:skip` the walk collected. Returns `false` when the whole
+    - L2337:4@bind_annotations
+    - L2363:4@preceding_comment:Option<String> // nearest comment immediately preceding a function definition, used as its
+    - L2443:4@text:&'a str // small helpers funcs
+    - L2448:4@pos:(usize, usize) // 1-based (line, column) of a node's start
+    - L2454:4@oneline:String // collapse all runs of whitespace to single spaces and trim
+    - L2458:4@truncate:String
+    - L2468:4@strip_comment:String // strip common comment delimiters from a raw comment token
+    - L2490:8@annotations_of:Vec<(usize, &'static str, String, String, String)>
+    - L2502:8@boundary_hints_parse_in_every_language // The whole point of the comment form: one spelling, every language, no
+    - L2543:8@a_hint_binds_above_a_definition_and_inside_a_body // A directive above a definition belongs to it; one inside a body belongs
+    - L2557:8@a_hint_survives_decorators_and_attributes // Decorators and attributes sit between the comment and the definition,
+    - L2574:8@a_hint_without_a_transport_is_all_key // The transport is optional; without one there is still a key to match on.
+    - L2583:8@a_hint_naming_only_a_transport_is_not_a_directive // A transport and nothing else names no key, so there is nothing for the
+    - L2589:8@prose_and_urls_are_not_directives // `ccc:` has to be written as a directive, not merely contained.
+    - L2602:8@a_far_away_hint_stays_at_file_level // A file-header hint has no definition to attach to and must not be
+    - L2752:8@new_languages_extract_the_same_shapes
+    - L2803:8@zig_type_and_import_bindings_are_not_constants // A binding that is really a type or an import must not also be filed as a
+    - L2818:8@defer_guards_the_release_and_using_guards_the_acquire // `defer` and `using` both promise the release happens when exiting scope but
+    - L2862:8@a_typedef_names_a_type_exactly_once
+    - L2873:8@enum_members_are_indexed_without_swallowing_struct_fields
+    - L2909:8@csharp_methods_are_owned_and_an_extension_binds_the_type_it_extends
+    - L2929:8@an_unqualified_call_means_a_sibling_method_only_where_the_language_says_so
+    - L2971:8@a_doc_comment_survives_attributes_and_wrappers // A doc comment is not always the definition's immediate predecessor.
+    - L3036:8@a_distant_or_unrelated_comment_is_not_adopted // tthe relaxation must not reach backwards past unrelated code: a comment
+    - L3044:8@rust_imports_are_captured
+    - L3074:8@a_crate_root_is_module_declarations_and_re_exports_not_an_empty_file
+    - L3108:8@an_inline_test_module_is_not_declared_structure
+    - L3124:8@python_and_js_imports_are_captured
+    - L3140:8@go_and_cpp_imports_are_captured
+    - L3164:8@rust_qualified_usages_are_captured
+    - L3204:8@cpp_enumerators_are_const_defs
+    - L3214:8@ts_enum_members_and_usages
+    - L3232:8@python_enum_class_members_are_const_defs
+    - L3261:8@bdd_callbacks_name_and_flag_their_scope // jest/vitest tests are anonymous callbacks; their string label becomes the
+    - L3287:8@func_metrics_count_shape_and_literal_trips
+    - L3319:8@resource_ops_pair_by_language
+    - L3339:8@typed_languages_expose_types_owners_and_receivers // the type layer `changes` resolves calls through: definitions, method
+    - L3407:8@type_names_normalise_to_their_definition
+    - L3424:8@rust_extraction
+    - L3448:8@go_const_block_and_call
+    - L3462:8@ts_arrow_is_a_func
+    - L3473:8@note_marker_word_boundary
+    - L3485:8@note_marker_requires_a_colon
+    - L3506:8@note_marker_must_follow_whitespace
+    - L3525:8@qualified_call_does_not_bind_to_local_name
+    - L3545:8@self_method_calls_resolve_by_type
+    - L3561:8@python_only_shouting_snek_is_const
+    - L3573:8@ts_module_identity_comes_from_namespace_blocks_only
+    - L3606:8@rust_macro_calls_and_test_mod_are_loose_calls
+    - L3629:8@cpp_extraction
+    - L3655:8@cpp_out_of_line_method_and_self_call
+    - L3685:8@js_let_is_not_a_const
+    - L3697:8@skip_at_the_top_withdraws_the_file_in_every_language // `ccc:skip` at the very top withdraws the file, in every comment syntax.
+    - L3712:8@skip_above_a_definition_withdraws_only_it // Directly above a definition it withdraws only that definition: the
+    - L3727:8@calls_to_a_skipped_function_do_not_resolve // A skipped function is not a call target either: calls to it stay loose
+    - L3739:8@skip_reaches_through_attributes_but_not_blank_lines // Attribute and decorator lines may sit between the marker and the
+    - L3752:8@skip_inside_a_body_withdraws_that_function // Inside a body the marker withdraws the function it sits in.
+    - L3763:8@skip_lookalikes_are_not_directives // Not a directive: prose around the marker, or a different word after the
+    - L3776:8@skip_reaches_through_python_decorators // Python decorators sit between the marker and the `def` and must not
+# refs
+    - extract@L162 calls L238:4@visit
+    - extract@L168 calls L2268:4@apply_skips:bool
+    - extract@L222 calls L2337:4@bind_annotations
+    - visit@L249 calls L2443:4@text:&'a str
+    - visit@L254 calls L1086:4@bdd_test_label:Option<String>
+    - visit@L261 calls L1663:4@extract_import
+    - visit@L271 calls L2443:4@text:&'a str
+    - visit@L281 calls L2454:4@oneline:String
+    - visit@L281 calls L2443:4@text:&'a str
+    - visit@L290 calls L1157:4@type_def_name:Option<Node<'a>>
+    - visit@L292 calls L2448:4@pos:(usize, usize)
+    - visit@L293 calls L2454:4@oneline:String
+    - visit@L293 calls L2443:4@text:&'a str
+    - visit@L305 calls L2454:4@oneline:String
+    - visit@L305 calls L2443:4@text:&'a str
+    - visit@L316 calls L746:4@bind_declaration
+    - visit@L318 calls L430:4@type_scope:Option<(String, Option<String>)>
+    - visit@L322 calls L569:4@extract_func:Option<Func>
+    - visit@L323 calls L482:4@func_owner:Option<(String, Option<String>)>
+    - visit@L347 calls L521:4@cpp_qualified_owner:Option<(String, Option<String>)>
+    - visit@L364 calls L549:4@const_eligible:bool
+    - visit@L365 calls L1211:4@extract_consts
+    - visit@L369 calls L1539:4@extract_variant
+    - visit@L373 calls L1574:4@extract_ts_enum
+    - visit@L377 calls L1600:4@extract_odin_enum
+    - visit@L380 calls L1450:4@classify_call:Option<RawCall>
+    - visit@L385 calls L1473:4@loose_call:Option<CallSite>
+    - visit@L389 calls L2121:4@maybe_note
+    - visit@L390 calls L2153:4@maybe_annotations
+    - visit@L395 calls L1894:4@scan_macro_tokens
+    - visit@L397 calls L1621:4@maybe_use
+    - visit@L405 calls L724:4@bind_signature
+    - visit@L411 calls L238:4@visit
+    - type_scope@L433 calls L2454:4@oneline:String
+    - type_scope@L433 calls L2443:4@text:&'a str
+    - type_scope@L455 calls L1157:4@type_def_name:Option<Node<'a>>
+    - type_scope@L456 calls L2454:4@oneline:String
+    - type_scope@L456 calls L2443:4@text:&'a str
+    - csharp_extension_receiver@L465 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - csharp_extension_receiver@L470 calls L2443:4@text:&'a str
+    - csharp_extension_receiver@L474 calls L2454:4@oneline:String
+    - csharp_extension_receiver@L474 calls L2443:4@text:&'a str
+    - csharp_extension_receiver@L477 calls L2454:4@oneline:String
+    - csharp_extension_receiver@L477 calls L2443:4@text:&'a str
+    - func_owner@L484 calls L531:4@go_receiver:Option<(String, Option<String>)>
+    - func_owner@L487 calls L464:4@csharp_extension_receiver:Option<(String, Option<String>)>
+    - func_owner@L494 calls L521:4@cpp_qualified_owner:Option<(String, Option<String>)>
+    - cpp_qualified_owner@L522 calls L506:4@cpp_function_declarator:Option<Node>
+    - cpp_qualified_owner@L526 calls L2454:4@oneline:String
+    - cpp_qualified_owner@L526 calls L2443:4@text:&'a str
+    - go_receiver@L539 calls L2454:4@oneline:String
+    - go_receiver@L539 calls L2443:4@text:&'a str
+    - go_receiver@L543 calls L2454:4@oneline:String
+    - go_receiver@L543 calls L2443:4@text:&'a str
+    - extract_func@L570 calls L1048:4@func_name:Option<(String, Node<'a>)>
+    - extract_func@L571 calls L2448:4@pos:(usize, usize)
+    - extract_func@L572 calls L1189:4@func_return:Option<String>
+    - extract_func@L573 calls L2363:4@preceding_comment:Option<String>
+    - extract_func@L574 calls L858:4@func_metrics:FuncMetrics
+    - extract_func@L575 calls L482:4@func_owner:Option<(String, Option<String>)>
+    - extract_func@L575 calls L602:8@normalize_type:String
+    - extract_func@L576 calls L661:4@param_pairs:Vec<(Option<String>, Option<String>)>
+    - extract_func@L579 calls L602:8@normalize_type:String
+    - param_pairs@L684 calls L2454:4@oneline:String
+    - param_pairs@L684 calls L2443:4@text:&'a str
+    - param_pairs@L686 calls L2454:4@oneline:String
+    - param_pairs@L686 calls L2443:4@text:&'a str
+    - param_pairs@L691 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - param_pairs@L693 calls L2454:4@oneline:String
+    - param_pairs@L693 calls L2443:4@text:&'a str
+    - param_pairs@L697 calls L2454:4@oneline:String
+    - param_pairs@L697 calls L2443:4@text:&'a str
+    - param_pairs@L706 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - param_pairs@L708 calls L2454:4@oneline:String
+    - param_pairs@L708 calls L2443:4@text:&'a str
+    - bind_signature@L725 calls L661:4@param_pairs:Vec<(Option<String>, Option<String>)>
+    - bind_signature@L727 calls L602:8@normalize_type:String
+    - bind_signature@L733 calls L482:4@func_owner:Option<(String, Option<String>)>
+    - bind_signature@L735 calls L602:8@normalize_type:String
+    - bind_signature@L737 calls L602:8@normalize_type:String
+    - bind_signature@L738 calls L602:8@normalize_type:String
+    - bind_declaration@L762 calls L2454:4@oneline:String
+    - bind_declaration@L762 calls L2443:4@text:&'a str
+    - bind_declaration@L776 calls L602:8@normalize_type:String
+    - func_metrics@L861 calls L870:4@count_params:usize
+    - func_metrics@L864 calls L887:4@walk_metrics
+    - walk_metrics@L903 calls L2448:4@pos:(usize, usize)
+    - walk_metrics@L904 calls L936:4@loop_label:String
+    - walk_metrics@L906 calls L997:4@literal_trip:Option<usize>
+    - walk_metrics@L917 calls L953:4@resource_op:Option<ResourceOp>
+    - walk_metrics@L920 calls L931:4@callee_name:Option<String>
+    - walk_metrics@L926 calls L887:4@walk_metrics
+    - callee_name@L932 calls L1468:4@callee_node:Option<Node>
+    - callee_name@L933 calls L1937:4@loose_name:Option<(Option<String>, String)>
+    - resource_op@L955 calls L2448:4@pos:(usize, usize)
+    - resource_op@L982 calls L931:4@callee_name:Option<String>
+    - literal_trip@L1002 calls L2443:4@text:&'a str
+    - func_name@L1053 calls L1126:4@cpp_func_name:Option<(String, Node<'a>)>
+    - func_name@L1056 calls L2454:4@oneline:String
+    - func_name@L1056 calls L2443:4@text:&'a str
+    - func_name@L1060 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - func_name@L1061 calls L2454:4@oneline:String
+    - func_name@L1061 calls L2443:4@text:&'a str
+    - func_name@L1069 calls L2454:4@oneline:String
+    - func_name@L1069 calls L2443:4@text:&'a str
+    - bdd_test_label@L1103 calls L2443:4@text:&'a str
+    - bdd_test_label@L1114 calls L2454:4@oneline:String
+    - bdd_test_label@L1114 calls L2443:4@text:&'a str
+    - cpp_func_name@L1127 calls L506:4@cpp_function_declarator:Option<Node>
+    - cpp_func_name@L1128 calls L1133:4@cpp_declarator_name:Option<(String, Node<'a>)>
+    - cpp_declarator_name@L1136 calls L2454:4@oneline:String
+    - cpp_declarator_name@L1136 calls L2443:4@text:&'a str
+    - cpp_declarator_name@L1139 calls L1133:4@cpp_declarator_name:Option<(String, Node<'a>)>
+    - cpp_declarator_name@L1143 calls L1133:4@cpp_declarator_name:Option<(String, Node<'a>)>
+    - type_def_name@L1181 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - type_def_name@L1184 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - func_return@L1192 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - func_return@L1193 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - func_return@L1194 calls L2454:4@oneline:String
+    - func_return@L1194 calls L2443:4@text:&'a str
+    - func_return@L1199 calls L2454:4@oneline:String
+    - func_return@L1199 calls L2443:4@text:&'a str
+    - extract_consts@L1217 calls L2454:4@oneline:String
+    - extract_consts@L1217 calls L2443:4@text:&'a str
+    - extract_consts@L1219 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1220 calls L2454:4@oneline:String
+    - extract_consts@L1220 calls L2443:4@text:&'a str
+    - extract_consts@L1228 calls L2454:4@oneline:String
+    - extract_consts@L1228 calls L2443:4@text:&'a str
+    - extract_consts@L1230 calls L1438:4@is_shouting_snek:bool
+    - extract_consts@L1235 calls L2454:4@oneline:String
+    - extract_consts@L1235 calls L2443:4@text:&'a str
+    - extract_consts@L1239 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1247 calls L1444:4@has_const_keyword:bool
+    - extract_consts@L1266 calls L2454:4@oneline:String
+    - extract_consts@L1266 calls L2443:4@text:&'a str
+    - extract_consts@L1272 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1273 calls L2454:4@oneline:String
+    - extract_consts@L1273 calls L2443:4@text:&'a str
+    - extract_consts@L1283 calls L2454:4@oneline:String
+    - extract_consts@L1283 calls L2443:4@text:&'a str
+    - extract_consts@L1288 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1289 calls L2454:4@oneline:String
+    - extract_consts@L1289 calls L2443:4@text:&'a str
+    - extract_consts@L1305 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - extract_consts@L1310 calls L2454:4@oneline:String
+    - extract_consts@L1310 calls L2443:4@text:&'a str
+    - extract_consts@L1318 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1319 calls L2454:4@oneline:String
+    - extract_consts@L1319 calls L2443:4@text:&'a str
+    - extract_consts@L1327 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - extract_consts@L1336 calls L2443:4@text:&'a str
+    - extract_consts@L1341 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - extract_consts@L1346 calls L2454:4@oneline:String
+    - extract_consts@L1346 calls L2443:4@text:&'a str
+    - extract_consts@L1348 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1349 calls L2454:4@oneline:String
+    - extract_consts@L1349 calls L2443:4@text:&'a str
+    - extract_consts@L1354 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - extract_consts@L1360 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - extract_consts@L1362 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1363 calls L2454:4@oneline:String
+    - extract_consts@L1363 calls L2443:4@text:&'a str
+    - extract_consts@L1368 calls L1150:4@first_child_of_kind:Option<Node<'a>>
+    - extract_consts@L1368 calls L2454:4@oneline:String
+    - extract_consts@L1368 calls L2443:4@text:&'a str
+    - extract_consts@L1370 calls L2448:4@pos:(usize, usize)
+    - extract_consts@L1371 calls L2454:4@oneline:String
+    - extract_consts@L1371 calls L2443:4@text:&'a str
+    - extract_consts@L1378 calls L1399:4@cpp_is_const_decl:bool
+    - extract_consts@L1383 calls L2454:4@oneline:String
+    - extract_consts@L1383 calls L2443:4@text:&'a str
+    - extract_consts@L1386 calls L1412:4@cpp_const_declarator_name:Option<(String, Node<'a>)>
+    - extract_consts@L1388 calls L2448:4@pos:(usize, usize)
+    - cpp_const_declarator_name@L1415 calls L2454:4@oneline:String
+    - cpp_const_declarator_name@L1415 calls L2443:4@text:&'a str
+    - cpp_const_declarator_name@L1418 calls L1423:4@cpp_plain_name:Option<(String, Node<'a>)>
+    - cpp_plain_name@L1427 calls L2454:4@oneline:String
+    - cpp_plain_name@L1427 calls L2443:4@text:&'a str
+    - classify_call@L1451 calls L1468:4@callee_node:Option<Node>
+    - classify_call@L1452 calls L2010:4@resolve_callee:Option<CallKind>
+    - classify_call@L1455 calls L2448:4@pos:(usize, usize)
+    - loose_call@L1474 calls L1468:4@callee_node:Option<Node>
+    - loose_call@L1475 calls L1937:4@loose_name:Option<(Option<String>, String)>
+    - loose_call@L1490 calls L2454:4@oneline:String
+    - loose_call@L1490 calls L2443:4@text:&'a str
+    - loose_call@L1494 calls L2448:4@pos:(usize, usize)
+    - loose_call@L1496 calls L1506:4@receiver_type:Option<String>
+    - receiver_type@L1523 calls L602:8@normalize_type:String
+    - extract_variant@L1550 calls L2454:4@oneline:String
+    - extract_variant@L1550 calls L2443:4@text:&'a str
+    - extract_variant@L1550 calls L1157:4@type_def_name:Option<Node<'a>>
+    - extract_variant@L1552 calls L2448:4@pos:(usize, usize)
+    - extract_variant@L1553 calls L2454:4@oneline:String
+    - extract_variant@L1553 calls L2443:4@text:&'a str
+    - extract_variant@L1564 calls L2454:4@oneline:String
+    - extract_variant@L1564 calls L2443:4@text:&'a str
+    - extract_variant@L1566 calls L2448:4@pos:(usize, usize)
+    - extract_variant@L1567 calls L2454:4@oneline:String
+    - extract_variant@L1567 calls L2443:4@text:&'a str
+    - extract_ts_enum@L1577 calls L2454:4@oneline:String
+    - extract_ts_enum@L1577 calls L2443:4@text:&'a str
+    - extract_ts_enum@L1590 calls L2448:4@pos:(usize, usize)
+    - extract_ts_enum@L1591 calls L2454:4@oneline:String
+    - extract_ts_enum@L1591 calls L2443:4@text:&'a str
+    - extract_odin_enum@L1601 calls L2454:4@oneline:String
+    - extract_odin_enum@L1601 calls L2443:4@text:&'a str
+    - extract_odin_enum@L1601 calls L1157:4@type_def_name:Option<Node<'a>>
+    - extract_odin_enum@L1610 calls L2448:4@pos:(usize, usize)
+    - extract_odin_enum@L1611 calls L2454:4@oneline:String
+    - extract_odin_enum@L1611 calls L2443:4@text:&'a str
+    - maybe_use@L1636 calls L1937:4@loose_name:Option<(Option<String>, String)>
+    - maybe_use@L1643 calls L1438:4@is_shouting_snek:bool
+    - maybe_use@L1649 calls L2448:4@pos:(usize, usize)
+    - extract_import@L1664 calls L2448:4@pos:(usize, usize)
+    - extract_import@L1665 calls L2454:4@oneline:String
+    - extract_import@L1665 calls L2443:4@text:&'a str
+    - extract_import@L1666 calls L1678:4@is_reexport:bool
+    - extract_import@L1667 calls L1690:4@parse_import:Vec<(String, Vec<String>)>
+    - scan_macro_tokens@L1901 calls L2443:4@text:&'a str
+    - scan_macro_tokens@L1912 calls L2443:4@text:&'a str
+    - scan_macro_tokens@L1926 calls L2448:4@pos:(usize, usize)
+    - scan_macro_tokens@L1927 calls L2454:4@oneline:String
+    - scan_macro_tokens@L1927 calls L2443:4@text:&'a str
+    - loose_name@L1940 calls L2454:4@oneline:String
+    - loose_name@L1940 calls L2443:4@text:&'a str
+    - loose_name@L1944 calls L2454:4@oneline:String
+    - loose_name@L1944 calls L2443:4@text:&'a str
+    - loose_name@L1964 calls L1937:4@loose_name:Option<(Option<String>, String)>
+    - loose_name@L2004 calls L1937:4@loose_name:Option<(Option<String>, String)>
+    - resolve_callee@L2013 calls L2454:4@oneline:String
+    - resolve_callee@L2013 calls L2443:4@text:&'a str
+    - resolve_callee@L2023 calls L2454:4@oneline:String
+    - resolve_callee@L2023 calls L2070:4@self_method:Option<CallKind>
+    - resolve_callee@L2023 calls L2443:4@text:&'a str
+    - resolve_callee@L2028 calls L2454:4@oneline:String
+    - resolve_callee@L2028 calls L2443:4@text:&'a str
+    - resolve_callee@L2029 calls L2070:4@self_method:Option<CallKind>
+    - resolve_callee@L2033 calls L2454:4@oneline:String
+    - resolve_callee@L2033 calls L2443:4@text:&'a str
+    - resolve_callee@L2036 calls L2454:4@oneline:String
+    - resolve_callee@L2036 calls L2443:4@text:&'a str
+    - resolve_callee@L2047 calls L2454:4@oneline:String
+    - resolve_callee@L2047 calls L2443:4@text:&'a str
+    - resolve_callee@L2048 calls L2070:4@self_method:Option<CallKind>
+    - resolve_callee@L2053 calls L2454:4@oneline:String
+    - resolve_callee@L2053 calls L2443:4@text:&'a str
+    - resolve_callee@L2054 calls L2070:4@self_method:Option<CallKind>
+    - resolve_callee@L2059 calls L2454:4@oneline:String
+    - resolve_callee@L2059 calls L2443:4@text:&'a str
+    - resolve_callee@L2060 calls L2070:4@self_method:Option<CallKind>
+    - resolve_callee@L2065 calls L2010:4@resolve_callee:Option<CallKind>
+    - self_method@L2073 calls L2454:4@oneline:String
+    - self_method@L2073 calls L2443:4@text:&'a str
+    - maybe_note@L2122 calls L2443:4@text:&'a str
+    - maybe_note@L2123 calls L2468:4@strip_comment:String
+    - maybe_note@L2124 calls L2085:4@has_marker:bool
+    - maybe_note@L2127 calls L2454:4@oneline:String
+    - maybe_note@L2132 calls L2448:4@pos:(usize, usize)
+    - maybe_note@L2133 calls L2458:4@truncate:String
+    - maybe_annotations@L2154 calls L2443:4@text:&'a str
+    - maybe_annotations@L2158 calls L2448:4@pos:(usize, usize)
+    - maybe_annotations@L2159 calls L2468:4@strip_comment:String
+    - maybe_annotations@L2161 calls L2178:4@parse_annotation:Option<(Boundary, String, String)>
+    - parse_annotation@L2220 calls L2458:4@truncate:String
+    - preceding_comment@L2430 calls L2468:4@strip_comment:String
+    - preceding_comment@L2430 calls L2443:4@text:&'a str
+    - preceding_comment@L2433 calls L2454:4@oneline:String
+    - preceding_comment@L2437 calls L2458:4@truncate:String
+    - annotations_of@L2491 calls L135:8@extract:Option<Extracted>
+    - boundary_hints_parse_in_every_language@L2530 calls L2490:8@annotations_of:Vec<(usize, &'static str, String, String, String)>
+    - a_hint_binds_above_a_definition_and_inside_a_body@L2544 calls L2490:8@annotations_of:Vec<(usize, &'static str, String, String, String)>
+    - a_hint_survives_decorators_and_attributes@L2558 calls L2490:8@annotations_of:Vec<(usize, &'static str, String, String, String)>
+    - a_hint_survives_decorators_and_attributes@L2565 calls L2490:8@annotations_of:Vec<(usize, &'static str, String, String, String)>
+    - a_hint_without_a_transport_is_all_key@L2575 calls L2490:8@annotations_of:Vec<(usize, &'static str, String, String, String)>
+    - a_far_away_hint_stays_at_file_level@L2608 calls L2490:8@annotations_of:Vec<(usize, &'static str, String, String, String)>
+    - new_languages_extract_the_same_shapes@L2755 calls L135:8@extract:Option<Extracted>
+    - zig_type_and_import_bindings_are_not_constants@L2808 calls L135:8@extract:Option<Extracted>
+    - defer_guards_the_release_and_using_guards_the_acquire@L2837 calls L135:8@extract:Option<Extracted>
+    - defer_guards_the_release_and_using_guards_the_acquire@L2854 calls L135:8@extract:Option<Extracted>
+    - a_typedef_names_a_type_exactly_once@L2864 calls L135:8@extract:Option<Extracted>
+    - a_typedef_names_a_type_exactly_once@L2868 calls L135:8@extract:Option<Extracted>
+    - enum_members_are_indexed_without_swallowing_struct_fields@L2882 calls L135:8@extract:Option<Extracted>
+    - enum_members_are_indexed_without_swallowing_struct_fields@L2896 calls L135:8@extract:Option<Extracted>
+    - csharp_methods_are_owned_and_an_extension_binds_the_type_it_extends@L2917 calls L135:8@extract:Option<Extracted>
+    - an_unqualified_call_means_a_sibling_method_only_where_the_language_says_so@L2948 calls L135:8@extract:Option<Extracted>
+    - an_unqualified_call_means_a_sibling_method_only_where_the_language_says_so@L2962 calls L135:8@extract:Option<Extracted>
+    - a_doc_comment_survives_attributes_and_wrappers@L3023 calls L135:8@extract:Option<Extracted>
+    - a_distant_or_unrelated_comment_is_not_adopted@L3038 calls L135:8@extract:Option<Extracted>
+    - rust_imports_are_captured@L3050 calls L135:8@extract:Option<Extracted>
+    - a_crate_root_is_module_declarations_and_re_exports_not_an_empty_file@L3083 calls L135:8@extract:Option<Extracted>
+    - an_inline_test_module_is_not_declared_structure@L3119 calls L135:8@extract:Option<Extracted>
+    - python_and_js_imports_are_captured@L3127 calls L135:8@extract:Option<Extracted>
+    - python_and_js_imports_are_captured@L3134 calls L135:8@extract:Option<Extracted>
+    - go_and_cpp_imports_are_captured@L3146 calls L135:8@extract:Option<Extracted>
+    - go_and_cpp_imports_are_captured@L3155 calls L135:8@extract:Option<Extracted>
+    - rust_qualified_usages_are_captured@L3174 calls L135:8@extract:Option<Extracted>
+    - cpp_enumerators_are_const_defs@L3206 calls L135:8@extract:Option<Extracted>
+    - ts_enum_members_and_usages@L3217 calls L135:8@extract:Option<Extracted>
+    - python_enum_class_members_are_const_defs@L3242 calls L135:8@extract:Option<Extracted>
+    - bdd_callbacks_name_and_flag_their_scope@L3268 calls L135:8@extract:Option<Extracted>
+    - func_metrics_count_shape_and_literal_trips@L3294 calls L135:8@extract:Option<Extracted>
+    - func_metrics_count_shape_and_literal_trips@L3307 calls L135:8@extract:Option<Extracted>
+    - func_metrics_count_shape_and_literal_trips@L3310 calls L135:8@extract:Option<Extracted>
+    - resource_ops_pair_by_language@L3322 calls L135:8@extract:Option<Extracted>
+    - resource_ops_pair_by_language@L3332 calls L135:8@extract:Option<Extracted>
+    - typed_languages_expose_types_owners_and_receivers@L3349 calls L135:8@extract:Option<Extracted>
+    - typed_languages_expose_types_owners_and_receivers@L3375 calls L135:8@extract:Option<Extracted>
+    - typed_languages_expose_types_owners_and_receivers@L3389 calls L135:8@extract:Option<Extracted>
+    - typed_languages_expose_types_owners_and_receivers@L3399 calls L135:8@extract:Option<Extracted>
+    - rust_extraction@L3430 calls L135:8@extract:Option<Extracted>
+    - go_const_block_and_call@L3453 calls L135:8@extract:Option<Extracted>
+    - ts_arrow_is_a_func@L3465 calls L135:8@extract:Option<Extracted>
+    - note_marker_word_boundary@L3479 calls L135:8@extract:Option<Extracted>
+    - note_marker_requires_a_colon@L3498 calls L135:8@extract:Option<Extracted>
+    - note_marker_must_follow_whitespace@L3517 calls L135:8@extract:Option<Extracted>
+    - qualified_call_does_not_bind_to_local_name@L3533 calls L135:8@extract:Option<Extracted>
+    - self_method_calls_resolve_by_type@L3554 calls L135:8@extract:Option<Extracted>
+    - python_only_shouting_snek_is_const@L3564 calls L135:8@extract:Option<Extracted>
+    - ts_module_identity_comes_from_namespace_blocks_only@L3575 calls L135:8@extract:Option<Extracted>
+    - ts_module_identity_comes_from_namespace_blocks_only@L3581 calls L135:8@extract:Option<Extracted>
+    - ts_module_identity_comes_from_namespace_blocks_only@L3588 calls L135:8@extract:Option<Extracted>
+    - ts_module_identity_comes_from_namespace_blocks_only@L3600 calls L135:8@extract:Option<Extracted>
+    - rust_macro_calls_and_test_mod_are_loose_calls@L3613 calls L135:8@extract:Option<Extracted>
+    - cpp_extraction@L3636 calls L135:8@extract:Option<Extracted>
+    - cpp_out_of_line_method_and_self_call@L3667 calls L135:8@extract:Option<Extracted>
+    - js_let_is_not_a_const@L3689 calls L135:8@extract:Option<Extracted>
+    - skip_above_a_definition_withdraws_only_it@L3716 calls L135:8@extract:Option<Extracted>
+    - calls_to_a_skipped_function_do_not_resolve@L3730 calls L135:8@extract:Option<Extracted>
+    - skip_reaches_through_attributes_but_not_blank_lines@L3742 calls L135:8@extract:Option<Extracted>
+    - skip_inside_a_body_withdraws_that_function@L3755 calls L135:8@extract:Option<Extracted>
+    - skip_lookalikes_are_not_directives@L3768 calls L135:8@extract:Option<Extracted>
+    - skip_reaches_through_python_decorators@L3779 calls L135:8@extract:Option<Extracted>
+# note
