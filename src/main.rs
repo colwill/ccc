@@ -91,6 +91,20 @@ enum Command {
         // the committed view (the default); a local run usually wants this
         #[arg(long)]
         worktree: bool,
+        // name the request behind each change
+        #[arg(long)]
+        prompts: bool,
+        #[arg(long)]
+        deps: bool,
+        // narrow the output to what this branch did to the OpenTelemetry
+        #[arg(long)]
+        telemetry: bool,
+        // render one section as markdown for an agent
+        #[arg(long)]
+        markdown: bool,
+        // exit non-zero when the change introduces an advisory
+        #[arg(long)]
+        fail_introduced: bool,
         // also write a single-file HTML view of the report (Tailwind + HTMX
         // live-query panel against `ccc serve`), e.g. ccc-changes-rust.html
         #[arg(long, value_name = "FILE")]
@@ -99,6 +113,42 @@ enum Command {
         // the analysis (no git needed)
         #[arg(long, value_name = "REPORT.json", requires = "html")]
         from: Option<PathBuf>,
+    },
+    // what this branch did to the dependency tree
+    Deps {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // base ref to diff against
+        #[arg(long)]
+        base: Option<String>,
+        // include uncommitted edits and untracked files in the diff
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+        // render the dependency delta as markdown for an agent
+        #[arg(long)]
+        markdown: bool,
+        // exit non-zero when the change introduces an advisory
+        #[arg(long)]
+        fail_introduced: bool,
+    },
+    Prompts {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // base ref to diff against
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+        #[arg(long, value_name = "DAYS")]
+        since: Option<u64>,
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long)]
+        record: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
     },
     // serve the code map over HTTP for AI agents: REST endpoints
     // (/find /references /dependencies ...) + an MCP endpoint at /mcp
@@ -120,6 +170,8 @@ enum Command {
         // also serve the human-facing insights UI at /insights
         #[arg(long)]
         html: bool,
+        #[arg(long)]
+        deps: bool,
     },
     // analyse the project and emit the insights payload
     Insights {
@@ -130,6 +182,32 @@ enum Command {
         // base ref for the test-trigger diff
         #[arg(long)]
         base: Option<String>,
+    },
+    // scan this project's own source for security findings
+    Sast {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // include test files, which normally carry fixtures rather than leaks
+        #[arg(long)]
+        include_tests: bool,
+        // only report findings at or above this severity
+        #[arg(long, default_value = "low")]
+        min_severity: String,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
+    // resolve dependencies from lockfiles and check them against the OSV advisory database
+    Audit {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // resolve only; never reach for the advisory database
+        #[arg(long)]
+        offline: bool,
+        // let a dev/build-only advisory fail the run too
+        #[arg(long)]
+        dev: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
     // install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
     Install {
@@ -152,6 +230,7 @@ fn main() -> ExitCode {
     }
 }
 
+// ccc:skip
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
@@ -249,9 +328,15 @@ fn run() -> Result<ExitCode> {
             fail_untested,
             init,
             worktree,
+            prompts,
+            deps,
+            telemetry,
+            markdown,
+            fail_introduced,
             html,
             from,
         } => {
+            let _ = deps;
             let root = canonical(&path);
             if init {
                 let cfg = codecache::init_config(&root)?;
@@ -283,6 +368,8 @@ fn run() -> Result<ExitCode> {
                 worktree,
                 base,
                 service_flags,
+                prompts,
+                deps: true,
             };
             let report = codecache::changes(&root, &path_str(&path), &opts)?;
             if let Some(html_path) = &html {
@@ -291,9 +378,29 @@ fn run() -> Result<ExitCode> {
                 // stderr so stdout stays pure JSON for pipelines
                 eprintln!("wrote {}", html_path.display());
             }
-            match format {
-                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
-                OutputFormat::Text => print_changes_text(&report),
+
+            match (telemetry, markdown, format) {
+                (true, true, _) => {
+                    print!(
+                        "{}",
+                        codecache::telemetry::markdown(&report.telemetry, &report.base)
+                    )
+                }
+                (true, false, OutputFormat::Json) => {
+                    println!("{}", serde_json::to_string(&report.telemetry)?)
+                }
+                (true, false, OutputFormat::Text) => print!(
+                    "{}",
+                    codecache::telemetry::text(&report.telemetry, &report.base)
+                ),
+                (false, true, _) => {
+                    let d = report.deps.as_ref().expect("`changes` always computes the delta");
+                    print!("{}", codecache::deps::markdown(d, &report.base));
+                }
+                (false, false, OutputFormat::Json) => {
+                    println!("{}", serde_json::to_string(&report)?)
+                }
+                (false, false, OutputFormat::Text) => print_changes_text(&report),
             }
             if fail_untested && !report.untested.is_empty() {
                 eprintln!(
@@ -301,6 +408,64 @@ fn run() -> Result<ExitCode> {
                     report.untested.len()
                 );
                 return Ok(ExitCode::FAILURE);
+            }
+            if fail_introduced {
+                let d = report.deps.as_ref().expect("`changes` always computes the delta");
+                if gate_introduced("changes", d) {
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Deps {
+            path,
+            base,
+            worktree,
+            format,
+            markdown,
+            fail_introduced,
+        } => {
+            let root = canonical(&path);
+            let (base_label, report) =
+                codecache::changes::deps_report(&root, base.as_deref(), worktree)?;
+            match (markdown, format) {
+                (true, _) => print!("{}", codecache::deps::markdown(&report, &base_label)),
+                (false, OutputFormat::Json) => println!("{}", serde_json::to_string(&report)?),
+                (false, OutputFormat::Text) => {
+                    print!("{}", codecache::deps::text(&report, &base_label))
+                }
+            }
+            if fail_introduced && gate_introduced("deps", &report) {
+                return Ok(ExitCode::FAILURE);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Prompts {
+            path,
+            base,
+            agent,
+            since,
+            worktree,
+            record,
+            format,
+        } => {
+            if let Some(a) = agent.as_deref() {
+                if !matches!(a, "claude" | "copilot") {
+                    return Err(anyhow!("--agent wants `claude` or `copilot`, got '{a}'"));
+                }
+            }
+            let root = canonical(&path);
+            let opts = codecache::PromptsOptions {
+                base,
+                worktree,
+                agent,
+                since_days: since,
+                record,
+            };
+            let report = codecache::prompts(&root, &path_str(&path), &opts)?;
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+                OutputFormat::Text => print_prompts_text(&report),
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -311,12 +476,14 @@ fn run() -> Result<ExitCode> {
             watch_interval,
             no_watch,
             html,
+            deps
         } => {
             let watch = if no_watch || watch_interval == 0 {
                 None
             } else {
                 Some(std::time::Duration::from_secs(watch_interval))
             };
+            let _ = deps; // discard
             let opts = codecache::ServeOptions { addr, port, watch, html };
             codecache::serve(&canonical(&path), &opts)?;
             Ok(ExitCode::SUCCESS)
@@ -338,7 +505,209 @@ fn run() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Sast { path, include_tests, min_severity, format } => {
+            let root = canonical(&path);
+            let report = codecache::sast::analyse(&root, include_tests);
+            let floor = match min_severity.to_ascii_lowercase().as_str() {
+                "high" => codecache::sast::Severity::High,
+                "medium" | "moderate" => codecache::sast::Severity::Medium,
+                _ => codecache::sast::Severity::Low,
+            };
+            let shown: Vec<&codecache::sast::Finding> =
+                report.findings.iter().filter(|f| f.severity <= floor).collect();
+            match format {
+                OutputFormat::Text => print_sast_text(&report, &shown),
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+            }
+            // only a high finding fails the run, so CI does not break on a checksum
+            let high = shown
+                .iter()
+                .filter(|f| f.severity == codecache::sast::Severity::High)
+                .count();
+            Ok(if high > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+        }
+        Command::Audit { path, offline, dev, format } => {
+            let root = canonical(&path);
+            let mut report = codecache::audit::resolve(&root);
+            if !offline {
+                codecache::audit::assess(&mut report);
+            }
+            codecache::audit::locate(&root, &mut report);
+            match format {
+                OutputFormat::Text => print_audit_text(&report, offline),
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+            }
+            // a runtime advisory fails the run so CI can gate on it; dev ones only with --dev
+            let gating = if dev {
+                report.findings.len()
+            } else {
+                report.runtime_findings().len()
+            };
+            Ok(if gating > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+        }
         Command::Install { dir, force } => run_install(dir, force),
+    }
+}
+
+// `--fail-introduced` shared by `changes` and `deps` when the
+// run should fail, with the reason already on stderr
+fn gate_introduced(cmd: &str, d: &codecache::deps::DepsReport) -> bool {
+    if !d.gates() {
+        return false;
+    }
+    match d.error.as_deref() {
+        // "we could not check" is not "it is fine"
+        Some(err) => eprintln!("{cmd}: the dependency delta was not assessed - {err}"),
+        None => {
+            eprintln!("{cmd}: this branch introduces advisories the base did not carry:");
+            for f in &d.introduced {
+                eprintln!(
+                    "  {} {} - {} {}",
+                    f.advisory.id, f.advisory.severity, f.package.name, f.package.version
+                );
+            }
+        }
+    }
+    true
+}
+
+fn print_sast_text(r: &codecache::sast::SastReport, shown: &[&codecache::sast::Finding]) {
+    use codecache::sast::Severity;
+    println!(
+        "security: {} finding(s) across {} file(s) - {} rule(s) applied",
+        shown.len(),
+        r.files_scanned,
+        r.rules.len()
+    );
+    println!(
+        "  high {}, medium {}, low {}",
+        r.by_severity(Severity::High),
+        r.by_severity(Severity::Medium),
+        r.by_severity(Severity::Low)
+    );
+    if shown.is_empty() {
+        println!("\nnothing matched - these are syntax-level rules, not a proof of safety");
+        return;
+    }
+    for f in shown {
+        println!(
+            "\n  [{}] {} {}:{} in {}",
+            f.severity.as_str(),
+            f.rule,
+            f.file,
+            f.line,
+            f.function
+        );
+        println!("        {}", f.message);
+        println!("        evidence: {}", f.evidence);
+        println!("        {} - {}", f.cwe, f.hint);
+    }
+    println!("\nevery finding is a syntax match with no data flow behind it - confirm in the source");
+}
+
+fn print_audit_text(r: &codecache::audit::AuditReport, offline: bool) {
+    println!(
+        "dependencies: {} resolved from {} lockfile(s), {} direct",
+        r.packages.len(),
+        r.lockfiles.len(),
+        r.direct_count()
+    );
+    for lock in &r.lockfiles {
+        let n = r.packages.iter().filter(|p| &p.lockfile == lock).count();
+        println!("  {lock} - {n} package(s)");
+    }
+    if !r.unresolved.is_empty() {
+        // a coverage gap is not a clean result, so it is never left implicit
+        println!("\nnot resolved ({}):", r.unresolved.len());
+        for u in &r.unresolved {
+            println!("  {} - {}", u.manifest, u.reason);
+        }
+    }
+    if r.packages.is_empty() {
+        println!("\nno lockfile found - run your package manager so versions can be resolved");
+        return;
+    }
+    if offline {
+        println!("\nadvisory database not consulted (--offline)");
+        return;
+    }
+    if let Some(err) = &r.error {
+        // the resolution above still stands; only the assessment is missing
+        println!("\nvulnerabilities: not assessed - {err}");
+        return;
+    }
+    let runtime = r.runtime_findings().len();
+    let dev = r.findings.len() - runtime;
+    if r.findings.is_empty() {
+        println!("\nvulnerabilities: none known against {} package(s)", r.packages.len());
+        return;
+    }
+    println!("\nvulnerabilities: {} ({runtime} runtime, {dev} dev-only)", r.findings.len());
+    for f in &r.findings {
+        let p = &f.package;
+        let scope = if p.dev { ", dev" } else { "" };
+        let reach = if p.direct { "direct" } else { "transitive" };
+        println!(
+            "\n  [{}] {} {} ({}{scope}, {reach})",
+            f.advisory.severity.to_uppercase(),
+            p.name,
+            p.version,
+            p.ecosystem.label()
+        );
+        println!("        {}", f.advisory.summary);
+        match &f.advisory.fixed {
+            Some(v) => println!("        fixed in {v}"),
+            None => println!("        no fixed version published"),
+        }
+        println!("        {} {}", f.advisory.id, f.advisory.url);
+    }
+}
+
+fn print_prompts_text(r: &codecache::PromptsReport) {
+    let c = &r.counts;
+    println!(
+        "prompts: {} request(s) against {} (claude {}, copilot {}), base {}",
+        c.turns, r.root, c.claude_turns, c.copilot_turns, r.base
+    );
+    for s in &r.sources {
+        println!("source: {} - {} session(s) at {}", s.agent, s.sessions, s.location);
+    }
+    println!(
+        "attributed: {} changed file(s), {} unexplained",
+        c.attributed_files, c.unattributed_files
+    );
+    // the requests once, numbered
+    let slot: std::collections::BTreeMap<&str, usize> = r
+        .turns
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.as_str(), i + 1))
+        .collect();
+    for (i, t) in r.turns.iter().enumerate() {
+        let edits = match t.edits.len() {
+            0 => " (changed nothing)".to_string(),
+            n => format!(" ({n} edit(s))"),
+        };
+        println!("#{} {} {}{edits}: {}", i + 1, t.agent, t.ts, t.prompt);
+    }
+    for (path, refs) in &r.attributed {
+        // the evidence is part of the answer, not a footnote: a temporal match
+        // is a guess and should read as one
+        let cited: Vec<String> = refs
+            .iter()
+            .map(|p| {
+                let span = match p.lines {
+                    Some([s, e]) => format!("L{s}-{e} "),
+                    None => String::new(),
+                };
+                let n = slot.get(p.turn.as_str()).copied().unwrap_or(0);
+                format!("{span}[{}] #{n}", p.evidence)
+            })
+            .collect();
+        println!("{path}: {}", cited.join(", "));
+    }
+    for path in &r.unattributed {
+        println!("unexplained: {path}");
     }
 }
 
@@ -417,6 +786,12 @@ fn print_changes_text(r: &ChangesReport) {
     }
     if !r.unassigned_files.is_empty() {
         println!("unassigned: {}", r.unassigned_files.join(", "));
+    }
+    if let Some(d) = &r.deps {
+        print!("{}", codecache::deps::text(d, &r.base));
+    }
+    if r.telemetry.instrumented || r.telemetry.error.is_some() {
+        print!("{}", codecache::telemetry::text(&r.telemetry, &r.base));
     }
 }
 

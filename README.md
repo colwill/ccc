@@ -89,12 +89,18 @@ ccc scan [PATH] --tokens     # also pre-encode the cache into a token stream
 ccc check [PATH]             # exit non-zero if .ccc is stale - for CI
 ccc check [PATH] --format json   # same, but print changed cache files as JSON
 ccc tokenize [PATH]          # pre-encode an existing .ccc into tokens.bin + tokens.json
-ccc changes [PATH]              # what changed vs the base branch + which services to test (JSON)
+ccc changes [PATH]           # changes vs the base branch: services to test, dependencies,
+                             #   OpenTelemetry metrics (JSON)
+ccc changes [PATH] --telemetry # just what the branch did to the OpenTelemetry metrics
+ccc deps [PATH]              # just the dependency delta of that report, for CI (JSON)
+ccc prompts [PATH]           # which claude/copilot request produced each change (JSON)
 ccc serve [PATH]             # MCP server: agents query the in-memory map (REST + MCP)
 ccc serve [PATH] --html      # render the insights UI at /insights
 ccc export [PATH]            # publish what this project serves/calls, for other repos
 ccc insights [PATH]          # the insights analysis as JSON (call graph, triggers, lints)
 ccc insights [PATH] --html F # as one self-contained page
+ccc sast [PATH]              # security findings in this project's own code - returns non-zero on a high
+ccc audit [PATH]             # resolve the lockfiles and check them against the OSV advisory database
 ccc install [--dir DIR]      # install the ccc binary onto your PATH (Linux)
 ```
 
