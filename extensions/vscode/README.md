@@ -53,9 +53,13 @@ The panel badge is the number of tests worth running before you push.
 
 ## Requirements
 
-**The `ccc` binary.** Install it with `./install.sh` from the repo root, or `cargo build --release`
-and point `ccc.binaryPath` at `target/release/ccc`. The extension searches, in order:
-`ccc.binaryPath`, your `PATH`, `<folder>/target/release/ccc`, `<folder>/target/debug/ccc`.
+**The `ccc` binary.** The extension installs it for you. When it activates it looks for a working
+`ccc` — `ccc.binaryPath`, your `PATH`, `<folder>/target/release/ccc`, `<folder>/target/debug/ccc`,
+then a copy it installed earlier — and, finding none, downloads the release matching your platform
+into its own storage before the first analyser starts. Nothing on your `PATH` is modified, and
+`ccc.autoInstall: false` turns the download off. To manage the binary yourself, install it with
+`./install.sh` from the repo root, or `cargo build --release` and point `ccc.binaryPath` at
+`target/release/ccc`; a binary you provide is always preferred to the one the extension installs.
 
 **A git repo with a resolvable base ref**, for the coverage hints. The analyser diffs against the
 first of `origin/main`, `main`, `origin/master`, `master` that exists. On a shallow clone or a repo
@@ -211,8 +215,10 @@ carries the analyser's own explanation.
 **Everything looks like a cross-service call.** Your project has no `.ccc/map.json`, so boundaries
 were inferred from directories. Add a `services` block.
 
-**"could not find the ccc binary".** Build it (`cargo build --release`) or set `ccc.binaryPath`. The
-message lists every path that was searched.
+**"could not find the ccc binary".** The download failed, or `ccc.autoInstall` is off and nothing is
+installed. The message lists every path that was searched; **Retry Install** tries the download
+again, and `ccc: Show Log` says why the last one failed. Failing that, build it
+(`cargo build --release`) or set `ccc.binaryPath`.
 
 **The analyser keeps restarting.** It is restarted with backoff and gives up after five failures in
 five minutes. `ccc: Show Log` has the last 20 lines of its stderr for each crash.
@@ -223,7 +229,8 @@ same data the hints are built from.
 ## Performance
 
 One analyser process per workspace folder per window, started lazily the first time you open a file
-in that folder. It runs with `--no-watch` by default and rescans on save and on window focus, so it
+in that folder. Activation itself only probes for the binary — a single `ccc --version` — and costs
+a download once, when there is no ccc to find. It runs with `--no-watch` by default and rescans on save and on window focus, so it
 is idle between edits. Two windows on the same folder run two analysers, each on its own free port;
 a `ccc serve` you started yourself is neither used nor disturbed.
 

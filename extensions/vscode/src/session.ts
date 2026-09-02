@@ -3,11 +3,11 @@ import * as vscode from 'vscode';
 import { CccClient, isAborted } from './client';
 import { type Cfg, needsRebuild, needsServerRestart } from './config';
 import { FileStructureCache, refineFileHints } from './enclosing';
-import type { Log } from './log';
+import { describe, type Log } from './log';
 import { buildHintIndex, type FileHints, type HintIndex } from './model';
 import { keyOf, relOf } from './paths';
 import { ServerProcess, type ServerState } from './server';
-import type { FileStructure, InsightsPayload, ReferencesResult } from './types';
+import type { FileStructure, InsightsPayload, ReferencesResult, VulnPayload } from './types';
 
 export interface RefreshOptions {
   // POST /refresh before reading the analysis - the files on disk changed
@@ -27,6 +27,7 @@ export class WorkspaceSession implements vscode.Disposable {
   private structures: FileStructureCache | undefined;
   private currentIndex: HintIndex | undefined;
   private lastPayload: InsightsPayload | undefined;
+  private lastVulns: VulnPayload | undefined;
   private lastGenerated: string | undefined;
   private lastBase: string | undefined;
   private inFlight: AbortController | undefined;
@@ -40,13 +41,19 @@ export class WorkspaceSession implements vscode.Disposable {
     private cfg: Cfg,
     private readonly log: Log,
     private readonly userAgent: string,
+    // extension storage, where an auto-installed ccc is kept
+    storage?: vscode.Uri,
   ) {
-    this.server = new ServerProcess(folder.uri, cfg, log, folder.name);
+    this.server = new ServerProcess(folder.uri, cfg, log, folder.name, storage);
     this.server.onDidChangeState((state) => this.onServerState(state));
   }
 
   get index(): HintIndex | undefined {
     return this.currentIndex;
+  }
+
+  get vulnerabilities(): VulnPayload | undefined {
+    return this.lastVulns;
   }
 
   get serverState(): ServerState {
@@ -175,6 +182,26 @@ export class WorkspaceSession implements vscode.Disposable {
           `${this.currentIndex.counts.untested} untested, ${this.currentIndex.files.size} files with hints`,
       );
       this.changed.fire();
+
+      // advisories are a separate, slower question - a failure here must not
+      // discard the refresh that already succeeded
+      try {
+        const vulns = await client.vulnerabilities(signal);
+        if (this.disposed || signal.aborted) return;
+        this.lastVulns = vulns;
+        const n = vulns.findings.length;
+        if (n > 0 || vulns.error) {
+          this.log.info(
+            `[${this.folder.name}] dependencies: ${vulns.packages.length} resolved, ${n} advisory finding(s)` +
+              (vulns.error ? ` (not assessed: ${vulns.error})` : ''),
+          );
+        }
+        this.changed.fire();
+      } catch (err) {
+        if (!isAborted(err)) {
+          this.log.warn(`[${this.folder.name}] could not read dependency advisories: ${describe(err)}`);
+        }
+      }
     } catch (err) {
       if (isAborted(err)) return;
       this.log.error(`[${this.folder.name}] refresh failed (${options.reason})`, err);

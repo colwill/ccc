@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { CccBinaryError } from './binary';
+import { bootstrapCccBinary, CccBinaryError } from './binary';
 import { CccCodeLensProvider } from './codelens';
 import { type CommandHost, registerCommands } from './commands';
 import { type Cfg, needsDecorationReload, readConfig } from './config';
@@ -11,11 +11,15 @@ import { WorkspaceSession } from './session';
 import { type ActiveFileState, StatusBar } from './status';
 import { ComplexityPanel } from './complexitypanel';
 import { TestTriggerPanel } from './testpanel';
+import { VulnerabilityMarks } from './vulns';
 
 // re-applying decorations while typing is cheap but not free
 const DIRTY_DEBOUNCE_MS = 150;
 // don't rescan on every alt-tab
 const FOCUS_COOLDOWN_MS = 10_000;
+// the extension version the binary check last ran for, so an install or an
+// update re-checks once and every later activation stays cheap
+const CHECKED_FOR_KEY = 'ccc.binaryCheckedFor';
 
 let extension: Extension | undefined;
 
@@ -40,11 +44,16 @@ class Extension implements CommandHost {
   private readonly codeLens: CccCodeLensProvider;
   private readonly hover: CccHoverProvider;
   private readonly testPanel: TestTriggerPanel;
+  private readonly vulns = new VulnerabilityMarks();
   private readonly complexityPanel: ComplexityPanel;
   private cfg: Cfg;
   private lastFocusRefresh = 0;
   private dirtyTimer: NodeJS.Timeout | undefined;
   private disposables: vscode.Disposable[] = [];
+  private version = '0.0.0';
+  // a usable analyser binary exists; false means every session start will fail the same way
+  private binaryReady = false;
+  private binaryWarned = false;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.cfg = readConfig();
@@ -80,9 +89,9 @@ class Extension implements CommandHost {
   }
 
   async start(): Promise<void> {
-    const version = this.context.extension.packageJSON?.version ?? '0.0.0';
-    this.userAgent = `vscode-ccc/${version}`;
-    this.log.info(`ccc extension ${version} activating`);
+    this.version = this.context.extension.packageJSON?.version ?? '0.0.0';
+    this.userAgent = `vscode-ccc/${this.version}`;
+    this.log.info(`ccc extension ${this.version} activating`);
 
     // commands register unconditionally so `ccc: Show Log` still works when all else failed
     this.disposables.push(
@@ -93,6 +102,7 @@ class Extension implements CommandHost {
       this.codeLens,
       this.testPanel,
       this.complexityPanel,
+      this.vulns,
       vscode.languages.registerCodeLensProvider({ scheme: 'file' }, this.codeLens),
       vscode.languages.registerHoverProvider({ scheme: 'file' }, this.hover),
       vscode.commands.registerCommand('ccc.refreshTestTriggers', () =>
@@ -126,13 +136,21 @@ class Extension implements CommandHost {
     );
     await vscode.commands.executeCommand('setContext', 'ccc.active', false);
 
+    // the analyser is a separate binary, so nothing else can work until one exists:
+    // install it here rather than leaving the first session to discover it is missing
+    await this.ensureBinary();
+
     this.disposables.push(
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (!e.affectsConfiguration('ccc')) return;
         void this.onConfigChanged();
       }),
       vscode.window.onDidChangeActiveTextEditor(() => void this.onActiveEditor()),
-      vscode.window.onDidChangeVisibleTextEditors(() => void this.render()),
+      vscode.window.onDidChangeVisibleTextEditors((editors) => {
+        // a manifest that just became visible has no decorations of its own yet
+        for (const editor of editors) this.vulns.apply(editor);
+        void this.render();
+      }),
       vscode.workspace.onDidSaveTextDocument((doc) => this.onSave(doc)),
       vscode.workspace.onDidChangeTextDocument((e) => this.onEdit(e)),
       vscode.window.onDidChangeWindowState((state) => this.onWindowState(state)),
@@ -144,6 +162,71 @@ class Extension implements CommandHost {
 
   private userAgent = 'vscode-ccc';
 
+  // Runs once per activation and only does real work when there is nothing to
+  // find: it searches PATH, the workspace builds and this extension's own
+  // storage first, and downloads the matching GitHub release when none of those
+  // holds a usable ccc. On the first activation after the extension is
+  // installed or updated it also replaces a copy it installed for an older version
+  private async ensureBinary(): Promise<void> {
+    if (!this.cfg.enable || !this.cfg.server.autoStart) {
+      this.log.info('skipping the binary check: ccc.enable or ccc.server.autoStart is off');
+      return;
+    }
+    const checkedFor = this.context.globalState.get<string>(CHECKED_FOR_KEY);
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri);
+    try {
+      const resolved = await bootstrapCccBinary(
+        folders,
+        this.cfg,
+        this.log,
+        this.context.globalStorageUri,
+        // asking for a version costs a download when the installed copy differs,
+        // so only the first activation on a new extension version asks
+        checkedFor === this.version ? undefined : this.version,
+      );
+      this.binaryReady = true;
+      this.binaryWarned = false;
+      await this.context.globalState.update(CHECKED_FOR_KEY, this.version);
+      this.log.info(
+        `analyser binary ready: ${resolved.path} (${resolved.version ?? 'unknown version'}, ${resolved.source})`,
+      );
+    } catch (err) {
+      this.binaryReady = false;
+      this.log.error('no usable ccc binary', err);
+      this.warnMissingBinary(
+        binaryMessage(err) ?? 'ccc: the analyser binary could not be installed. See the log for details.',
+      );
+    }
+  }
+
+  // a missing binary is one problem for the whole window, so it is reported once,
+  // not once per workspace folder that then fails to start
+  private warnMissingBinary(message: string): void {
+    if (this.binaryWarned) return;
+    this.binaryWarned = true;
+    void vscode.window
+      .showWarningMessage(message, 'Retry Install', 'Open Settings', 'Show Log')
+      .then(async (choice) => {
+        if (choice === 'Retry Install') {
+          this.binaryWarned = false;
+          await this.ensureBinary();
+          if (this.binaryReady) await this.retryStart();
+        } else if (choice === 'Open Settings') {
+          void vscode.commands.executeCommand('workbench.action.openSettings', 'ccc.binaryPath');
+        } else if (choice === 'Show Log') this.log.show();
+      });
+  }
+
+  // a binary that arrives late leaves the sessions that wanted it sitting in `failed`
+  private async retryStart(): Promise<void> {
+    this.warned.clear();
+    for (const session of this.sessionMap.values()) {
+      if (session.serverState.kind !== 'failed') continue;
+      await session.restartServer().catch((err) => this.log.error('restart after install failed', err));
+    }
+    await this.onActiveEditor();
+  }
+
   // sessions start lazily so a twelve-folder workspace does not spawn twelve analysers
   private async sessionFor(uri: vscode.Uri): Promise<WorkspaceSession | undefined> {
     if (!this.cfg.enable || !this.cfg.server.autoStart) return undefined;
@@ -154,9 +237,20 @@ class Extension implements CommandHost {
     if (existing) return existing;
 
     const cfg = readConfig(folder);
-    const session = new WorkspaceSession(folder, cfg, this.log, this.userAgent);
+    const session = new WorkspaceSession(
+      folder,
+      cfg,
+      this.log,
+      this.userAgent,
+      this.context.globalStorageUri,
+    );
     this.sessionMap.set(key, session);
-    session.onDidChange(() => void this.render());
+    session.onDidChange(() => {
+      // the refresh path fires twice, once for the analysis and once for the
+      // advisories - redrawing on both is what made the marks blink
+      if (this.vulns.update(folder.uri, session.vulnerabilities)) this.vulns.applyAll();
+      void this.render();
+    });
     try {
       await session.ensureStarted();
       await vscode.commands.executeCommand('setContext', 'ccc.active', true);
@@ -196,14 +290,21 @@ class Extension implements CommandHost {
   private reportStartFailure(folder: vscode.WorkspaceFolder, err: unknown): void {
     const key = folder.uri.toString();
     this.log.error(`could not start the analyser for ${folder.name}`, err);
+    // the binary is a window-wide problem with its own retry, not this folder's
+    const binary = binaryMessage(err);
+    if (binary !== undefined) {
+      this.binaryReady = false;
+      this.warnMissingBinary(binary);
+      return;
+    }
     if (this.warned.has(key)) return;
     this.warned.add(key);
-    const message =
-      err instanceof CccBinaryError
-        ? `ccc: ${err.message} Searched: ${err.searched.join(', ')}.`
-        : `ccc: could not start the analyser for ${folder.name}. See the log for details.`;
     void vscode.window
-      .showWarningMessage(message, 'Open Settings', 'Show Log')
+      .showWarningMessage(
+        `ccc: could not start the analyser for ${folder.name}. See the log for details.`,
+        'Open Settings',
+        'Show Log',
+      )
       .then((choice) => {
         if (choice === 'Open Settings') {
           void vscode.commands.executeCommand('workbench.action.openSettings', 'ccc.binaryPath');
@@ -220,12 +321,19 @@ class Extension implements CommandHost {
     this.codeLens.updateConfig(this.cfg);
     this.hover.updateConfig(this.cfg);
 
+    // the fix for a missing binary usually arrives as a settings change - take it
+    // before the sessions below act on the same change
+    const wasReady = this.binaryReady;
+    if (!wasReady && bearsOnBinary(previous, this.cfg)) await this.ensureBinary();
+
     for (const [key, session] of this.sessionMap) {
       session.updateConfig(readConfig(vscode.workspace.getWorkspaceFolder(vscode.Uri.parse(key))));
     }
     if (!this.cfg.enable) {
       this.clearAllDecorations();
     }
+    // a session left in `failed` by the old settings does not restart itself
+    if (!wasReady && this.binaryReady) await this.retryStart();
     await this.render();
   }
 
@@ -374,4 +482,20 @@ class Extension implements CommandHost {
     for (const disposable of this.disposables) disposable.dispose();
     this.disposables = [];
   }
+}
+
+// the user-facing form of "there is no binary", or undefined for any other failure
+function binaryMessage(err: unknown): string | undefined {
+  if (!(err instanceof CccBinaryError)) return undefined;
+  return `ccc: ${err.message} Searched: ${err.searched.join(', ')}.`;
+}
+
+// settings that can turn "no binary" into "a binary", so are worth re-checking for
+function bearsOnBinary(a: Cfg, b: Cfg): boolean {
+  return (
+    a.enable !== b.enable ||
+    a.binaryPath !== b.binaryPath ||
+    a.autoInstall !== b.autoInstall ||
+    a.server.autoStart !== b.server.autoStart
+  );
 }

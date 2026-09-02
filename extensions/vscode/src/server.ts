@@ -50,6 +50,8 @@ export class ServerProcess implements vscode.Disposable {
     private cfg: Cfg,
     private readonly log: Log,
     private readonly label: string,
+    // extension storage, where an auto-installed ccc is kept
+    private readonly storage?: vscode.Uri,
   ) {
     // last-ditch cleanup if the extension host dies without calling deactivate
     this.exitGuard = () => this.child?.kill();
@@ -96,7 +98,7 @@ export class ServerProcess implements vscode.Disposable {
     this.setState({ kind: 'starting' });
     let bin: string;
     try {
-      const resolved = await resolveCccBinary(this.folder, this.cfg, this.log);
+      const resolved = await resolveCccBinary(this.folder, this.cfg, this.log, this.storage);
       bin = resolved.path;
     } catch (err) {
       const message =

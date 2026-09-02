@@ -6,7 +6,7 @@
 //! parsed map in whenever source changes - `/refresh` forces it immediately.
 
 use crate::model::{FileCache, Counts};
-use crate::{insights, render, scan};
+use crate::{audit, deps, insights, render, sast, scan};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,7 +50,15 @@ struct MapState {
     html: bool,
     origin: String,
     analysis: Mutex<Option<Analysis>>,
+    // the advisory answer for this map generation; asking osv is a network round trip
+    audit: Mutex<Option<(String, audit::AuditReport)>>,
+    // security findings for this generation, keyed also by whether tests were included
+    sast: Mutex<Option<(String, bool, sast::SastReport)>>,
+    // the dependency delta per base ref for this generation
+    deps: Mutex<DepsCache>,
 }
+
+type DepsCache = (String, BTreeMap<String, (String, Arc<deps::DepsReport>)>);
 
 struct Analysis {
     // the map generation this was computed from
@@ -83,7 +91,59 @@ impl MapState {
                 format!("http://{}:{}", d.addr, d.port)
             },
             analysis: Mutex::new(None),
+            audit: Mutex::new(None),
+            sast: Mutex::new(None),
+            deps: Mutex::new((String::new(), BTreeMap::new())),
         })
+    }
+
+    // resolving lockfiles is cheap, asking osv is not - hold the answer for this generation
+    fn audit_report(&self, offline: bool) -> audit::AuditReport {
+        let mut slot = self.audit.lock().expect("audit lock poisoned");
+        if let Some((ts, cached)) = slot.as_ref() {
+            // a cached resolution still serves an offline caller even if osv was unreachable
+            if ts == &self.ts && (offline || cached.assessed) {
+                return cached.clone();
+            }
+        }
+        let mut report = audit::resolve(&self.root);
+        if !offline {
+            audit::assess(&mut report);
+        }
+        audit::locate(&self.root, &mut report);
+        *slot = Some((self.ts.clone(), report.clone()));
+        report
+    }
+
+    // What this branch did to the dependency tree
+    fn deps_report(&self, base: Option<&str>) -> Result<(String, Arc<deps::DepsReport>), String> {
+        let key = base.unwrap_or_default().to_string();
+        let mut slot = self.deps.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.0 != self.ts {
+            *slot = (self.ts.clone(), BTreeMap::new());
+        }
+        if let Some((label, hit)) = slot.1.get(&key) {
+            return Ok((label.clone(), Arc::clone(hit)));
+        }
+        // the server watches a working tree, so uncommitted edits count
+        let (label, report) = crate::changes::deps_report(&self.root, base, true)
+            .map_err(|e| format!("{e:#}"))?;
+        let report = Arc::new(report);
+        slot.1.insert(key, (label.clone(), Arc::clone(&report)));
+        Ok((label, report))
+    }
+
+    // re-parsing every file is not free, so hold the answer for this generation
+    fn sast_report(&self, include_tests: bool) -> sast::SastReport {
+        let mut slot = self.sast.lock().expect("sast lock poisoned");
+        if let Some((ts, tests, cached)) = slot.as_ref() {
+            if ts == &self.ts && *tests == include_tests {
+                return cached.clone();
+            }
+        }
+        let report = sast::analyse(&self.root, include_tests);
+        *slot = Some((self.ts.clone(), include_tests, report.clone()));
+        report
     }
 
     fn rescan(&mut self) -> Result<(usize, usize)> {
@@ -1439,6 +1499,153 @@ fn q_notes(map: &MapState, marker: Option<&str>) -> Value {
     json!({"count": notes.len(), "marker": marker, "notes": notes})
 }
 
+// resolved dependency set plus whatever the advisory database had to say about it
+fn md_security(r: &sast::SastReport, floor: sast::Severity, rule: Option<&str>) -> String {
+    use std::fmt::Write;
+    let shown: Vec<&sast::Finding> = r
+        .findings
+        .iter()
+        .filter(|f| f.severity <= floor)
+        .filter(|f| rule.is_none_or(|want| f.rule == want))
+        .collect();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# security - {} finding(s) across {} file(s)",
+        shown.len(),
+        r.files_scanned
+    );
+    let _ = writeln!(
+        out,
+        "high {}, medium {}, low {} (test scopes excluded unless include_tests)",
+        r.by_severity(sast::Severity::High),
+        r.by_severity(sast::Severity::Medium),
+        r.by_severity(sast::Severity::Low)
+    );
+
+    if shown.is_empty() {
+        out.push_str(
+            "\nnothing matched. These are syntax-level rules with no data flow behind them, \
+             so this is not a proof of safety.\n",
+        );
+    }
+
+    for f in &shown {
+        let _ = write!(
+            out,
+            "\n[{}] {} - {}:{} in {}\n    {}\n    evidence: {}\n    {} - {}\n",
+            f.severity.as_str(),
+            f.rule,
+            f.file,
+            f.line,
+            f.function,
+            f.message,
+            f.evidence,
+            f.cwe,
+            f.hint,
+        );
+    }
+
+    out.push_str("\n## rules\n");
+    for (name, cwe, what) in sast::rule_catalogue() {
+        let n = r.findings.iter().filter(|f| f.rule == name).count();
+        let _ = writeln!(out, "- {name} ({cwe}) - {what}: {n} finding(s)");
+    }
+    out.push_str(
+        "\nEvery finding is a syntax match with no type or data-flow information behind it - \
+         read the evidence and confirm in the source before acting on one.\n",
+    );
+    out
+}
+
+fn md_vulnerabilities(r: &audit::AuditReport, offline: bool, with_dev: bool) -> String {
+    use std::fmt::Write;
+    let shown: Vec<&audit::Finding> = if with_dev {
+        r.findings.iter().collect()
+    } else {
+        r.runtime_findings()
+    };
+    let mut out = String::new();
+
+    if r.packages.is_empty() {
+        return "# vulnerabilities\n\nno lockfile found under this root, so no version could be \
+                resolved. A manifest range like `1` or `^2.0` names nothing an advisory can be \
+                matched against - run the package manager to produce a lockfile."
+            .to_string();
+    }
+
+    let _ = writeln!(
+        out,
+        "# vulnerabilities - {} finding(s) across {} package(s)",
+        shown.len(),
+        r.packages.len()
+    );
+    let _ = writeln!(
+        out,
+        "{} resolved from {} lockfile(s), {} direct and {} transitive",
+        r.packages.len(),
+        r.lockfiles.len(),
+        r.direct_count(),
+        r.packages.len() - r.direct_count()
+    );
+    out.push('\n');
+    for lock in &r.lockfiles {
+        let n = r.packages.iter().filter(|p| &p.lockfile == lock).count();
+        let _ = writeln!(out, "- {lock} - {n} package(s)");
+    }
+
+    if !r.unresolved.is_empty() {
+        // a coverage gap is not a clean result, so it is never left implicit
+        let _ = write!(out, "\n## not resolved ({})\n", r.unresolved.len());
+        for u in &r.unresolved {
+            let _ = writeln!(out, "- {} - {}", u.manifest, u.reason);
+        }
+    }
+    if offline {
+        out.push_str("\nthe advisory database was not consulted (offline)\n");
+        return out;
+    }
+    if let Some(err) = &r.error {
+        // the resolution above still stands, only the assessment is missing
+        let _ = write!(out, "\nnot assessed - {err}\n");
+        return out;
+    }
+    if shown.is_empty() {
+        let scope = if with_dev { "" } else { " that reach production" };
+        let _ = write!(out, "\nno known advisories against these packages{scope}\n");
+        return out;
+    }
+
+    let runtime = shown.iter().filter(|f| !f.package.dev).count();
+    let _ = write!(
+        out,
+        "\n## findings ({runtime} runtime, {} dev-only)\n",
+        shown.len() - runtime
+    );
+    for f in shown {
+        let p = &f.package;
+        let _ = write!(
+            out,
+            "\n[{}] {} {} - {}, {}, {}\n    {}\n    {}\n    {} {}\n",
+            f.advisory.severity,
+            p.name,
+            p.version,
+            p.ecosystem.label(),
+            if p.direct { "direct" } else { "transitive" },
+            if p.dev { "dev-only" } else { "runtime" },
+            f.advisory.summary,
+            match &f.advisory.fixed {
+                Some(v) => format!("fixed in {v}"),
+                None => "no fixed version published".to_string(),
+            },
+            f.advisory.id,
+            f.advisory.url,
+        );
+    }
+    out
+}
+
 fn mcp_tools() -> Value {
     let tool = |name: &str, desc: &str, props: Value, required: &[&str]| {
         json!({
@@ -1451,7 +1658,7 @@ fn mcp_tools() -> Value {
             },
         })
     };
-    json!({ "tools": [
+    let tools = vec![
         tool(
             "index",
             "START HERE in an unfamiliar project: what it contains, which directories carry the weight, where to look next. Use instead of `ls -R`, `find . -name '*.rs'` or `tree`. Every file the map holds is named, in path order, one row each - nothing is ever collapsed into a directory summary, so a row always tells you where something actually is. Most projects come back whole; the answer is capped at about a thousand lines, and past that the rest waits behind `offset` (or narrow with `path` instead of paging). The header totals always describe the whole filtered set, not the page. Where a project has module roots the rows carry two more columns: `mods`, the submodules a file declares, and `exp`, the names it re-exports - so a Rust `lib.rs` or `mod.rs`, which defines nothing and reads as zero in every other column, is visible as the module graph and public surface it is. Then drill: `path` for the files under one directory, `offset` for the next page of rows.",
@@ -1484,6 +1691,33 @@ fn mcp_tools() -> Value {
             &[],
         ),
         tool(
+            "vulnerabilities",
+            "ANSWERS whether anything this project depends on has a known vulnerability, and which of them actually reach production. Use instead of reading a manifest and guessing. Resolves the exact transitive closure from lockfiles (Cargo.lock, package-lock.json, go.sum, pinned requirements.txt) rather than the loose ranges a manifest declares - `anyhow = \"1\"` names no version an advisory range can be matched against, and most advisories land on packages nothing declared. The resolved set is checked against the OSV advisory database, which covers crates.io, npm, Go and PyPI. Each finding carries the severity, the first fixed version, and whether the package is `direct` (a manifest names it) or `transitive`, `runtime` or `dev` - a dev-only advisory never ships. Findings are ordered runtime first, then worst first. The advisory database is consulted over the network; when it cannot be reached the resolved dependency set is still returned and the reason is reported, never fatal. Pass offline=true to resolve dependencies without any network call.",
+            json!({
+                "offline": {"type": "boolean", "description": "resolve dependencies only; never consult the advisory database (default false)"},
+                "dev": {"type": "boolean", "description": "include dev/build-only findings (default true; set false for only what ships)"},
+            }),
+            &[],
+        ),
+        tool(
+            "deps",
+            "ANSWERS what this branch did to the dependency tree: which packages entered it, which left, which moved version, and whether that introduced an advisory that was not there before. Use instead of reading a lockfile diff, which is thousands of lines of hashes with the answer buried in it. It does NOT answer what this project depends on or what is currently vulnerable - that is `vulnerabilities`, which never looks at git. Both sides of the branch are resolved out of committed trees through the same lockfile parsers, so the answer does not change with whatever is on disk. Each change carries the versions on both sides, whether the package is `direct` (a manifest names it) or transitive, whether it ships or is dev-only, and the manifest lines it can be edited at - a transitive bump points at the direct dependency whose line a person can actually change. `promoted`/`demoted` mean a manifest started or stopped naming it at the same version; `now-ships`/`no-longer-ships` mean it crossed between the dev and runtime closures, which is when a dev-only advisory starts to matter. Version direction is reported only where the ecosystem orders versions unambiguously; a Go pseudo-version or an npm prerelease tag reads as `versions-changed` rather than a guessed direction. Only the versions that exist on exactly one side are checked against the OSV advisory database; when it cannot be reached the change set is still complete and the reason is reported, never fatal. A branch that touched no manifest or lockfile answers in one line without reading anything.",
+            json!({
+                "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
+            }),
+            &[],
+        ),
+        tool(
+            "security",
+            "ANSWERS what in this project's own code is a security risk - credentials committed to source, certificate checks turned off, a command line or an SQL statement built from a value, a broken hash, predictable randomness. Use instead of grepping for `password` or `eval`. Rules match real literal and call nodes in the same tree-sitter parse the map is built from, so a finding cannot come from a comment, from prose, or from the word `password` inside a sentence - which is exactly what a text search gets wrong. Each finding carries the rule, a CWE, the severity, the enclosing function, and the text it actually matched; secret values are redacted to a prefix and a length. Test scopes are skipped by default because a credential in a fixture is usually a fixture - an inline `mod tests` counts, not just a test path. These are syntax-level rules with no data flow and no type information behind them: read the evidence and confirm in the source before acting on one, and treat a clean result as nothing matched rather than as proof of safety.",
+            json!({
+                "min_severity": {"type": "string", "enum": ["high", "medium", "low"], "description": "only findings at or above this severity (default low, i.e. everything)"},
+                "rule": {"type": "string", "description": "only findings from this rule (see the rules section of any result)"},
+                "include_tests": {"type": "boolean", "description": "also scan test scopes, where a credential is usually a fixture (default false)"},
+            }),
+            &[],
+        ),
+        tool(
             "file",
             "ANSWERS what is in this file - the submodules it declares, its imports (`pub` marks a re-export), every constant and function with its return type and doc summary, plus notes - for a fraction of the tokens reading it would cost. Use it to decide whether a file is worth opening at all, and on a module root (lib.rs, mod.rs, __init__.py) to read the module graph and published API of everything around it. NOT for editing: this is a map, not the code, so open the real source before you change a line. Pass structured=true for definition spans and the intra-file call graph instead of the rendered markdown.",
             json!({
@@ -1509,6 +1743,16 @@ fn mcp_tools() -> Value {
                 "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
                 "limit": {"type": "integer", "description": "changed functions per page (default 40, max 500)"},
                 "offset": {"type": "integer", "description": "changed functions to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
+            "prompts",
+            "ANSWERS why a change was made, not just what changed: which request sent to claude or copilot produced it. Use when a hunk needs explaining - before reverting something that looks stray, when reviewing work another session did, or to recover the intent behind code you are about to change. Reads the records those agents already keep on this machine: claude's session transcripts, which link a prompt to the exact `Edit`/`Write` it produced, and copilot's chat log, which carries the prompt and its timing. Every attribution names its evidence: `content-match` means the text that request wrote is still in the file inside a changed hunk, `tool-edit` means the request named the file, `temporal` means only its timing places it there - the rung that covers edits made through the shell. A changed file no request explains is listed as unattributed rather than credited to whichever prompt was nearest, so `unattributed` is the honest answer for hand-written code.",
+            json!({
+                "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
+                "limit": {"type": "integer", "description": "attributed files per page (default 25, max 500)"},
+                "offset": {"type": "integer", "description": "attributed files to skip (default 0)"},
             }),
             &[],
         ),
@@ -1570,7 +1814,8 @@ fn mcp_tools() -> Value {
             json!({}),
             &[],
         ),
-    ]})
+    ];
+    json!({ "tools": tools })
 }
 
 fn mcp_initialize(params: &Value) -> Value {
@@ -1618,10 +1863,16 @@ fn mcp_initialize(params: &Value) -> Value {
             of an exact name - check it before changing a signature, `dependencies` \
             file-level edges and declared packages, `file` one file's full map including \
             the submodules it declares, `notes` TODO/FIXME markers, `refresh` force a \
-            rescan. Analysis: `changes` what this branch touched, `test_triggers` the \
+            rescan. Analysis: `changes` what this branch touched, `prompts` which \
+            request sent to claude or copilot produced each of those changes - and \
+            which of them nothing explains, `test_triggers` the \
             tests those changes make necessary, `test_targets` where a missing test \
             would cost most, `lints` syntax-level findings, `hot` call-graph shape, \
-            `services` the service map and the calls crossing it. For a person rather \
+            `services` the service map and the calls crossing it, `vulnerabilities` known advisories against the dependencies the lockfiles actually \
+            resolve to, runtime ones first, `deps` what this branch did to that dependency tree - \
+            what entered it, what left, what moved version and which advisories that introduced. \
+            `security` syntax-level security findings in this \
+            project's own code - secrets, disabled TLS, injection surfaces. For a person rather \
             than an agent: `insights` opens the UI over that same analysis in their \
             browser - call it when they ask to *see* the code, not to read about it. \
             The analysis tools are \
@@ -1630,7 +1881,7 @@ fn mcp_initialize(params: &Value) -> Value {
             acting. They page rather than truncate: on `showing 1-40 of 152`, pass \
             `offset` for the rest.\n\n\
             Results are markdown; the same data is JSON over HTTP (/index, /find, \
-            /references, /dependencies, /file, /notes, /insights.json).",
+            /references, /dependencies, /file, /notes, /insights.json, /deps.json).",
     })
 }
 
@@ -2274,6 +2525,85 @@ fn md_unavailable(what: &str, v: &Value) -> Option<String> {
     ))
 }
 
+fn md_prompts(v: &Value, page: Page) -> String {
+    if let Some(why) = md_unavailable("prompts", v) {
+        return why;
+    }
+    let turns = jarr(v, "turns");
+    let files = jarr(v, "changed_files");
+    let attributed: Vec<&Value> = files
+        .iter()
+        .filter(|f| !jarr(f, "prompted_by").is_empty())
+        .collect();
+    let unattributed = jarr(v, "unattributed");
+
+    let mut out = format!(
+        "# prompts\n{} request(s) against this branch, {} changed file(s) explained, {} not\n",
+        turns.len(),
+        attributed.len(),
+        unattributed.len(),
+    );
+    if turns.is_empty() {
+        out.push_str(
+            "no local claude or copilot records name this project. \
+             The agent may not have run here, or its history has rotated.\n",
+        );
+        return out;
+    }
+
+    // requests once, numbered, so the rows below cite rather than repeat them
+    let slot: BTreeMap<String, usize> = turns
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (jstr(t, "id"), i + 1))
+        .collect();
+    let body: String = turns
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let n = jarr(t, "edits").len();
+            format!(
+                "#{} {} {} ({} edit(s)) {}\n",
+                i + 1,
+                jstr(t, "agent"),
+                jstr(t, "ts"),
+                n,
+                jstr(t, "prompt"),
+            )
+        })
+        .collect();
+    md_section(&mut out, "requests", &body);
+
+    let (window, note) = page.window(&attributed);
+    let rows: String = window
+        .iter()
+        .map(|f| {
+            let cited: Vec<String> = jarr(f, "prompted_by")
+                .iter()
+                .map(|p| {
+                    let span = match &jarr(p, "lines")[..] {
+                        [a, b] => format!("L{a}-{b} "),
+                        _ => String::new(),
+                    };
+                    let n = slot.get(&jstr(p, "turn")).copied().unwrap_or(0);
+                    format!("{span}[{}] #{n}", jstr(p, "evidence"))
+                })
+                .collect();
+            format!("{}: {}\n", jstr(f, "path"), cited.join(", "))
+        })
+        .collect();
+    md_section(&mut out, &format!("attributed changes {note}"), &rows);
+
+    if !unattributed.is_empty() {
+        let body: String = unattributed
+            .iter()
+            .map(|p| format!("{}\n", p.as_str().unwrap_or_default()))
+            .collect();
+        md_section(&mut out, "no request explains", &body);
+    }
+    out
+}
+
 fn md_changes(v: &Value, page: Page) -> String {
     if let Some(why) = md_unavailable("changes", v) {
         return why;
@@ -2367,6 +2697,32 @@ fn md_changes(v: &Value, page: Page) -> String {
         })
         .collect();
     md_section(&mut out, "unresolved calls", &unresolved);
+
+    // What the branch did to the metric names
+    let telemetry = v.get("telemetry").cloned().unwrap_or(json!({}));
+    let metrics: String = jarr(&telemetry, "changes")
+        .iter()
+        .map(|m| {
+            let was = jstr(m, "was");
+            let mut line = format!("{} {}", jstr(m, "kind"), jstr(m, "name"));
+            if !was.is_empty() {
+                line.push_str(&format!(" (was {was})"));
+            }
+            if jbool(m, "breaking") {
+                line.push_str(" BREAKING");
+            }
+            let detail: Vec<String> = jarr(m, "detail")
+                .into_iter()
+                .filter_map(|d| d.as_str().map(str::to_string))
+                .collect();
+            if !detail.is_empty() {
+                line.push_str(&format!(" - {}", detail.join(", ")));
+            }
+            line.push('\n');
+            line
+        })
+        .collect();
+    md_section(&mut out, "telemetry", &metrics);
     out
 }
 
@@ -2905,6 +3261,33 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let out: Result<String, String> = match name {
+        "security" => {
+            let include_tests = args
+                .get("include_tests")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let floor = match arg("min_severity").as_deref().unwrap_or("low") {
+                "high" => sast::Severity::High,
+                "medium" | "moderate" => sast::Severity::Medium,
+                _ => sast::Severity::Low,
+            };
+            Ok(md_security(
+                &map.sast_report(include_tests),
+                floor,
+                arg("rule").as_deref(),
+            ))
+        }
+        "vulnerabilities" => {
+            let offline = args
+                .get("offline")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let with_dev = args.get("dev").and_then(|v| v.as_bool()).unwrap_or(true);
+            Ok(md_vulnerabilities(&map.audit_report(offline), offline, with_dev))
+        }
+        "deps" => map
+            .deps_report(arg("base").as_deref())
+            .map(|(label, r)| deps::markdown(&r, &label)),
         "index" => Ok(md_index(
             &q_index(&map, arg("path").as_deref()),
             &Page::from(&args, INDEX_DEFAULT_ROWS),
@@ -2928,6 +3311,10 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
         "changes" => {
             let a = map.analysis(arg("base").as_deref());
             Ok(md_changes(&a["changes"], Page::from(&args, 40)))
+        }
+        "prompts" => {
+            let a = map.analysis(arg("base").as_deref());
+            Ok(md_prompts(&a["changes"], Page::from(&args, 25)))
         }
         "test_triggers" => {
             let a = map.analysis(arg("base").as_deref());
@@ -3301,9 +3688,11 @@ const ENDPOINTS: &[&str] = &[
     "GET /find?q=<substring>[&kind=func|const|note]",
     "GET /references?symbol=<name>",
     "GET /dependencies[?file=<path>]",
+    "GET /deps.json[?base=<ref>] (what this branch did to the dependency tree)",
     "GET /file?path=<path>",
     "GET /notes[?marker=TODO]",
     "GET /health",
+    "GET /prompts[?base=<ref>] (which claude/copilot request produced each change)",
     "GET /insights.json[?base=<ref>] (the whole analysis payload)",
     "GET /insights (human UI over the same data; needs --html)",
     "POST /refresh",
@@ -3372,6 +3761,39 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
         ("GET", "/notes") => {
             let map = state.read().expect("map lock poisoned");
             ok(q_notes(&map, get("marker")))
+        }
+        // the attribution alone, without the rest of the change set
+        ("GET", "/prompts") => {
+            let map = state.read().expect("map lock poisoned");
+            let a = map.analysis(get("base"));
+            let c = &a["changes"];
+            ok(json!({
+                "schema": crate::prompts::SCHEMA,
+                "root": map.root_label,
+                "base": c["base"],
+                "turns": c["turns"],
+                "changed_files": c["changed_files"]
+                    .as_array()
+                    .map(|fs| fs.iter().filter(|f| {
+                        f["prompted_by"].as_array().is_some_and(|p| !p.is_empty())
+                    }).cloned().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                "unattributed": c["unattributed"],
+            }))
+        }
+        // dependency advisories
+        ("GET", "/vulnerabilities.json") => {
+            let map = state.read().expect("map lock poisoned");
+            let offline = get("offline").is_some_and(|v| v == "1" || v == "true");
+            ok(serde_json::to_value(map.audit_report(offline)).unwrap_or_else(|_| json!({})))
+        }
+        // what this branch did to the dependency tree
+        ("GET", "/deps.json") => {
+            let map = state.read().expect("map lock poisoned");
+            match map.deps_report(get("base")) {
+                Ok((_, r)) => ok(serde_json::to_value(&*r).unwrap_or_else(|_| json!({}))),
+                Err(e) => bad(400, e),
+            }
         }
         ("GET", "/insights.json") => {
             let map = state.read().expect("map lock poisoned");
@@ -3501,6 +3923,7 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     if opts.html {
         println!("insights UI: http://{addr}/insights");
     }
+    println!("dependency delta: http://{addr}/deps.json[?base=<ref>]");
     match opts.watch {
         Some(interval) => {
             println!("watching for changes every {}s", interval.as_secs().max(1));
@@ -4697,10 +5120,14 @@ mod tests {
                 "find",
                 "references",
                 "dependencies",
+                "vulnerabilities",
+                "deps",
+                "security",
                 "file",
                 "notes",
                 "refresh",
                 "changes",
+                "prompts",
                 "test_triggers",
                 "test_targets",
                 "lints",
@@ -4938,6 +5365,22 @@ mod tests {
         map.ts = "later".into();
         map.invalidate();
         assert!(!Arc::ptr_eq(&first, &map.analysis(None)));
+    }
+
+    #[test]
+    fn the_dependency_delta_needs_no_flag() {
+        let state = RwLock::new(fixture());
+        let names = |v: &Value| -> Vec<String> {
+            v["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(names(&mcp_tools()).contains(&"deps".to_string()));
+        assert!(names(&mcp_tools()).contains(&"dependencies".to_string()));
+        assert_ne!(route(&state, "GET", "/deps.json", b"").status, 404);
     }
 
     #[test]

@@ -44,22 +44,52 @@
       {
         "id": "ccc.complexity1",
         "description": "Complexity band 1 of 10: straight through, no decision points.",
-        "defaults": { "dark": "descriptionForeground", "light": "descriptionForeground", "highContrast": "descriptionForeground", "highContrastLight": "descriptionForeground" }
+        "defaults": {
+          "dark": "descriptionForeground",
+          "light": "descriptionForeground",
+          "highContrast": "descriptionForeground",
+          "highContrastLight": "descriptionForeground"
+        }
       },
       {
         "id": "ccc.complexity2",
         "description": "Complexity band 2 of 10: nearly straight through.",
-        "defaults": { "dark": "editor.foreground", "light": "editor.foreground", "highContrast": "editor.foreground", "highContrastLight": "editor.foreground" }
+        "defaults": {
+          "dark": "editor.foreground",
+          "light": "editor.foreground",
+          "highContrast": "editor.foreground",
+          "highContrastLight": "editor.foreground"
+        }
       },
       {
         "id": "ccc.complexity7",
         "description": "Complexity band 7 of 10: worth a second look.",
-        "defaults": { "dark": "#b07d48", "light": "#8a5a2b", "highContrast": "#d19a66", "highContrastLight": "#6d4520" }
+        "defaults": {
+          "dark": "#b07d48",
+          "light": "#8a5a2b",
+          "highContrast": "#d19a66",
+          "highContrastLight": "#6d4520"
+        }
       },
       {
         "id": "ccc.complexity8",
         "description": "Complexity band 8 of 10: worth a second look.",
-        "defaults": { "dark": "#d9a441", "light": "#a4700a", "highContrast": "#ffcc66", "highContrastLight": "#7d5400" }
+        "defaults": {
+          "dark": "#d9a441",
+          "light": "#a4700a",
+          "highContrast": "#ffcc66",
+          "highContrastLight": "#7d5400"
+        }
+      },
+      {
+        "id": "ccc.vulnerable",
+        "description": "Underline and badge marking a manifest line whose dependency has a known advisory.",
+        "defaults": {
+          "dark": "#cc7832",
+          "light": "#b7601a",
+          "highContrast": "#ff9e40",
+          "highContrastLight": "#8a4508"
+        }
       }
     ],
     "commands": [
@@ -297,7 +327,13 @@
           "type": "string",
           "default": "",
           "scope": "machine-overridable",
-          "markdownDescription": "Absolute path to the `ccc` binary. Empty searches PATH, then `target/release/ccc`, then `target/debug/ccc` in the workspace folder."
+          "markdownDescription": "Absolute path to the `ccc` binary. Empty searches PATH, then `target/release/ccc`, then `target/debug/ccc` in the workspace folder, then a copy installed by `ccc.autoInstall`."
+        },
+        "ccc.autoInstall": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "When no `ccc` binary is found, download the matching release from GitHub into this extension's storage. This runs when the extension activates, so the analyser is ready before the first file is opened, and again after an update if the installed copy is older than the extension. Nothing on your PATH is modified. Turn off to require an install you manage yourself."
         },
         "ccc.baseRef": {
           "type": "string",
@@ -484,13 +520,11 @@
       "ccc": [
         {
           "id": "ccc.testTriggers",
-          "name": "Triggers",
-          "contextualTitle": "CodeCaChe \u2014 tests your changes invoke"
+          "name": "[CCC] Test Impact"
         },
         {
           "id": "ccc.complexity",
-          "name": "Complexity",
-          "contextualTitle": "CodeCaChe \u2014 how complex each function is"
+          "name": "[CCC] Complexity"
         }
       ]
     }
@@ -507,7 +541,7 @@
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.2.0",
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.25.0",
     "typescript": "^5.6.0"
   }
 }

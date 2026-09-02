@@ -450,7 +450,7 @@ function complexityHover(fn: FileFunc): vscode.MarkdownString {
   const score = fn.complexity_score ?? 0;
   const md = new vscode.MarkdownString();
   md.supportThemeIcons = true;
-  md.appendMarkdown(`**Complexity ${score}/10** - _${SCORE_DESCRIPTION[score] ?? ''}_`);
+  md.appendMarkdown(`**[ccc] Complexity ${score}/10** - _${SCORE_DESCRIPTION[score] ?? ''}_`);
   const parts: string[] = [];
   if (typeof fn.complexity === 'number') parts.push(`${fn.complexity} independent path(s)`);
   if (typeof fn.branches === 'number' && fn.branches > 0) {
@@ -460,8 +460,8 @@ function complexityHover(fn: FileFunc): vscode.MarkdownString {
     parts.push(`${fn.loop_depth} nested loop level(s)`);
   }
   if (typeof fn.body_lines === 'number' && fn.body_lines > 0) parts.push(`${fn.body_lines} lines`);
-  if (parts.length > 0) md.appendMarkdown(`\n\nWhy: ${parts.join(' · ')}`);
-  md.appendMarkdown('\n\n_Cyclomatic-style: one path, plus one per decision point and loop._');
+  if (parts.length > 0) md.appendMarkdown(`\n\nMeasures ${parts.join(', ')}`);
+  md.appendMarkdown('\n\n_Cyclomatic-style complexity analysis_');
   return md;
 }
 

@@ -8,6 +8,8 @@ export type DecorationStyle = 'badge+gutter' | 'badge' | 'gutter';
 export interface Cfg {
   enable: boolean;
   binaryPath: string;
+  // download a matching ccc release into extension storage when none is found
+  autoInstall: boolean;
   baseRef: string | undefined;
   server: {
     autoStart: boolean;
@@ -59,6 +61,7 @@ export function readConfig(scope?: vscode.ConfigurationScope): Cfg {
   return {
     enable: c.get<boolean>('enable', true),
     binaryPath: c.get<string>('binaryPath', '').trim(),
+    autoInstall: c.get<boolean>('autoInstall', true),
     baseRef: baseRef.length > 0 ? baseRef : undefined,
     server: {
       autoStart: c.get<boolean>('server.autoStart', true),

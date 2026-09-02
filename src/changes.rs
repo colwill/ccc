@@ -2,6 +2,7 @@
 //!
 //! Groups source files into named services (from `.ccc/map.json` and/or
 //! `--service` flags), diffs the branch against a base ref.
+// ccc:skip
 
 use crate::coverage;
 use crate::extract::BDD_REGISTRARS;
@@ -34,6 +35,11 @@ pub struct ChangesOptions {
     // uncommitted edits and untracked files count as changes. CI wants the
     // committed view (the default); an engineer wants this one.
     pub worktree: bool,
+    // Off by default: it walks transcripts a CI run has no use for
+    pub prompts: bool,
+    // Work out what this branch did to the dependency tree. `ccc changes`
+    // always asks for it
+    pub deps: bool,
 }
 
 
@@ -79,6 +85,10 @@ pub struct ChangedFile {
     pub services: Vec<String>,
     // changed relative to HEAD as well as to the base: not committed yet
     pub uncommitted: bool,
+    // the requests sent to claude/copilot that produced this file's changes,
+    // strongest evidence first. Only populated with `prompts`
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prompted_by: Vec<crate::prompts::PromptRef>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -98,6 +108,10 @@ pub struct ChangedFunction {
     // same-named test in another language.
     pub tested_by_sites: Vec<TestedBySite>,
     pub called_from: Vec<String>,
+    // the requests behind this function's changes: the same references the
+    // file carries, narrowed to the ones whose evidence reaches this span
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prompted_by: Vec<crate::prompts::PromptRef>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -161,6 +175,12 @@ pub struct ChangesCounts {
     pub crossings: usize,
     // crossings whose key nothing answers: a typo, or a peer not configured
     pub unmatched_crossings: usize,
+    // changed functions a request accounts for
+    pub prompted_functions: usize,
+    pub unattributed_files: usize,
+    // telemetric definitions this branch moved
+    pub telemetry_changes: usize,
+    pub telemetry_breaking: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,6 +205,16 @@ pub struct ChangesReport {
     pub externals: Vec<Value>,
     // `ccc:calls` / `ccc:serves` pairs, including the ones that leave the repo
     pub crossings: Vec<Value>,
+    // requests sent to an agent
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<crate::prompts::Turn>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unattributed: Vec<String>,
+    // What this branch did to the dependency tree
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deps: Option<crate::deps::DepsReport>,
+    // what this branch did to the OpenTelemetry metrics
+    pub telemetry: crate::telemetry::TelemetryReport,
     pub counts: ChangesCounts,
 }
 
@@ -289,6 +319,40 @@ pub fn changes_with_caches(
         BTreeSet::new()
     };
 
+    // What the branch did to the dependency tree
+    let deps = opts.deps.then(|| {
+        crate::deps::analyse(
+            root,
+            &crate::deps::DepsOptions {
+                base_sha: &base_sha,
+                head_sha: &head_sha,
+                worktree: opts.worktree,
+                touched: &statuses,
+                offline: false,
+            },
+        )
+    });
+
+    // What the branch did to the metrics the source emits
+    let telemetry = crate::telemetry::analyse(
+        root,
+        &crate::telemetry::TelemetryOptions {
+            base_sha: &base_sha,
+            head_sha: &head_sha,
+            worktree: opts.worktree,
+        },
+    );
+
+    // Which request produced which change
+    let (turns, attribution) = if opts.prompts {
+        let (turns, _) = crate::prompts::collect(root, &crate::prompts::PromptsOptions::default());
+        let times = write_times(root, &base_sha, &hunks, &uncommitted);
+        let attribution = crate::prompts::attribute(root, &turns, &hunks, &times);
+        (turns, attribution)
+    } else {
+        (Vec::new(), crate::prompts::Attribution::default())
+    };
+
     let idx = build_indexes(root, caches, &matchers);
     // Which tests reach which definitions. One relation, shared with
     // `insights`, so the two reports cannot disagree about what is covered.
@@ -321,6 +385,7 @@ pub fn changes_with_caches(
             status: status.clone(),
             services,
             uncommitted: uncommitted.contains(path),
+            prompted_by: attribution.by_file.get(path).cloned().unwrap_or_default(),
         });
     }
     changed_files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -368,11 +433,23 @@ pub fn changes_with_caches(
                         .collect()
                 })
                 .unwrap_or_default();
+            // A file-wide reference explains every span in it
+            let prompted_by: Vec<crate::prompts::PromptRef> = attribution
+                .by_file
+                .get(&rel)
+                .map(|refs| {
+                    refs.iter()
+                        .filter(|r| r.covers(f.start_line, f.end_line))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             changed_functions.push(ChangedFunction {
                 services: services.clone(),
                 file: rel.clone(),
                 function: f.name.clone(),
                 lines: [f.start_line, f.end_line],
+                prompted_by,
                 tested,
                 tested_by,
                 tested_by_sites,
@@ -403,6 +480,13 @@ pub fn changes_with_caches(
         externals: externals.len(),
         crossings: crossings.len(),
         unmatched_crossings,
+        prompted_functions: changed_functions
+            .iter()
+            .filter(|f| !f.prompted_by.is_empty())
+            .count(),
+        unattributed_files: attribution.unattributed.len(),
+        telemetry_changes: telemetry.changes.len(),
+        telemetry_breaking: telemetry.counts.breaking,
     };
 
     Ok(ChangesReport {
@@ -422,8 +506,50 @@ pub fn changes_with_caches(
         unresolved_calls,
         externals: externals.iter().map(|e| e.json()).collect(),
         crossings: crossings.iter().map(crossing_json).collect(),
+        turns,
+        unattributed: attribution.unattributed,
+        deps,
+        telemetry,
         counts,
     })
+}
+
+// The dependency delta on its own
+pub fn deps_report(
+    root: &Path,
+    base: Option<&str>,
+    worktree: bool,
+) -> Result<(String, crate::deps::DepsReport)> {
+    let (base_label, base_sha) = resolve_base(root, base)?;
+    let head_sha = git(root, &["rev-parse", "HEAD"])?.trim().to_string();
+    let mut diff_refs: Vec<&str> = vec![&base_sha];
+    if !worktree {
+        diff_refs.push("HEAD");
+    }
+    let mut args = vec!["diff", "--relative", "--name-status", "-z", "-M"];
+    args.extend(&diff_refs);
+    let mut touched = parse_name_status(&git_bytes(root, &args)?);
+    // a lockfile git has never seen is still a lockfile this branch added
+    if worktree {
+        for path in git_bytes(root, &["ls-files", "--others", "--exclude-standard", "-z"])?
+            .split(|&b| b == 0)
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .filter(|s| !s.is_empty())
+        {
+            touched.push(("added".to_string(), path));
+        }
+    }
+    let report = crate::deps::analyse(
+        root,
+        &crate::deps::DepsOptions {
+            base_sha: &base_sha,
+            head_sha: &head_sha,
+            worktree,
+            touched: &touched,
+            offline: false,
+        },
+    );
+    Ok((base_label, report))
 }
 
 fn crossing_json(c: &crate::externals::Crossing) -> Value {
@@ -1446,8 +1572,84 @@ fn parse_hunks(diff: &str) -> BTreeMap<String, Vec<(usize, usize)>> {
     out
 }
 
+// The changed line ranges per file, plus when each of those files was last
+// written. `prompts` needs both: the ranges say what moved, the times say
+// which request was in flight when it moved.
+pub fn changed_line_times(
+    root: &Path,
+    base: Option<&str>,
+    worktree: bool,
+) -> Result<(String, BTreeMap<String, Vec<(usize, usize)>>, BTreeMap<String, i64>)> {
+    let (base_label, base_sha) = resolve_base(root, base)?;
+    let mut diff_refs: Vec<&str> = vec![&base_sha];
+    if !worktree {
+        diff_refs.push("HEAD");
+    }
+    let mut hunk_args = vec!["diff", "--relative", "--unified=0", "-M"];
+    hunk_args.extend(&diff_refs);
+    let mut hunks = parse_hunks(&git(root, &hunk_args)?);
+    let mut uncommitted = BTreeSet::new();
+    if worktree {
+        for path in git_bytes(root, &["ls-files", "--others", "--exclude-standard", "-z"])?
+            .split(|&b| b == 0)
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .filter(|s| !s.is_empty())
+        {
+            hunks.entry(path.clone()).or_insert_with(|| vec![(1, usize::MAX)]);
+            uncommitted.insert(path);
+        }
+        for (_, p) in parse_name_status(&git_bytes(
+            root,
+            &["diff", "--relative", "--name-status", "-z", "-M", "HEAD"],
+        )?) {
+            uncommitted.insert(p);
+        }
+    }
+    let times = write_times(root, &base_sha, &hunks, &uncommitted);
+    Ok((base_label, hunks, times))
+}
 
-// build one matcher per service; bare pattern with no glob is a dir prefix 
+// When each changed file was last written, in epoch seconds
+pub(crate) fn write_times(
+    root: &Path,
+    base_sha: &str,
+    hunks: &BTreeMap<String, Vec<(usize, usize)>>,
+    uncommitted: &BTreeSet<String>,
+) -> BTreeMap<String, i64> {
+    let mut out = BTreeMap::new();
+    let range = format!("{base_sha}..HEAD");
+    if let Ok(log) = git(
+        root,
+        &["log", "--format=@%ct", "--name-only", "--relative", &range],
+    ) {
+        // newest commit first, so the first mention of a path is its latest
+        let mut stamp = 0i64;
+        for line in log.lines() {
+            match line.strip_prefix('@') {
+                Some(t) => stamp = t.trim().parse().unwrap_or(0),
+                None if hunks.contains_key(line) => {
+                    out.entry(line.to_string()).or_insert(stamp);
+                }
+                None => {}
+            }
+        }
+    }
+    for path in uncommitted {
+        let Ok(mtime) = fs::metadata(root.join(path))
+            .and_then(|m| m.modified())
+            .and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })
+        else {
+            continue;
+        };
+        out.insert(path.clone(), mtime.as_secs() as i64);
+    }
+    out
+}
+
+// build one matcher per service; bare pattern with no glob is a dir prefix
 pub(crate) fn build_matchers(services: &BTreeMap<String, Vec<String>>) -> Result<Vec<(String, GlobSet)>> {
     let mut out = Vec::new();
     for (name, patterns) in services {
@@ -2155,6 +2357,8 @@ diff --git a/gone.rs b/gone.rs
             base: Some(base_sha),
             service_flags: vec![],
             worktree: false,
+            prompts: false,
+            deps: false,
         };
         let report = changes(&dir, ".", &opts).unwrap_or_else(|e| panic!("{tag}: {e}"));
         let _ = fs::remove_dir_all(&dir);
@@ -2603,6 +2807,8 @@ diff --git a/gone.rs b/gone.rs
             base: Some(base_sha.clone()),
             service_flags: vec![],
             worktree: false,
+            prompts: false,
+            deps: false,
         };
         let report = changes(&dir, ".", &opts).unwrap();
 

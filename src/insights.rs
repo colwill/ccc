@@ -1378,6 +1378,7 @@ fn arity(params: usize) -> &'static str {
 //
 // The working-tree view: an engineer's uncommitted edit has to count, and CI
 // re-runs this against the committed tree anyway.
+// ccc:skip
 fn change_set(
     g: &Graph,
     root: &Path,
@@ -1390,6 +1391,8 @@ fn change_set(
         base: base.map(str::to_string),
         service_flags: Vec::new(),
         worktree: true,
+        prompts: true,
+        deps: false,
     };
     changes::changes_with_caches(root, root_label, &opts, g.caches).map_err(|e| format!("{e:#}"))
 }
@@ -1673,15 +1676,11 @@ fn test_triggers(report: &changes::ChangesReport, trig: &Triggered, targets: &Va
             "direct": run.iter().filter(|(_, d, _)| *d == 0).count(),
         },
         "note": "Tests are matched to changes by name through the call graph, so this is the \
-                 set worth running - not proof that running it covers the change. A test that \
-                 exercises code without naming it, or through dynamic dispatch, cannot be seen. \
-                 `distance` is call hops from the changed function to what the test names. \
-                 Each `add` entry is a `target` id into `test_targets`, where the \
-                 recommendation itself lives.",
+                 estimated set worth running, not proof that running it covers the change.",
         "changed_note": if *any_change {
             "changed functions are diffed against the merge-base, including uncommitted edits"
         } else {
-            "nothing changed against the base"
+            "no change(s) detected, create a branch from base first."
         },
     })
 }
