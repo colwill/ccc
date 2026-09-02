@@ -1,7 +1,7 @@
 import * as http from 'node:http';
 import type { Log } from './log';
 import type { ServerAddress } from './server';
-import type { FileStructure, Health, InsightsPayload, ReferencesResult, RefreshResult } from './types';
+import type { FileStructure, Health, InsightsPayload, ReferencesResult, RefreshResult, VulnPayload } from './types';
 
 export class CccHttpError extends Error {
   constructor(
@@ -49,6 +49,11 @@ export class CccClient {
   insights(base: string | undefined, signal?: AbortSignal): Promise<InsightsPayload> {
     const query = base ? `?base=${encodeURIComponent(base)}` : '';
     return this.getJson<InsightsPayload>(`/insights.json${query}`, TIMEOUT_SLOW_MS, signal);
+  }
+
+  // dependency advisories; the analyser caches per map generation so this is cheap to re-ask
+  vulnerabilities(signal?: AbortSignal): Promise<VulnPayload> {
+    return this.getJson<VulnPayload>('/vulnerabilities.json', TIMEOUT_SLOW_MS, signal);
   }
 
   // pass the full repo-relative path - the server suffix-matches so a bare `money.rs` can mis-resolve

@@ -396,3 +396,44 @@ export function lineSpan(value: unknown): [number, number] | undefined {
   if (start < 1) return undefined;
   return [start, Math.max(start, end)];
 }
+
+// GET /vulnerabilities.json - dependency advisories with the manifest lines they belong on
+export interface VulnLocation {
+  manifest: string;
+  line: number;
+  // the direct dependency whose line this is; the package itself when direct
+  via: string;
+}
+
+export interface VulnPackage {
+  ecosystem: string;
+  name: string;
+  version: string;
+  direct: boolean;
+  dev: boolean;
+  lockfile: string;
+}
+
+export interface VulnAdvisory {
+  id: string;
+  aliases: string[];
+  summary: string;
+  severity: string;
+  fixed: string | null;
+  url: string;
+}
+
+export interface VulnFinding {
+  package: VulnPackage;
+  advisory: VulnAdvisory;
+  locations: VulnLocation[];
+}
+
+export interface VulnPayload {
+  packages: VulnPackage[];
+  findings: VulnFinding[];
+  lockfiles: string[];
+  unresolved: { manifest: string; reason: string }[];
+  assessed: boolean;
+  error: string | null;
+}
