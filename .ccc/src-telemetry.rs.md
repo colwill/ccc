@@ -1,0 +1,180 @@
+# telemetry.rs.md (20260921-12-11-30) UTC
+# source: src/telemetry.rs [rust]
+# modules
+# imports
+    - L26@crate::changes (is_test_fn_name, is_test_path)
+    - L27@crate::languages (Language)
+    - L28@crate::sast (is_string_kind, rightmost, unquote)
+    - L29@serde (Serialize)
+    - L30@std::collections (BTreeMap)
+    - L31@std::path (Path)
+    - L32@std::process (Command)
+    - L33@tree_sitter (Node, Parser)
+    - L1028@std::fmt (Write)
+    - L1081@std::fmt (Write)
+    - L1159@super
+    - L1160@std::collections (BTreeSet)
+    - L1161@std (fs)
+    - L1385@Instrument (Counter, Histogram)
+    - L1448@Instrument (Counter)
+# const
+    - L35@SCHEMA:&str
+    - L41@MARKERS:&[&str]
+    - L44@VENDORED:&[&str]
+    - L55@MAX_STATEMENT:usize
+    - L56@STATEMENT_DEPTH:usize
+    - L61@Counter:Instrument
+    - L62@UpDownCounter:Instrument
+    - L63@Histogram:Instrument
+    - L64@Gauge:Instrument
+    - L65@ObservableCounter:Instrument
+    - L66@ObservableUpDownCounter:Instrument
+    - L67@ObservableGauge:Instrument
+    - L110@Added:MetricChangeKind
+    - L111@Removed:MetricChangeKind
+    - L112@Renamed:MetricChangeKind
+    - L113@InstrumentChanged:MetricChangeKind
+    - L114@TypeChanged:MetricChangeKind
+    - L115@UnitChanged:MetricChangeKind
+    - L116@DescriptionChanged:MetricChangeKind
+    - L252@INSTRUMENTS:&[(&str, Instrument, &str)]
+    - L452@Worktree:Side
+    - L454@Commit:Side
+    - L709@UNIT_KEYS:&[&str]
+    - L721@DESCRIPTION_KEYS:&[&str]
+# funcs
+    - L71:12@label:&'static str
+    - L120:12@label:&'static str
+    - L133:8@marker:char // the marker the text report draws it with
+    - L145:8@breaking:bool // Whether a query written against the base still returns the same series.
+    - L153:8@rank:u8 // report order: what a reader acts on first
+    - L216:8@empty:TelemetryReport
+    - L231:12@gates:bool // whether a gate should fail: a query written against the base broke, or a
+    - L383:4@instrument_of:Option<(Instrument, &'static str)>
+    - L393:4@positional:Option<(usize, usize)> // The two bindings that take the unit and the description by position, and
+    - L403:8@analyse:TelemetryReport
+    - L460:4@collect:Result<BTreeMap<String, Metric>, String> // Every metric one side defines, keyed by name. Both sides go through this same
+    - L513:4@merge // The same name created in two places is one metric with two definition sites,
+    - L526:4@collect_file:Vec<Metric>
+    - L539:4@walk
+    - L582:4@creation:Option<Metric> // One call node, if it creates an instrument. The metric's name is its first
+    - L635:4@string_args:Vec<Option<String>> // The call's arguments in order, each one the literal it is or None for
+    - L653:4@literal_of:Option<String> // The literal an argument is, if it is one. C# wraps every argument in an
+    - L671:4@statement_of:String // The statement a creation sits in, which is where a fluent API leaves the unit
+    - L689:4@is_body_kind:bool
+    - L733:4@scrape:String
+    - L763:4@find_word:Option<usize> // `unit=` must not match inside `runit=`, and `description:` must not be found
+    - L776:4@text_of:Option<String>
+    - L780:4@truncate:String
+    - L788:4@diff:Vec<MetricChange>
+    - L858:4@compare:Vec<(MetricChangeKind, String)> // What moved between two definitions of the same name, one clause per property.
+    - L891:4@shown:&str
+    - L901:4@pair_renames:Vec<MetricChange> // A rename is a removal and an addition that are the same instrument created in
+    - L906:8@key:Option<Key>
+    - L952:4@git_prefix:String
+    - L959:4@git_grep:Result<Vec<String>, String> // `git grep` says "nothing matched" with exit 1, which is not a failure
+    - L981:4@headline:String
+    - L1011:4@site_of:String // where a change happened, head side first because that is where the fix goes
+    - L1019:4@instrument_of_change:&'static str
+    - L1027:8@text:String // the `changes` text report's voice, appended to it
+    - L1080:8@markdown:String // the same answer for an agent, in the tone `deps --markdown` uses
+    - L1153:4@short:&str
+    - L1163:8@one:Metric
+    - L1169:8@facts:(String, &'static str, String, String, String)
+    - L1183:8@every_binding_reads_the_same_metric_the_same_way // The point of the pass: one metric expressed in six bindings is one metric,
+    - L1258:8@the_positional_bindings_disagree_about_order_and_both_are_honoured // The two bindings that take these by position disagree about the order, so
+    - L1296:8@an_instrument_is_matched_whole_rather_than_by_the_word_it_ends_in
+    - L1315:8@a_name_assembled_at_runtime_is_skipped_rather_than_guessed_at
+    - L1329:8@a_unit_that_is_not_a_literal_is_left_empty // A unit given as a constant leaves the next literal in the chain belonging
+    - L1341:8@a_metric_a_test_creates_is_a_fixture_not_a_surface
+    - L1356:8@metric:Metric
+    - L1372:8@side:BTreeMap<String, Metric>
+    - L1376:8@kinds:BTreeMap<String, MetricChangeKind>
+    - L1384:8@every_row_of_the_change_table
+    - L1440:8@a_metric_that_only_moved_file_is_not_a_change
+    - L1447:8@a_rename_is_paired_only_when_the_pairing_is_unambiguous
+    - L1491:8@one_name_created_twice_is_one_metric_with_two_sites
+    - L1509:8@run
+    - L1522:8@commit_all
+    - L1542:8@rev_head:String
+    - L1552:8@telemetry_end_to_end_git
+    - L1643:8@a_side_that_could_not_be_read_reports_nothing_rather_than_deletions
+# refs
+    - analyse@L404 calls L952:4@git_prefix:String
+    - analyse@L405 calls L460:4@collect:Result<BTreeMap<String, Metric>, String>
+    - analyse@L414 calls L460:4@collect:Result<BTreeMap<String, Metric>, String>
+    - analyse@L419 calls L788:4@diff:Vec<MetricChange>
+    - collect@L481 calls L959:4@git_grep:Result<Vec<String>, String>
+    - collect@L503 calls L526:4@collect_file:Vec<Metric>
+    - collect@L504 calls L513:4@merge
+    - collect_file@L535 calls L539:4@walk
+    - walk@L554 calls L776:4@text_of:Option<String>
+    - walk@L560 calls L776:4@text_of:Option<String>
+    - walk@L567 calls L582:4@creation:Option<Metric>
+    - walk@L574 calls L539:4@walk
+    - creation@L585 calls L776:4@text_of:Option<String>
+    - creation@L586 calls L776:4@text_of:Option<String>
+    - creation@L594 calls L383:4@instrument_of:Option<(Instrument, &'static str)>
+    - creation@L596 calls L635:4@string_args:Vec<Option<String>>
+    - creation@L602 calls L671:4@statement_of:String
+    - creation@L603 calls L733:4@scrape:String
+    - creation@L604 calls L733:4@scrape:String
+    - creation@L605 calls L393:4@positional:Option<(usize, usize)>
+    - string_args@L645 calls L653:4@literal_of:Option<String>
+    - literal_of@L657 calls L776:4@text_of:Option<String>
+    - statement_of@L677 calls L689:4@is_body_kind:bool
+    - statement_of@L686 calls L776:4@text_of:Option<String>
+    - statement_of@L686 calls L780:4@truncate:String
+    - scrape@L737 calls L763:4@find_word:Option<usize>
+    - diff@L797 calls L858:4@compare:Vec<(MetricChangeKind, String)>
+    - diff@L824 calls L901:4@pair_renames:Vec<MetricChange>
+    - pair_renames@L918 calls L906:8@key:Option<Key>
+    - pair_renames@L923 calls L906:8@key:Option<Key>
+    - pair_renames@L935 calls L858:4@compare:Vec<(MetricChangeKind, String)>
+    - text@L1050 calls L1019:4@instrument_of_change:&'static str
+    - one@L1164 calls L526:4@collect_file:Vec<Metric>
+    - every_binding_reads_the_same_metric_the_same_way@L1184 calls L1163:8@one:Metric
+    - every_binding_reads_the_same_metric_the_same_way@L1201 calls L1163:8@one:Metric
+    - every_binding_reads_the_same_metric_the_same_way@L1218 calls L1163:8@one:Metric
+    - every_binding_reads_the_same_metric_the_same_way@L1237 calls L1163:8@one:Metric
+    - the_positional_bindings_disagree_about_order_and_both_are_honoured@L1259 calls L1163:8@one:Metric
+    - the_positional_bindings_disagree_about_order_and_both_are_honoured@L1277 calls L1163:8@one:Metric
+    - an_instrument_is_matched_whole_rather_than_by_the_word_it_ends_in@L1297 calls L1163:8@one:Metric
+    - a_name_assembled_at_runtime_is_skipped_rather_than_guessed_at@L1316 calls L526:4@collect_file:Vec<Metric>
+    - a_unit_that_is_not_a_literal_is_left_empty@L1330 calls L1163:8@one:Metric
+    - kinds@L1377 calls L788:4@diff:Vec<MetricChange>
+    - kinds@L1377 calls L1372:8@side:BTreeMap<String, Metric>
+    - every_row_of_the_change_table@L1393 calls L1356:8@metric:Metric
+    - every_row_of_the_change_table@L1408 calls L1376:8@kinds:BTreeMap<String, MetricChangeKind>
+    - every_row_of_the_change_table@L1425 calls L788:4@diff:Vec<MetricChange>
+    - every_row_of_the_change_table@L1425 calls L1372:8@side:BTreeMap<String, Metric>
+    - a_metric_that_only_moved_file_is_not_a_change@L1441 calls L1356:8@metric:Metric
+    - a_metric_that_only_moved_file_is_not_a_change@L1442 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1450 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1451 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1452 calls L788:4@diff:Vec<MetricChange>
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1452 calls L1372:8@side:BTreeMap<String, Metric>
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1462 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1463 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1466 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1467 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1469 calls L1376:8@kinds:BTreeMap<String, MetricChangeKind>
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1476 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1477 calls L1356:8@metric:Metric
+    - a_rename_is_paired_only_when_the_pairing_is_unambiguous@L1485 calls L1376:8@kinds:BTreeMap<String, MetricChangeKind>
+    - one_name_created_twice_is_one_metric_with_two_sites@L1493 calls L513:4@merge
+    - one_name_created_twice_is_one_metric_with_two_sites@L1495 calls L1356:8@metric:Metric
+    - one_name_created_twice_is_one_metric_with_two_sites@L1497 calls L513:4@merge
+    - one_name_created_twice_is_one_metric_with_two_sites@L1499 calls L1356:8@metric:Metric
+    - commit_all@L1523 calls L1509:8@run
+    - commit_all@L1524 calls L1509:8@run
+    - telemetry_end_to_end_git@L1556 calls L1509:8@run
+    - telemetry_end_to_end_git@L1574 calls L1522:8@commit_all
+    - telemetry_end_to_end_git@L1575 calls L1542:8@rev_head:String
+    - telemetry_end_to_end_git@L1586 calls L1522:8@commit_all
+    - telemetry_end_to_end_git@L1587 calls L1542:8@rev_head:String
+    - telemetry_end_to_end_git@L1589 calls L403:8@analyse:TelemetryReport
+    - telemetry_end_to_end_git@L1619 calls L403:8@analyse:TelemetryReport
+    - telemetry_end_to_end_git@L1628 calls L403:8@analyse:TelemetryReport
+    - a_side_that_could_not_be_read_reports_nothing_rather_than_deletions@L1648 calls L403:8@analyse:TelemetryReport
+# note

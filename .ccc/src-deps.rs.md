@@ -1,0 +1,159 @@
+# deps.rs.md (20260921-12-11-30) UTC
+# source: src/deps.rs [rust]
+# modules
+# imports
+    - L14@crate::audit (base_name, join_rel, rel_dir_of, Cached, DiskSource, Ecosystem, Finding, GitSource, Location, Package, Source, Unresolved)
+    - L18@serde (Serialize)
+    - L19@std::cmp (Ordering)
+    - L20@std::collections (BTreeMap, BTreeSet)
+    - L21@std::path (Path)
+    - L692@std::fmt (Write)
+    - L709@std::fmt (Write)
+    - L787@std::fmt (Write)
+    - L861@super
+# const
+    - L23@SCHEMA:&str
+    - L27@LOCKS_FOR:&[(&str, &[&str])]
+    - L50@Added:DepChangeKind
+    - L51@Removed:DepChangeKind
+    - L52@Upgraded:DepChangeKind
+    - L53@Downgraded:DepChangeKind
+    - L56@VersionsChanged:DepChangeKind
+    - L57@Promoted:DepChangeKind
+    - L58@Demoted:DepChangeKind
+    - L59@NowShips:DepChangeKind
+    - L60@NoLongerShips:DepChangeKind
+    - L1053@MANIFEST:&str
+# funcs
+    - L64:12@label:&'static str
+    - L79:8@marker:char // the marker the text report draws it with
+    - L91:8@rank:u8 // report order: the kinds a reader acts on first
+    - L154:12@gates:bool // whether a gate should fail: an advisory came in, or the branch moved
+    - L175:8@analyse:DepsReport // ---------------------------------------------------------------------------
+    - L354:4@empty:DepsReport
+    - L371:4@count:usize
+    - L396:4@pv:Pv
+    - L400:4@ident:Ident
+    - L408:4@sides:BTreeMap<Key, Side>
+    - L434:4@classify:Option<DepChangeKind>
+    - L481:4@version_direction:Option<Ordering> // Which way a version moved, or None when the two cannot be ordered honestly.
+    - L485:4@triple:Option<(u64, u64, u64)>
+    - L507:4@rename_map:BTreeMap<String, String> // lockfiles that moved, base path -> head path. `changes::parse_name_status`
+    - L553:4@drift:Vec<Unresolved> // A resolution that half-worked must never read as a clean result. Everything
+    - L637:4@subject:String // the versions cell: `name 1.0.0`, or `name 1.0.0 -> 1.1.0` for a move
+    - L648:4@reach:String // how it reaches us: the line a person can actually edit, and whether it ships
+    - L663:4@headline:String
+    - L691:4@finding_lines // one line per finding, plus the manifest lines it should be read at
+    - L708:8@text:String // the `changes` text report's voice, appended to it
+    - L786:8@markdown:String // the same answer for an agent, in the tone `vulnerabilities` uses
+    - L855:4@short:&str
+    - L863:8@pkg:Package
+    - L874:8@kinds:Vec<(String, DepChangeKind)>
+    - L884:8@every_row_of_the_classification_table
+    - L925:8@npm_multi_version_reports_both_lists_rather_than_a_fake_bump
+    - L949:8@a_version_pair_the_ecosystem_does_not_order_claims_no_direction
+    - L971:8@a_moved_lockfile_is_a_move_rather_than_a_remove_and_an_add
+    - L990:8@a_branch_that_touched_no_manifest_reads_no_blob
+    - L1013:8@drift_names_a_manifest_whose_lockfile_did_not_move
+    - L1055:8@lock_with:String
+    - L1062:8@git:String
+    - L1077:8@commit:String
+    - L1097:8@write
+    - L1105:8@repo:(std::path::PathBuf, String)
+    - L1117:8@touched:Vec<(String, String)> // the rows `changes` hands over: only the paths are read, so a status
+    - L1153:8@run:DepsReport
+    - L1170:8@a_bump_on_a_branch_is_one_upgrade_and_nothing_else
+    - L1199:8@the_same_bump_left_uncommitted_needs_worktree_to_be_seen
+    - L1218:8@a_first_lockfile_reads_as_a_baseline_rather_than_a_thousand_additions
+    - L1232:8@a_manifest_edited_without_its_lockfile_is_drift_rather_than_a_change
+    - L1252:8@a_lockfile_that_moved_is_followed_rather_than_emptied_and_refilled
+    - L1274:8@a_deleted_lockfile_removes_its_packages_and_says_nothing_pins_them
+    - L1295:8@an_unchanged_branch_says_so_in_one_line
+    - L1315:8@an_unreachable_database_is_reported_and_still_gates
+# refs
+    - analyse@L186 calls L354:4@empty:DepsReport
+    - analyse@L189 calls L354:4@empty:DepsReport
+    - analyse@L208 calls L507:4@rename_map:BTreeMap<String, String>
+    - analyse@L209 calls L408:4@sides:BTreeMap<Key, Side>
+    - analyse@L210 calls L408:4@sides:BTreeMap<Key, Side>
+    - analyse@L217 calls L434:4@classify:Option<DepChangeKind>
+    - analyse@L249 calls L396:4@pv:Pv
+    - analyse@L250 calls L396:4@pv:Pv
+    - analyse@L255 calls L396:4@pv:Pv
+    - analyse@L257 calls L396:4@pv:Pv
+    - analyse@L279 calls L396:4@pv:Pv
+    - analyse@L282 calls L396:4@pv:Pv
+    - analyse@L292 calls L400:4@ident:Ident
+    - analyse@L296 calls L400:4@ident:Ident
+    - analyse@L324 calls L553:4@drift:Vec<Unresolved>
+    - analyse@L327 calls L371:4@count:usize
+    - analyse@L328 calls L371:4@count:usize
+    - analyse@L329 calls L371:4@count:usize
+    - analyse@L330 calls L371:4@count:usize
+    - classify@L444 calls L481:4@version_direction:Option<Ordering>
+    - version_direction@L482 calls L485:4@triple:Option<(u64, u64, u64)>
+    - text@L729 calls L637:4@subject:String
+    - text@L767 calls L691:4@finding_lines
+    - text@L773 calls L691:4@finding_lines
+    - markdown@L833 calls L691:4@finding_lines
+    - markdown@L839 calls L691:4@finding_lines
+    - kinds@L875 calls L408:4@sides:BTreeMap<Key, Side>
+    - kinds@L876 calls L408:4@sides:BTreeMap<Key, Side>
+    - kinds@L879 calls L434:4@classify:Option<DepChangeKind>
+    - every_row_of_the_classification_table@L905 calls L874:8@kinds:Vec<(String, DepChangeKind)>
+    - npm_multi_version_reports_both_lists_rather_than_a_fake_bump@L936 calls L874:8@kinds:Vec<(String, DepChangeKind)>
+    - npm_multi_version_reports_both_lists_rather_than_a_fake_bump@L943 calls L874:8@kinds:Vec<(String, DepChangeKind)>
+    - a_version_pair_the_ecosystem_does_not_order_claims_no_direction@L963 calls L874:8@kinds:Vec<(String, DepChangeKind)>
+    - a_version_pair_the_ecosystem_does_not_order_claims_no_direction@L964 calls L863:8@pkg:Package
+    - a_version_pair_the_ecosystem_does_not_order_claims_no_direction@L965 calls L863:8@pkg:Package
+    - a_moved_lockfile_is_a_move_rather_than_a_remove_and_an_add@L972 calls L863:8@pkg:Package
+    - a_moved_lockfile_is_a_move_rather_than_a_remove_and_an_add@L981 calls L863:8@pkg:Package
+    - a_moved_lockfile_is_a_move_rather_than_a_remove_and_an_add@L981 calls L408:4@sides:BTreeMap<Key, Side>
+    - a_moved_lockfile_is_a_move_rather_than_a_remove_and_an_add@L982 calls L408:4@sides:BTreeMap<Key, Side>
+    - a_branch_that_touched_no_manifest_reads_no_blob@L995 calls L175:8@analyse:DepsReport
+    - drift_names_a_manifest_whose_lockfile_did_not_move@L1030 calls L553:4@drift:Vec<Unresolved>
+    - commit@L1078 calls L1062:8@git:String
+    - commit@L1079 calls L1062:8@git:String
+    - commit@L1094 calls L1062:8@git:String
+    - repo@L1109 calls L1097:8@write
+    - repo@L1110 calls L1062:8@git:String
+    - repo@L1111 calls L1077:8@commit:String
+    - run@L1154 calls L1062:8@git:String
+    - run@L1155 calls L175:8@analyse:DepsReport
+    - run@L1161 calls L1117:8@touched:Vec<(String, String)>
+    - a_bump_on_a_branch_is_one_upgrade_and_nothing_else@L1171 calls L1105:8@repo:(std::path::PathBuf, String)
+    - a_bump_on_a_branch_is_one_upgrade_and_nothing_else@L1173 calls L1055:8@lock_with:String
+    - a_bump_on_a_branch_is_one_upgrade_and_nothing_else@L1175 calls L1055:8@lock_with:String
+    - a_bump_on_a_branch_is_one_upgrade_and_nothing_else@L1175 calls L1097:8@write
+    - a_bump_on_a_branch_is_one_upgrade_and_nothing_else@L1176 calls L1077:8@commit:String
+    - a_bump_on_a_branch_is_one_upgrade_and_nothing_else@L1178 calls L1153:8@run:DepsReport
+    - the_same_bump_left_uncommitted_needs_worktree_to_be_seen@L1200 calls L1105:8@repo:(std::path::PathBuf, String)
+    - the_same_bump_left_uncommitted_needs_worktree_to_be_seen@L1202 calls L1055:8@lock_with:String
+    - the_same_bump_left_uncommitted_needs_worktree_to_be_seen@L1204 calls L1055:8@lock_with:String
+    - the_same_bump_left_uncommitted_needs_worktree_to_be_seen@L1204 calls L1097:8@write
+    - the_same_bump_left_uncommitted_needs_worktree_to_be_seen@L1207 calls L1153:8@run:DepsReport
+    - the_same_bump_left_uncommitted_needs_worktree_to_be_seen@L1210 calls L1153:8@run:DepsReport
+    - a_first_lockfile_reads_as_a_baseline_rather_than_a_thousand_additions@L1219 calls L1105:8@repo:(std::path::PathBuf, String)
+    - a_first_lockfile_reads_as_a_baseline_rather_than_a_thousand_additions@L1220 calls L1055:8@lock_with:String
+    - a_first_lockfile_reads_as_a_baseline_rather_than_a_thousand_additions@L1220 calls L1097:8@write
+    - a_first_lockfile_reads_as_a_baseline_rather_than_a_thousand_additions@L1221 calls L1077:8@commit:String
+    - a_first_lockfile_reads_as_a_baseline_rather_than_a_thousand_additions@L1223 calls L1153:8@run:DepsReport
+    - a_manifest_edited_without_its_lockfile_is_drift_rather_than_a_change@L1233 calls L1105:8@repo:(std::path::PathBuf, String)
+    - a_manifest_edited_without_its_lockfile_is_drift_rather_than_a_change@L1235 calls L1055:8@lock_with:String
+    - a_manifest_edited_without_its_lockfile_is_drift_rather_than_a_change@L1237 calls L1097:8@write
+    - a_manifest_edited_without_its_lockfile_is_drift_rather_than_a_change@L1238 calls L1077:8@commit:String
+    - a_manifest_edited_without_its_lockfile_is_drift_rather_than_a_change@L1240 calls L1153:8@run:DepsReport
+    - a_lockfile_that_moved_is_followed_rather_than_emptied_and_refilled@L1253 calls L1105:8@repo:(std::path::PathBuf, String)
+    - a_lockfile_that_moved_is_followed_rather_than_emptied_and_refilled@L1257 calls L1055:8@lock_with:String
+    - a_lockfile_that_moved_is_followed_rather_than_emptied_and_refilled@L1261 calls L1062:8@git:String
+    - a_lockfile_that_moved_is_followed_rather_than_emptied_and_refilled@L1262 calls L1062:8@git:String
+    - a_lockfile_that_moved_is_followed_rather_than_emptied_and_refilled@L1263 calls L1077:8@commit:String
+    - a_lockfile_that_moved_is_followed_rather_than_emptied_and_refilled@L1265 calls L1153:8@run:DepsReport
+    - a_deleted_lockfile_removes_its_packages_and_says_nothing_pins_them@L1275 calls L1105:8@repo:(std::path::PathBuf, String)
+    - a_deleted_lockfile_removes_its_packages_and_says_nothing_pins_them@L1277 calls L1055:8@lock_with:String
+    - a_deleted_lockfile_removes_its_packages_and_says_nothing_pins_them@L1280 calls L1077:8@commit:String
+    - a_deleted_lockfile_removes_its_packages_and_says_nothing_pins_them@L1282 calls L1153:8@run:DepsReport
+    - an_unchanged_branch_says_so_in_one_line@L1296 calls L354:4@empty:DepsReport
+    - an_unreachable_database_is_reported_and_still_gates@L1316 calls L354:4@empty:DepsReport
+    - an_unreachable_database_is_reported_and_still_gates@L1339 calls L708:8@text:String
+# note

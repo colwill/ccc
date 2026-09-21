@@ -1,0 +1,628 @@
+# serve.rs.md (20260921-12-11-30) UTC
+# source: src/serve.rs [rust]
+# modules
+# imports
+    - L8@crate::model (FileCache, Counts)
+    - L9@crate (audit, deps, insights, render, sast, scan)
+    - L10@anyhow (Result)
+    - L11@serde_json (json, Value)
+    - L12@std::collections (BTreeMap, BTreeSet)
+    - L13@std::path (Path, PathBuf)
+    - L14@std::sync (Arc, Mutex, RwLock)
+    - L1504@std::fmt (Write)
+    - L1563@std::fmt (Write)
+    - L3166@std::process (Command, Stdio)
+    - L4014@super
+    - L4015@std (fs)
+# const
+    - L16@MCP_VERSIONS:&[&str]
+    - L17@MCP_LATEST:&str
+    - L19@FIND_CAP:usize
+    - L20@REFS_CAP:usize
+    - L21@EDGE_SYMBOL_CAP:usize
+    - L698@BAND:usize
+    - L763@SEARCHED_KINDS:&[&str]
+    - L1995@INDEX_LINE_CEILING:usize
+    - L1999@INDEX_DEFAULT_ROWS:usize
+    - L2969@HOT_VIEWS:&[&str]
+    - L3482@Json:ReplyBody
+    - L3483@Html:ReplyBody
+    - L3484@Empty:ReplyBody
+    - L3686@ENDPOINTS:&[&str]
+# funcs
+    - L32:8@default:Self
+    - L71:8@build:Result<MapState>
+    - L101:8@audit_report:audit::AuditReport // resolving lockfiles is cheap, asking osv is not - hold the answer for this generation
+    - L119:8@deps_report:Result<(String, Arc<deps::DepsReport>), String> // What this branch did to the dependency tree
+    - L137:8@sast_report:sast::SastReport // re-parsing every file is not free, so hold the answer for this generation
+    - L149:8@rescan:Result<(usize, usize)>
+    - L161:8@swap_in // swap in a fresh map (built outside lock by watcher)
+    - L169:8@external_named:Option<&ExternalDep>
+    - L177:8@invalidate // `ts` alone would do it, but it has one-second resolution - two rescans
+    - L185:8@analysis:Arc<Value> // The insights analysis for this map, computed at most once per
+    - L213:8@path_of:String
+    - L218:8@find_file:Result<&FileCache, String> // find a file by relative path, cache name, or unique path suffix
+    - L267:8@def_files:BTreeMap<&str, BTreeSet<usize>> // symbol name -> indexes of files defining it (as a function)
+    - L282:4@fingerprint:Result<Fingerprint>
+    - L298:4@fingerprint_delta:usize
+    - L307:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - L321:4@spawn_watcher
+    - L355:4@q_index:Value // `prefix` narrows the overview to one subtree; totals then describe the
+    - L423:4@split_query:(Option<&str>, &str) // A query ending in a separator (`clap::`, `client.`) names a qualifier with no
+    - L438:4@q_find:Result<Value, String>
+    - L618:4@split_qualified:(Option<&str>, &str) // `serde_json::to_string` / `client.charge` -> (Some("serde_json"), "to_string");
+    - L642:4@qualifier_matches:bool // a call qualifier matches when its identifier segments end with the wanted
+    - L646:8@segs:Vec<&str>
+    - L657:4@qualifier_under:bool // `money::` asks for everything *under* a qualifier, so it matches by prefix
+    - L673:4@edit_distance:Option<usize> // Levenshtein dist
+    - L700:4@name_distance:Option<usize>
+    - L711:4@nearest_names:Vec<Value> // nearest indexed names to a query that found nothing
+    - L768:4@file_facade:Option<String> // the module name a file's contents are reachable under from outside it
+    - L793:4@reexport_routes:Vec<Route> // Where `name` is re-exported to, restricted to routes a `qualifier` could mean.
+    - L828:4@qualifier_evidence:(usize, Vec<String>) // what the map knows about a *qualifier* whose symbol missed
+    - L856:4@add_miss_evidence // Attach the qualifier verdict to a zero-hit result.
+    - L872:4@q_references:Result<Value, String>
+    - L1061:4@cargo_package_name:Option<String> // package name from a root Cargo.toml, if any - the name code uses to
+    - L1093:8@json:Value
+    - L1104:4@toml_version:Option<String> // `"1.0"` or `{ version = "0.4", features = [..] }` -> the version string
+    - L1114:4@manifest_deps:Vec<ExternalDep> // Declared dependencies from whatever manifests the root carries
+    - L1250:4@is_cargo_dep_section:bool
+    - L1262:4@q_dependencies:Result<Value, String> // File-level dependency edges, resolved from imports and calls. A call only
+    - L1264:8@path_segs:impl Iterator<Item = &str>
+    - L1447:4@q_file:Result<Value, String>
+    - L1484:4@q_notes:Value
+    - L1503:4@md_security:String // resolved dependency set plus whatever the advisory database had to say about it
+    - L1562:4@md_vulnerabilities:String
+    - L1649:4@mcp_tools:Value
+    - L1821:4@mcp_initialize:Value
+    - L1888:4@mcp_md:Value
+    - L1896:4@jstr:String // markdown rendering of tool results
+    - L1900:4@jnum:i64
+    - L1904:4@jbool:bool
+    - L1908:4@jarr:Vec<Value>
+    - L1916:4@jnames:String // comma-joined string array (`symbols`, `ambiguous_symbols`, ...)
+    - L1925:4@md_section // a section body, or `(none)` when empty
+    - L1932:4@md_hit:String // one map hit - covers every kind `find` and `references` emit (func, const,
+    - L2005:4@md_index_rows // one page of rows, plus the line accounting for whatever sits outside it.
+    - L2031:4@md_index:String
+    - L2126:4@md_dependencies:String
+    - L2190:4@md_find:String
+    - L2213:4@md_miss:String // What a zero-hit answer owes the caller: the kinds it covered, the nearest
+    - L2264:4@md_references:String
+    - L2310:4@md_notes:String
+    - L2334:4@md_file_structured:String // the structured half of a `file` result: spans and the intra-file call graph,
+    - L2439:8@from:Page
+    - L2453:8@apply:(&'a [Value], String) // the window, plus the line that accounts for everything outside it
+    - L2457:8@window:(&'a [T], String)
+    - L2479:4@at:String // `file:line`, the form every other tool here emits
+    - L2485:4@svc:&str // With no `.ccc/map.json`, `changes` names the implicit whole-root service
+    - L2493:4@svc_names:String
+    - L2504:4@jnames_capped:String // Evidence, not an index: a helper named by forty tests would otherwise fill
+    - L2517:4@md_unavailable:Option<String> // The change set is unavailable outside a git repo, on a shallow clone, or with
+    - L2528:4@md_prompts:String
+    - L2607:4@md_changes:String
+    - L2729:4@md_triggers:String
+    - L2831:4@md_targets:String
+    - L2905:4@md_lints:Result<String, String>
+    - L2977:4@md_hot:String
+    - L3027:4@md_services:String
+    - L3156:4@browser_origin:String
+    - L3165:4@open_in_browser:Result<(), String>
+    - L3192:4@q_insights:Result<String, String> // open the insights page
+    - L3233:4@mcp_tool_call:Result<Value, (i64, String)>
+    - L3369:4@mcp_resources_list:Value
+    - L3388:4@mcp_resources_read:Result<Value, (i64, String)>
+    - L3409:4@mcp_handle:Option<Value>
+    - L3434:4@url_decode:String // percent-decoder for query components (`%2F`, `+` as space)
+    - L3457:4@parse_query:(String, BTreeMap<String, String>)
+    - L3469:4@origin_ok:bool // only loopback origins - plus "null", the Origin a browser sends for pages
+    - L3492:4@ok:Reply
+    - L3499:4@bad:Reply
+    - L3508:4@html_ok:Reply // fragment endpoints always answer 200 with self-describing HTML (soft
+    - L3518:4@esc:String // tiny Tailwind-styled snippets consumed by the `ccc changes --html` report's
+    - L3525:4@frag_err:String
+    - L3529:4@frag_health:String
+    - L3538:4@frag_loc:String // `file:line` code location chip
+    - L3546:4@frag_find:String
+    - L3575:4@frag_references:String
+    - L3628:4@frag_dependencies:String
+    - L3703:4@route:Reply
+    - L3891:8@serve:Result<()> // start the server and block
+    - L3954:4@handle_request
+    - L4017:8@fixture:MapState
+    - L4049:8@fixture_imports:MapState // The shapes the fixture above has nothing to say about: imports, a name
+    - L4094:8@fixture_crate:MapState // A crate root: the file that declares the module graph and publishes the
+    - L4133:8@a_crate_root_does_not_report_as_an_empty_file
+    - L4157:8@the_structure_columns_stay_off_a_map_with_no_structure
+    - L4169:8@the_file_tool_shows_the_structure_a_module_root_is_made_of
+    - L4194:8@the_file_tool_scores_every_function_it_reports // The editor draws one glyph per function from this
+    - L4237:8@a_facade_qualifier_resolves_through_the_re_export
+    - L4270:8@a_published_symbol_says_so_however_the_lookup_was_spelled
+    - L4305:8@type_definitions_are_findable
+    - L4333:8@imports_are_the_only_trace_a_derive_leaves
+    - L4362:8@a_qualifier_narrows_definitions_by_owning_type
+    - L4385:8@a_trailing_separator_lists_a_whole_qualifier
+    - L4402:8@a_miss_reports_its_coverage_and_the_nearest_names
+    - L4432:8@a_miss_says_whether_the_qualifier_itself_is_used
+    - L4468:8@declared_dependencies_come_from_the_manifests
+    - L4491:8@manifest_parsing_covers_the_other_ecosystems
+    - L4529:8@suggestions_never_guess_wildly
+    - L4540:8@find_kinds_are_validated_and_reported
+    - L4559:8@index_and_find
+    - L4573:8@idx_md:String // `index` as a caller gets it with no paging arguments
+    - L4578:8@index_narrows_to_a_subtree_and_says_so
+    - L4594:8@an_index_filter_that_matches_nothing_reports_what_the_map_holds
+    - L4603:8@tree_index:Value // a project of `n` files spread over a splittable tree
+    - L4621:8@a_project_under_the_ceiling_is_listed_whole
+    - L4632:8@a_large_index_pages_and_never_summarises_a_directory
+    - L4650:8@paths_are_listed_in_order_so_offset_walks_the_project
+    - L4676:8@the_ceiling_counts_lines_so_path_shape_does_not_decide
+    - L4699:8@index_pages_only_once_the_output_runs_past_the_ceiling
+    - L4743:8@find_qualified_queries_match_call_sites
+    - L4764:8@references_finds_defs_and_calls
+    - L4783:8@references_accepts_qualified_names
+    - L4808:8@references_and_find_cover_qualified_usages
+    - L4833:8@enum_variants_pair_declaration_with_usages
+    - L4850:8@mcp_results_are_markdown_not_json
+    - L4890:8@file_tool_returns_one_representation_per_call
+    - L4925:8@dependencies_edges_and_per_file
+    - L4938:8@dependencies_require_evidence_and_cover_type_only_imports
+    - L4988:8@dependencies_resolve_through_facade_reexports
+    - L5018:8@file_lookup_and_suffix
+    - L5029:8@notes_filtering
+    - L5037:8@watcher_detects_edits_adds_and_deletes
+    - L5067:8@mcp_initialize_negotiates_version
+    - L5076:8@the_instructions_cover_search_editing_and_every_tool
+    - L5094:8@mcp_lifecycle_and_tools
+    - L5182:8@every_advertised_tool_dispatches // verify all tools dispatch as expected
+    - L5225:8@mcp_resources_roundtrip
+    - L5242:8@json_of:&Value
+    - L5249:8@html_of:&str
+    - L5257:8@http_routing_shapes
+    - L5292:8@analysis_tools_render_markdown_and_page_rather_than_truncate // Call every analysis tool the way an agent would, and check the two
+    - L5353:8@the_analysis_is_computed_once_per_generation_and_base // Six tools over one analysis pass: computing it per call would repeat the
+    - L5371:8@the_dependency_delta_needs_no_flag
+    - L5387:8@insights_ui_is_opt_in
+    - L5426:8@the_insights_tool_hands_the_user_a_reachable_url // The `insights` tool is the one that acts on the user's machine, so the
+    - L5464:8@a_wildcard_bind_is_advertised_as_loopback
+    - L5476:8@html_fragments_for_htmx
+    - L5507:8@origin_gate
+# refs
+    - build@L84 calls L1114:4@manifest_deps:Vec<ExternalDep>
+    - build@L85 calls L1061:4@cargo_package_name:Option<String>
+    - rescan@L153 calls L1114:4@manifest_deps:Vec<ExternalDep>
+    - rescan@L154 calls L1061:4@cargo_package_name:Option<String>
+    - rescan@L156 calls L177:8@invalidate
+    - swap_in@L163 calls L1114:4@manifest_deps:Vec<ExternalDep>
+    - swap_in@L164 calls L1061:4@cargo_package_name:Option<String>
+    - swap_in@L166 calls L177:8@invalidate
+    - find_file@L223 calls L213:8@path_of:String
+    - find_file@L230 calls L213:8@path_of:String
+    - find_file@L238 calls L213:8@path_of:String
+    - check_and_rebuild@L311 calls L282:4@fingerprint:Result<Fingerprint>
+    - check_and_rebuild@L315 calls L298:4@fingerprint_delta:usize
+    - spawn_watcher@L323 calls L282:4@fingerprint:Result<Fingerprint>
+    - spawn_watcher@L327 calls L307:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - split_query@L435 calls L618:4@split_qualified:(Option<&str>, &str)
+    - q_find@L451 calls L423:4@split_query:(Option<&str>, &str)
+    - q_find@L522 calls L657:4@qualifier_under:bool
+    - q_find@L524 calls L642:4@qualifier_matches:bool
+    - q_find@L561 calls L657:4@qualifier_under:bool
+    - q_find@L565 calls L642:4@qualifier_matches:bool
+    - q_find@L610 calls L711:4@nearest_names:Vec<Value>
+    - q_find@L611 calls L856:4@add_miss_evidence
+    - qualifier_matches@L651 calls L646:8@segs:Vec<&str>
+    - qualifier_matches@L652 calls L646:8@segs:Vec<&str>
+    - qualifier_under@L667 calls L646:8@segs:Vec<&str>
+    - qualifier_under@L668 calls L646:8@segs:Vec<&str>
+    - name_distance@L707 calls L673:4@edit_distance:Option<usize>
+    - nearest_names@L742 calls L700:4@name_distance:Option<usize>
+    - reexport_routes@L796 calls L768:4@file_facade:Option<String>
+    - reexport_routes@L810 calls L642:4@qualifier_matches:bool
+    - qualifier_evidence@L842 calls L657:4@qualifier_under:bool
+    - qualifier_evidence@L847 calls L657:4@qualifier_under:bool
+    - add_miss_evidence@L859 calls L828:4@qualifier_evidence:(usize, Vec<String>)
+    - q_references@L877 calls L618:4@split_qualified:(Option<&str>, &str)
+    - q_references@L883 calls L793:4@reexport_routes:Vec<Route>
+    - q_references@L952 calls L642:4@qualifier_matches:bool
+    - q_references@L974 calls L642:4@qualifier_matches:bool
+    - q_references@L1003 calls L793:4@reexport_routes:Vec<Route>
+    - q_references@L1053 calls L711:4@nearest_names:Vec<Value>
+    - q_references@L1054 calls L856:4@add_miss_evidence
+    - manifest_deps@L1126 calls L1250:4@is_cargo_dep_section:bool
+    - manifest_deps@L1138 calls L1250:4@is_cargo_dep_section:bool
+    - manifest_deps@L1150 calls L1104:4@toml_version:Option<String>
+    - q_dependencies@L1289 calls L1061:4@cargo_package_name:Option<String>
+    - q_dependencies@L1311 calls L1264:8@path_segs:impl Iterator<Item = &str>
+    - q_dependencies@L1359 calls L1264:8@path_segs:impl Iterator<Item = &str>
+    - jnames@L1917 calls L1908:4@jarr:Vec<Value>
+    - md_hit@L1938 calls L1896:4@jstr:String
+    - md_hit@L1950 calls L1916:4@jnames:String
+    - md_hit@L1967 calls L1896:4@jstr:String
+    - md_hit@L1971 calls L1904:4@jbool:bool
+    - md_hit@L1974 calls L1896:4@jstr:String
+    - md_index@L2033 calls L1908:4@jarr:Vec<Value>
+    - md_index@L2036 calls L1900:4@jnum:i64
+    - md_index@L2066 calls L1916:4@jnames:String
+    - md_index@L2075 calls L1896:4@jstr:String
+    - md_index@L2076 calls L1896:4@jstr:String
+    - md_index@L2077 calls L1900:4@jnum:i64
+    - md_index@L2078 calls L1900:4@jnum:i64
+    - md_index@L2079 calls L1900:4@jnum:i64
+    - md_index@L2080 calls L1900:4@jnum:i64
+    - md_index@L2081 calls L1900:4@jnum:i64
+    - md_index@L2082 calls L1900:4@jnum:i64
+    - md_index@L2108 calls L1896:4@jstr:String
+    - md_index@L2110 calls L2005:4@md_index_rows
+    - md_dependencies@L2128 calls L1908:4@jarr:Vec<Value>
+    - md_dependencies@L2143 calls L1925:4@md_section
+    - md_dependencies@L2144 calls L1925:4@md_section
+    - md_dependencies@L2153 calls L1908:4@jarr:Vec<Value>
+    - md_dependencies@L2156 calls L1896:4@jstr:String
+    - md_dependencies@L2174 calls L1916:4@jnames:String
+    - md_dependencies@L2180 calls L1916:4@jnames:String
+    - md_find@L2191 calls L1908:4@jarr:Vec<Value>
+    - md_find@L2204 calls L1932:4@md_hit:String
+    - md_find@L2206 calls L2213:4@md_miss:String
+    - md_miss@L2214 calls L1904:4@jbool:bool
+    - md_miss@L2217 calls L1908:4@jarr:Vec<Value>
+    - md_miss@L2221 calls L1900:4@jnum:i64
+    - md_references@L2277 calls L1908:4@jarr:Vec<Value>
+    - md_references@L2278 calls L1925:4@md_section
+    - md_references@L2280 calls L1908:4@jarr:Vec<Value>
+    - md_references@L2296 calls L1925:4@md_section
+    - md_references@L2306 calls L2213:4@md_miss:String
+    - md_notes@L2311 calls L1896:4@jstr:String
+    - md_notes@L2321 calls L1908:4@jarr:Vec<Value>
+    - md_file_structured@L2341 calls L1908:4@jarr:Vec<Value>
+    - md_file_structured@L2355 calls L1908:4@jarr:Vec<Value>
+    - md_file_structured@L2374 calls L1908:4@jarr:Vec<Value>
+    - md_file_structured@L2386 calls L1908:4@jarr:Vec<Value>
+    - md_file_structured@L2390 calls L1908:4@jarr:Vec<Value>
+    - md_file_structured@L2402 calls L1908:4@jarr:Vec<Value>
+    - md_file_structured@L2405 calls L1916:4@jnames:String
+    - md_file_structured@L2419 calls L1925:4@md_section
+    - md_file_structured@L2420 calls L1925:4@md_section
+    - md_file_structured@L2421 calls L1925:4@md_section
+    - md_file_structured@L2422 calls L1925:4@md_section
+    - md_file_structured@L2423 calls L1925:4@md_section
+    - md_file_structured@L2424 calls L1925:4@md_section
+    - apply@L2454 calls L2457:8@window:(&'a [T], String)
+    - svc_names@L2494 calls L1908:4@jarr:Vec<Value>
+    - jnames_capped@L2505 calls L1908:4@jarr:Vec<Value>
+    - md_unavailable@L2518 calls L1904:4@jbool:bool
+    - md_prompts@L2529 calls L2517:4@md_unavailable:Option<String>
+    - md_prompts@L2532 calls L1908:4@jarr:Vec<Value>
+    - md_prompts@L2533 calls L1908:4@jarr:Vec<Value>
+    - md_prompts@L2536 calls L1908:4@jarr:Vec<Value>
+    - md_prompts@L2538 calls L1908:4@jarr:Vec<Value>
+    - md_prompts@L2558 calls L1896:4@jstr:String
+    - md_prompts@L2564 calls L1908:4@jarr:Vec<Value>
+    - md_prompts@L2575 calls L1925:4@md_section
+    - md_prompts@L2581 calls L1908:4@jarr:Vec<Value>
+    - md_prompts@L2584 calls L1908:4@jarr:Vec<Value>
+    - md_prompts@L2588 calls L1896:4@jstr:String
+    - md_prompts@L2595 calls L1925:4@md_section
+    - md_prompts@L2602 calls L1925:4@md_section
+    - md_changes@L2608 calls L2517:4@md_unavailable:Option<String>
+    - md_changes@L2612 calls L1896:4@jstr:String
+    - md_changes@L2628 calls L1908:4@jarr:Vec<Value>
+    - md_changes@L2633 calls L1908:4@jarr:Vec<Value>
+    - md_changes@L2636 calls L1900:4@jnum:i64
+    - md_changes@L2638 calls L1908:4@jarr:Vec<Value>
+    - md_changes@L2653 calls L1925:4@md_section
+    - md_changes@L2655 calls L1908:4@jarr:Vec<Value>
+    - md_changes@L2659 calls L1904:4@jbool:bool
+    - md_changes@L2662 calls L1904:4@jbool:bool
+    - md_changes@L2679 calls L1925:4@md_section
+    - md_changes@L2683 calls L1908:4@jarr:Vec<Value>
+    - md_changes@L2699 calls L1925:4@md_section
+    - md_changes@L2703 calls L1908:4@jarr:Vec<Value>
+    - md_changes@L2706 calls L1896:4@jstr:String
+    - md_changes@L2711 calls L1904:4@jbool:bool
+    - md_changes@L2714 calls L1908:4@jarr:Vec<Value>
+    - md_changes@L2725 calls L1925:4@md_section
+    - md_triggers@L2730 calls L2517:4@md_unavailable:Option<String>
+    - md_triggers@L2745 calls L1904:4@jbool:bool
+    - md_triggers@L2756 calls L1908:4@jarr:Vec<Value>
+    - md_triggers@L2759 calls L1896:4@jstr:String
+    - md_triggers@L2779 calls L1925:4@md_section
+    - md_triggers@L2781 calls L1908:4@jarr:Vec<Value>
+    - md_triggers@L2786 calls L1900:4@jnum:i64
+    - md_triggers@L2800 calls L1925:4@md_section
+    - md_triggers@L2804 calls L1908:4@jarr:Vec<Value>
+    - md_triggers@L2805 calls L1896:4@jstr:String
+    - md_triggers@L2806 calls L1908:4@jarr:Vec<Value>
+    - md_triggers@L2813 calls L1896:4@jstr:String
+    - md_triggers@L2826 calls L1925:4@md_section
+    - md_targets@L2849 calls L1908:4@jarr:Vec<Value>
+    - md_targets@L2853 calls L1908:4@jarr:Vec<Value>
+    - md_targets@L2853 calls L1896:4@jstr:String
+    - md_targets@L2862 calls L1908:4@jarr:Vec<Value>
+    - md_targets@L2864 calls L1896:4@jstr:String
+    - md_targets@L2880 calls L1908:4@jarr:Vec<Value>
+    - md_targets@L2886 calls L1925:4@md_section
+    - md_targets@L2889 calls L1908:4@jarr:Vec<Value>
+    - md_targets@L2900 calls L1925:4@md_section
+    - md_lints@L2906 calls L1908:4@jarr:Vec<Value>
+    - md_lints@L2910 calls L1896:4@jstr:String
+    - md_lints@L2921 calls L1908:4@jarr:Vec<Value>
+    - md_lints@L2923 calls L1896:4@jstr:String
+    - md_lints@L2927 calls L1904:4@jbool:bool
+    - md_lints@L2945 calls L1925:4@md_section
+    - md_lints@L2952 calls L1896:4@jstr:String
+    - md_lints@L2964 calls L1925:4@md_section
+    - md_hot@L2984 calls L1908:4@jarr:Vec<Value>
+    - md_hot@L3021 calls L1925:4@md_section
+    - md_services@L3029 calls L1908:4@jarr:Vec<Value>
+    - md_services@L3032 calls L1896:4@jstr:String
+    - md_services@L3043 calls L1925:4@md_section
+    - md_services@L3045 calls L1908:4@jarr:Vec<Value>
+    - md_services@L3049 calls L1896:4@jstr:String
+    - md_services@L3050 calls L1896:4@jstr:String
+    - md_services@L3058 calls L1904:4@jbool:bool
+    - md_services@L3061 calls L1904:4@jbool:bool
+    - md_services@L3064 calls L1904:4@jbool:bool
+    - md_services@L3075 calls L1908:4@jarr:Vec<Value>
+    - md_services@L3078 calls L1896:4@jstr:String
+    - md_services@L3080 calls L1904:4@jbool:bool
+    - md_services@L3097 calls L1925:4@md_section
+    - md_services@L3099 calls L1908:4@jarr:Vec<Value>
+    - md_services@L3104 calls L1904:4@jbool:bool
+    - md_services@L3122 calls L1925:4@md_section
+    - md_services@L3127 calls L1908:4@jarr:Vec<Value>
+    - md_services@L3146 calls L1925:4@md_section
+    - md_services@L3149 calls L1916:4@jnames:String
+    - md_services@L3151 calls L1925:4@md_section
+    - mcp_tool_call@L3244 calls L1888:4@mcp_md:Value
+    - mcp_tool_call@L3251 calls L1888:4@mcp_md:Value
+    - mcp_tool_call@L3274 calls L1503:4@md_security:String
+    - mcp_tool_call@L3286 calls L1562:4@md_vulnerabilities:String
+    - mcp_tool_call@L3291 calls L2031:4@md_index:String
+    - mcp_tool_call@L3292 calls L355:4@q_index:Value
+    - mcp_tool_call@L3295 calls L438:4@q_find:Result<Value, String>
+    - mcp_tool_call@L3300 calls L2190:4@md_find:String
+    - mcp_tool_call@L3301 calls L2264:4@md_references:String
+    - mcp_tool_call@L3301 calls L872:4@q_references:Result<Value, String>
+    - mcp_tool_call@L3302 calls L2126:4@md_dependencies:String
+    - mcp_tool_call@L3302 calls L1262:4@q_dependencies:Result<Value, String>
+    - mcp_tool_call@L3303 calls L1447:4@q_file:Result<Value, String>
+    - mcp_tool_call@L3305 calls L2334:4@md_file_structured:String
+    - mcp_tool_call@L3307 calls L1896:4@jstr:String
+    - mcp_tool_call@L3310 calls L2310:4@md_notes:String
+    - mcp_tool_call@L3310 calls L1484:4@q_notes:Value
+    - mcp_tool_call@L3313 calls L2607:4@md_changes:String
+    - mcp_tool_call@L3317 calls L2528:4@md_prompts:String
+    - mcp_tool_call@L3321 calls L2729:4@md_triggers:String
+    - mcp_tool_call@L3329 calls L2831:4@md_targets:String
+    - mcp_tool_call@L3337 calls L2905:4@md_lints:Result<String, String>
+    - mcp_tool_call@L3348 calls L2977:4@md_hot:String
+    - mcp_tool_call@L3354 calls L3027:4@md_services:String
+    - mcp_tool_call@L3360 calls L3192:4@q_insights:Result<String, String>
+    - mcp_tool_call@L3364 calls L1888:4@mcp_md:Value
+    - mcp_tool_call@L3365 calls L1888:4@mcp_md:Value
+    - mcp_handle@L3417 calls L1821:4@mcp_initialize:Value
+    - mcp_handle@L3419 calls L1649:4@mcp_tools:Value
+    - mcp_handle@L3420 calls L3233:4@mcp_tool_call:Result<Value, (i64, String)>
+    - mcp_handle@L3421 calls L3369:4@mcp_resources_list:Value
+    - mcp_handle@L3422 calls L3388:4@mcp_resources_read:Result<Value, (i64, String)>
+    - parse_query@L3462 calls L3434:4@url_decode:String
+    - frag_find@L3549 calls L3525:4@frag_err:String
+    - frag_references@L3605 calls L1908:4@jarr:Vec<Value>
+    - frag_references@L3611 calls L3518:4@esc:String
+    - frag_dependencies@L3666 calls L3525:4@frag_err:String
+    - route@L3704 calls L3457:4@parse_query:(String, BTreeMap<String, String>)
+    - route@L3710 calls L3492:4@ok:Reply
+    - route@L3710 calls L355:4@q_index:Value
+    - route@L3714 calls L3492:4@ok:Reply
+    - route@L3724 calls L3499:4@bad:Reply
+    - route@L3727 calls L438:4@q_find:Result<Value, String>
+    - route@L3728 calls L3492:4@ok:Reply
+    - route@L3729 calls L3499:4@bad:Reply
+    - route@L3734 calls L3499:4@bad:Reply
+    - route@L3739 calls L872:4@q_references:Result<Value, String>
+    - route@L3740 calls L3492:4@ok:Reply
+    - route@L3741 calls L3499:4@bad:Reply
+    - route@L3746 calls L1262:4@q_dependencies:Result<Value, String>
+    - route@L3747 calls L3492:4@ok:Reply
+    - route@L3748 calls L3499:4@bad:Reply
+    - route@L3753 calls L3499:4@bad:Reply
+    - route@L3756 calls L1447:4@q_file:Result<Value, String>
+    - route@L3757 calls L3492:4@ok:Reply
+    - route@L3758 calls L3499:4@bad:Reply
+    - route@L3763 calls L3492:4@ok:Reply
+    - route@L3763 calls L1484:4@q_notes:Value
+    - route@L3770 calls L3492:4@ok:Reply
+    - route@L3788 calls L3492:4@ok:Reply
+    - route@L3794 calls L3492:4@ok:Reply
+    - route@L3795 calls L3499:4@bad:Reply
+    - route@L3800 calls L3492:4@ok:Reply
+    - route@L3806 calls L3499:4@bad:Reply
+    - route@L3812 calls L3508:4@html_ok:Reply
+    - route@L3817 calls L3529:4@frag_health:String
+    - route@L3817 calls L3508:4@html_ok:Reply
+    - route@L3822 calls L3508:4@html_ok:Reply
+    - route@L3822 calls L438:4@q_find:Result<Value, String>
+    - route@L3823 calls L3546:4@frag_find:String
+    - route@L3824 calls L3525:4@frag_err:String
+    - route@L3829 calls L3508:4@html_ok:Reply
+    - route@L3829 calls L872:4@q_references:Result<Value, String>
+    - route@L3830 calls L3575:4@frag_references:String
+    - route@L3831 calls L3525:4@frag_err:String
+    - route@L3837 calls L3508:4@html_ok:Reply
+    - route@L3837 calls L1262:4@q_dependencies:Result<Value, String>
+    - route@L3838 calls L3628:4@frag_dependencies:String
+    - route@L3839 calls L3525:4@frag_err:String
+    - route@L3850 calls L3492:4@ok:Reply
+    - route@L3855 calls L3499:4@bad:Reply
+    - route@L3871 calls L3409:4@mcp_handle:Option<Value>
+    - route@L3872 calls L3492:4@ok:Reply
+    - route@L3880 calls L3499:4@bad:Reply
+    - serve@L3909 calls L3156:4@browser_origin:String
+    - serve@L3930 calls L321:4@spawn_watcher
+    - serve@L3945 calls L3954:4@handle_request
+    - handle_request@L3967 calls L3469:4@origin_ok:bool
+    - handle_request@L3969 calls L3499:4@bad:Reply
+    - handle_request@L3973 calls L3499:4@bad:Reply
+    - handle_request@L3975 calls L3703:4@route:Reply
+    - a_crate_root_does_not_report_as_an_empty_file@L4134 calls L4094:8@fixture_crate:MapState
+    - a_crate_root_does_not_report_as_an_empty_file@L4135 calls L355:4@q_index:Value
+    - a_crate_root_does_not_report_as_an_empty_file@L4151 calls L2031:4@md_index:String
+    - the_structure_columns_stay_off_a_map_with_no_structure@L4160 calls L2031:4@md_index:String
+    - the_structure_columns_stay_off_a_map_with_no_structure@L4161 calls L4017:8@fixture:MapState
+    - the_structure_columns_stay_off_a_map_with_no_structure@L4161 calls L355:4@q_index:Value
+    - the_file_tool_shows_the_structure_a_module_root_is_made_of@L4170 calls L4094:8@fixture_crate:MapState
+    - the_file_tool_shows_the_structure_a_module_root_is_made_of@L4171 calls L1447:4@q_file:Result<Value, String>
+    - the_file_tool_shows_the_structure_a_module_root_is_made_of@L4176 calls L2334:4@md_file_structured:String
+    - the_file_tool_shows_the_structure_a_module_root_is_made_of@L4182 calls L1896:4@jstr:String
+    - the_file_tool_shows_the_structure_a_module_root_is_made_of@L4187 calls L2334:4@md_file_structured:String
+    - the_file_tool_shows_the_structure_a_module_root_is_made_of@L4187 calls L1447:4@q_file:Result<Value, String>
+    - the_file_tool_scores_every_function_it_reports@L4210 calls L1447:4@q_file:Result<Value, String>
+    - a_facade_qualifier_resolves_through_the_re_export@L4238 calls L4094:8@fixture_crate:MapState
+    - a_facade_qualifier_resolves_through_the_re_export@L4242 calls L872:4@q_references:Result<Value, String>
+    - a_facade_qualifier_resolves_through_the_re_export@L4248 calls L872:4@q_references:Result<Value, String>
+    - a_facade_qualifier_resolves_through_the_re_export@L4259 calls L872:4@q_references:Result<Value, String>
+    - a_facade_qualifier_resolves_through_the_re_export@L4264 calls L872:4@q_references:Result<Value, String>
+    - a_published_symbol_says_so_however_the_lookup_was_spelled@L4271 calls L4094:8@fixture_crate:MapState
+    - a_published_symbol_says_so_however_the_lookup_was_spelled@L4272 calls L872:4@q_references:Result<Value, String>
+    - a_published_symbol_says_so_however_the_lookup_was_spelled@L4295 calls L872:4@q_references:Result<Value, String>
+    - a_published_symbol_says_so_however_the_lookup_was_spelled@L4299 calls L872:4@q_references:Result<Value, String>
+    - type_definitions_are_findable@L4306 calls L4049:8@fixture_imports:MapState
+    - type_definitions_are_findable@L4309 calls L438:4@q_find:Result<Value, String>
+    - type_definitions_are_findable@L4315 calls L872:4@q_references:Result<Value, String>
+    - type_definitions_are_findable@L4327 calls L4017:8@fixture:MapState
+    - type_definitions_are_findable@L4327 calls L438:4@q_find:Result<Value, String>
+    - imports_are_the_only_trace_a_derive_leaves@L4334 calls L4049:8@fixture_imports:MapState
+    - imports_are_the_only_trace_a_derive_leaves@L4337 calls L872:4@q_references:Result<Value, String>
+    - imports_are_the_only_trace_a_derive_leaves@L4348 calls L438:4@q_find:Result<Value, String>
+    - imports_are_the_only_trace_a_derive_leaves@L4356 calls L872:4@q_references:Result<Value, String>
+    - a_qualifier_narrows_definitions_by_owning_type@L4363 calls L4049:8@fixture_imports:MapState
+    - a_qualifier_narrows_definitions_by_owning_type@L4366 calls L872:4@q_references:Result<Value, String>
+    - a_qualifier_narrows_definitions_by_owning_type@L4373 calls L872:4@q_references:Result<Value, String>
+    - a_qualifier_narrows_definitions_by_owning_type@L4376 calls L2264:4@md_references:String
+    - a_qualifier_narrows_definitions_by_owning_type@L4380 calls L872:4@q_references:Result<Value, String>
+    - a_trailing_separator_lists_a_whole_qualifier@L4386 calls L4049:8@fixture_imports:MapState
+    - a_trailing_separator_lists_a_whole_qualifier@L4388 calls L438:4@q_find:Result<Value, String>
+    - a_miss_reports_its_coverage_and_the_nearest_names@L4403 calls L4049:8@fixture_imports:MapState
+    - a_miss_reports_its_coverage_and_the_nearest_names@L4404 calls L872:4@q_references:Result<Value, String>
+    - a_miss_reports_its_coverage_and_the_nearest_names@L4422 calls L2264:4@md_references:String
+    - a_miss_reports_its_coverage_and_the_nearest_names@L4426 calls L872:4@q_references:Result<Value, String>
+    - a_miss_says_whether_the_qualifier_itself_is_used@L4433 calls L4049:8@fixture_imports:MapState
+    - a_miss_says_whether_the_qualifier_itself_is_used@L4436 calls L872:4@q_references:Result<Value, String>
+    - a_miss_says_whether_the_qualifier_itself_is_used@L4441 calls L2264:4@md_references:String
+    - a_miss_says_whether_the_qualifier_itself_is_used@L4448 calls L872:4@q_references:Result<Value, String>
+    - a_miss_says_whether_the_qualifier_itself_is_used@L4455 calls L872:4@q_references:Result<Value, String>
+    - a_miss_says_whether_the_qualifier_itself_is_used@L4461 calls L438:4@q_find:Result<Value, String>
+    - declared_dependencies_come_from_the_manifests@L4469 calls L4049:8@fixture_imports:MapState
+    - declared_dependencies_come_from_the_manifests@L4470 calls L1262:4@q_dependencies:Result<Value, String>
+    - manifest_parsing_covers_the_other_ecosystems@L4512 calls L1114:4@manifest_deps:Vec<ExternalDep>
+    - find_kinds_are_validated_and_reported@L4541 calls L4049:8@fixture_imports:MapState
+    - find_kinds_are_validated_and_reported@L4544 calls L438:4@q_find:Result<Value, String>
+    - find_kinds_are_validated_and_reported@L4553 calls L438:4@q_find:Result<Value, String>
+    - index_and_find@L4560 calls L4017:8@fixture:MapState
+    - index_and_find@L4561 calls L355:4@q_index:Value
+    - index_and_find@L4563 calls L438:4@q_find:Result<Value, String>
+    - index_and_find@L4567 calls L438:4@q_find:Result<Value, String>
+    - idx_md@L4574 calls L2031:4@md_index:String
+    - index_narrows_to_a_subtree_and_says_so@L4579 calls L4017:8@fixture:MapState
+    - index_narrows_to_a_subtree_and_says_so@L4580 calls L355:4@q_index:Value
+    - index_narrows_to_a_subtree_and_says_so@L4584 calls L4573:8@idx_md:String
+    - an_index_filter_that_matches_nothing_reports_what_the_map_holds@L4595 calls L4017:8@fixture:MapState
+    - an_index_filter_that_matches_nothing_reports_what_the_map_holds@L4596 calls L4573:8@idx_md:String
+    - an_index_filter_that_matches_nothing_reports_what_the_map_holds@L4596 calls L355:4@q_index:Value
+    - a_project_under_the_ceiling_is_listed_whole@L4623 calls L4573:8@idx_md:String
+    - a_project_under_the_ceiling_is_listed_whole@L4623 calls L4603:8@tree_index:Value
+    - a_large_index_pages_and_never_summarises_a_directory@L4633 calls L4573:8@idx_md:String
+    - a_large_index_pages_and_never_summarises_a_directory@L4633 calls L4603:8@tree_index:Value
+    - paths_are_listed_in_order_so_offset_walks_the_project@L4651 calls L4603:8@tree_index:Value
+    - paths_are_listed_in_order_so_offset_walks_the_project@L4658 calls L4573:8@idx_md:String
+    - paths_are_listed_in_order_so_offset_walks_the_project@L4660 calls L2031:4@md_index:String
+    - the_ceiling_counts_lines_so_path_shape_does_not_decide@L4677 calls L4573:8@idx_md:String
+    - the_ceiling_counts_lines_so_path_shape_does_not_decide@L4677 calls L4603:8@tree_index:Value
+    - the_ceiling_counts_lines_so_path_shape_does_not_decide@L4678 calls L4573:8@idx_md:String
+    - the_ceiling_counts_lines_so_path_shape_does_not_decide@L4678 calls L4603:8@tree_index:Value
+    - the_ceiling_counts_lines_so_path_shape_does_not_decide@L4688 calls L4573:8@idx_md:String
+    - the_ceiling_counts_lines_so_path_shape_does_not_decide@L4688 calls L4603:8@tree_index:Value
+    - index_pages_only_once_the_output_runs_past_the_ceiling@L4721 calls L2031:4@md_index:String
+    - index_pages_only_once_the_output_runs_past_the_ceiling@L4729 calls L2031:4@md_index:String
+    - index_pages_only_once_the_output_runs_past_the_ceiling@L4738 calls L2031:4@md_index:String
+    - find_qualified_queries_match_call_sites@L4744 calls L4017:8@fixture:MapState
+    - find_qualified_queries_match_call_sites@L4747 calls L438:4@q_find:Result<Value, String>
+    - find_qualified_queries_match_call_sites@L4756 calls L438:4@q_find:Result<Value, String>
+    - references_finds_defs_and_calls@L4765 calls L4017:8@fixture:MapState
+    - references_finds_defs_and_calls@L4766 calls L872:4@q_references:Result<Value, String>
+    - references_finds_defs_and_calls@L4773 calls L872:4@q_references:Result<Value, String>
+    - references_accepts_qualified_names@L4784 calls L4017:8@fixture:MapState
+    - references_accepts_qualified_names@L4785 calls L872:4@q_references:Result<Value, String>
+    - references_accepts_qualified_names@L4794 calls L872:4@q_references:Result<Value, String>
+    - references_and_find_cover_qualified_usages@L4809 calls L4017:8@fixture:MapState
+    - references_and_find_cover_qualified_usages@L4811 calls L872:4@q_references:Result<Value, String>
+    - references_and_find_cover_qualified_usages@L4821 calls L438:4@q_find:Result<Value, String>
+    - enum_variants_pair_declaration_with_usages@L4834 calls L4017:8@fixture:MapState
+    - enum_variants_pair_declaration_with_usages@L4836 calls L872:4@q_references:Result<Value, String>
+    - mcp_results_are_markdown_not_json@L4851 calls L4017:8@fixture:MapState
+    - mcp_results_are_markdown_not_json@L4853 calls L3409:4@mcp_handle:Option<Value>
+    - mcp_results_are_markdown_not_json@L4880 calls L4017:8@fixture:MapState
+    - mcp_results_are_markdown_not_json@L4880 calls L355:4@q_index:Value
+    - file_tool_returns_one_representation_per_call@L4891 calls L4017:8@fixture:MapState
+    - file_tool_returns_one_representation_per_call@L4893 calls L3409:4@mcp_handle:Option<Value>
+    - file_tool_returns_one_representation_per_call@L4917 calls L4017:8@fixture:MapState
+    - file_tool_returns_one_representation_per_call@L4917 calls L1447:4@q_file:Result<Value, String>
+    - dependencies_edges_and_per_file@L4926 calls L4017:8@fixture:MapState
+    - dependencies_edges_and_per_file@L4927 calls L1262:4@q_dependencies:Result<Value, String>
+    - dependencies_edges_and_per_file@L4932 calls L1262:4@q_dependencies:Result<Value, String>
+    - dependencies_require_evidence_and_cover_type_only_imports@L4964 calls L1262:4@q_dependencies:Result<Value, String>
+    - dependencies_resolve_through_facade_reexports@L5004 calls L1262:4@q_dependencies:Result<Value, String>
+    - file_lookup_and_suffix@L5019 calls L4017:8@fixture:MapState
+    - file_lookup_and_suffix@L5020 calls L1447:4@q_file:Result<Value, String>
+    - notes_filtering@L5030 calls L4017:8@fixture:MapState
+    - watcher_detects_edits_adds_and_deletes@L5043 calls L282:4@fingerprint:Result<Fingerprint>
+    - watcher_detects_edits_adds_and_deletes@L5048 calls L307:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - watcher_detects_edits_adds_and_deletes@L5054 calls L307:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - watcher_detects_edits_adds_and_deletes@L5059 calls L307:4@check_and_rebuild:Result<Option<(Fingerprint, Vec<FileCache>, usize)>>
+    - mcp_initialize_negotiates_version@L5068 calls L1821:4@mcp_initialize:Value
+    - mcp_initialize_negotiates_version@L5070 calls L1821:4@mcp_initialize:Value
+    - the_instructions_cover_search_editing_and_every_tool@L5077 calls L1821:4@mcp_initialize:Value
+    - the_instructions_cover_search_editing_and_every_tool@L5084 calls L1649:4@mcp_tools:Value
+    - mcp_lifecycle_and_tools@L5095 calls L4017:8@fixture:MapState
+    - mcp_lifecycle_and_tools@L5102 calls L3409:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L5105 calls L3409:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L5140 calls L3409:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L5153 calls L3409:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L5163 calls L3409:4@mcp_handle:Option<Value>
+    - mcp_lifecycle_and_tools@L5171 calls L3409:4@mcp_handle:Option<Value>
+    - every_advertised_tool_dispatches@L5183 calls L1649:4@mcp_tools:Value
+    - every_advertised_tool_dispatches@L5203 calls L4017:8@fixture:MapState
+    - every_advertised_tool_dispatches@L5204 calls L3409:4@mcp_handle:Option<Value>
+    - mcp_resources_roundtrip@L5226 calls L4017:8@fixture:MapState
+    - mcp_resources_roundtrip@L5227 calls L3369:4@mcp_resources_list:Value
+    - mcp_resources_roundtrip@L5237 calls L3388:4@mcp_resources_read:Result<Value, (i64, String)>
+    - http_routing_shapes@L5258 calls L4017:8@fixture:MapState
+    - http_routing_shapes@L5259 calls L3703:4@route:Reply
+    - http_routing_shapes@L5264 calls L3703:4@route:Reply
+    - http_routing_shapes@L5272 calls L3703:4@route:Reply
+    - http_routing_shapes@L5281 calls L3703:4@route:Reply
+    - http_routing_shapes@L5284 calls L3703:4@route:Reply
+    - analysis_tools_render_markdown_and_page_rather_than_truncate@L5293 calls L4017:8@fixture:MapState
+    - analysis_tools_render_markdown_and_page_rather_than_truncate@L5295 calls L3409:4@mcp_handle:Option<Value>
+    - the_analysis_is_computed_once_per_generation_and_base@L5354 calls L4017:8@fixture:MapState
+    - the_dependency_delta_needs_no_flag@L5372 calls L4017:8@fixture:MapState
+    - insights_ui_is_opt_in@L5388 calls L4017:8@fixture:MapState
+    - insights_ui_is_opt_in@L5390 calls L3703:4@route:Reply
+    - insights_ui_is_opt_in@L5395 calls L3703:4@route:Reply
+    - insights_ui_is_opt_in@L5403 calls L3703:4@route:Reply
+    - insights_ui_is_opt_in@L5405 calls L5242:8@json_of:&Value
+    - the_insights_tool_hands_the_user_a_reachable_url@L5427 calls L4017:8@fixture:MapState
+    - the_insights_tool_hands_the_user_a_reachable_url@L5432 calls L3192:4@q_insights:Result<String, String>
+    - the_insights_tool_hands_the_user_a_reachable_url@L5439 calls L3192:4@q_insights:Result<String, String>
+    - the_insights_tool_hands_the_user_a_reachable_url@L5456 calls L3192:4@q_insights:Result<String, String>
+    - html_fragments_for_htmx@L5477 calls L4017:8@fixture:MapState
+    - html_fragments_for_htmx@L5479 calls L3703:4@route:Reply
+    - html_fragments_for_htmx@L5481 calls L5249:8@html_of:&str
+    - html_fragments_for_htmx@L5486 calls L3703:4@route:Reply
+    - html_fragments_for_htmx@L5490 calls L3703:4@route:Reply
+    - html_fragments_for_htmx@L5494 calls L3703:4@route:Reply
+    - html_fragments_for_htmx@L5496 calls L3703:4@route:Reply
+    - html_fragments_for_htmx@L5499 calls L3703:4@route:Reply
+    - html_fragments_for_htmx@L5502 calls L3703:4@route:Reply
+# note

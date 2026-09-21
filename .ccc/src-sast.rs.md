@@ -1,0 +1,145 @@
+# sast.rs.md (20260921-12-11-30) UTC
+# source: src/sast.rs [rust]
+# modules
+# imports
+    - L16@crate::languages (Language)
+    - L17@crate (changes)
+    - L18@crate::scan (collect_files)
+    - L19@serde (Serialize)
+    - L20@std::path (Path)
+    - L21@tree_sitter (Node, Parser)
+    - L746@super
+    - L747@std::collections (BTreeSet)
+# const
+    - L24@MAX_TEXT:usize
+    - L25@MAX_EVIDENCE:usize
+    - L29@High:Severity
+    - L30@Medium:Severity
+    - L31@Low:Severity
+    - L73@RULES:&[&str]
+    - L381@TOKEN_SHAPES:&[(&str, &str, usize)]
+    - L398@SECRET_NAMES:&[&str]
+    - L404@PLACEHOLDERS:&[&str]
+# funcs
+    - L35:12@as_str:&'static str
+    - L68:12@by_severity:usize
+    - L111:8@analyse:SastReport
+    - L155:4@collect:Option<Collected>
+    - L168:4@walk
+    - L251:4@is_config_kind:bool // kinds that carry configuration written as fields rather than arguments
+    - L267:15@is_string_kind:bool
+    - L274:4@text_of:Option<String>
+    - L278:4@truncate:String
+    - L288:15@unquote:String // strip the quoting a grammar hands back, whatever flavour it is
+    - L308:15@rightmost:&str // `crypto.createHash` -> `createHash`, `Md5::new` -> `new`
+    - L319:4@norm:String
+    - L323:4@apply_rules:Vec<Finding>
+    - L353:4@push
+    - L409:4@secret_rule
+    - L482:4@first_secret_name:Option<String>
+    - L491:4@redact:String
+    - L497:4@entropy:f64 // shannon entropy per char, which is what separates a key from a word
+    - L518:4@tls_rule
+    - L544:4@shell_rule
+    - L607:4@sql_rule
+    - L642:4@hash_rule
+    - L674:4@random_rule
+    - L700:4@only_literal_args:bool // true when every argument is a plain literal, which makes a sink constant
+    - L733:8@rule_catalogue:Vec<(&'static str, &'static str, &'static str)>
+    - L749:8@run:Vec<Finding>
+    - L754:8@rules_of:BTreeSet<&str>
+    - L759:8@a_shaped_token_is_found_without_any_surrounding_context
+    - L773:8@a_credential_name_plus_entropy_is_a_secret_but_a_placeholder_is_not
+    - L792:8@a_password_in_a_comment_or_prose_never_fires
+    - L802:8@shell_true_and_sh_dash_c_are_both_injection_surfaces
+    - L817:8@a_constant_query_is_safe_and_a_built_one_is_not
+    - L832:8@tls_verification_off_is_high_whatever_the_ecosystem_calls_it
+    - L847:8@a_weak_hash_is_only_serious_in_a_security_context
+    - L859:8@predictable_randomness_only_matters_for_unguessable_values
+    - L868:8@findings_carry_their_enclosing_function
+    - L878:8@a_regex_exec_is_not_a_process_call
+    - L892:8@shell_true_only_counts_on_a_call_that_starts_a_process
+    - L899:8@a_pem_label_is_not_a_pem_key
+    - L906:8@test_scopes_are_skipped_unless_asked_for
+    - L915:8@entropy_separates_a_key_from_a_word
+# refs
+    - analyse@L132 calls L155:4@collect:Option<Collected>
+    - analyse@L136 calls L323:4@apply_rules:Vec<Finding>
+    - collect@L164 calls L168:4@walk
+    - walk@L177 calls L274:4@text_of:Option<String>
+    - walk@L185 calls L274:4@text_of:Option<String>
+    - walk@L194 calls L274:4@text_of:Option<String>
+    - walk@L195 calls L274:4@text_of:Option<String>
+    - walk@L200 calls L308:15@rightmost:&str
+    - walk@L201 calls L278:4@truncate:String
+    - walk@L202 calls L274:4@text_of:Option<String>
+    - walk@L202 calls L278:4@truncate:String
+    - walk@L203 calls L278:4@truncate:String
+    - walk@L204 calls L274:4@text_of:Option<String>
+    - walk@L212 calls L251:4@is_config_kind:bool
+    - walk@L218 calls L274:4@text_of:Option<String>
+    - walk@L218 calls L278:4@truncate:String
+    - walk@L225 calls L267:15@is_string_kind:bool
+    - walk@L226 calls L274:4@text_of:Option<String>
+    - walk@L227 calls L288:15@unquote:String
+    - walk@L231 calls L274:4@text_of:Option<String>
+    - walk@L237 calls L278:4@truncate:String
+    - walk@L246 calls L168:4@walk
+    - apply_rules@L329 calls L409:4@secret_rule
+    - apply_rules@L335 calls L518:4@tls_rule
+    - apply_rules@L336 calls L544:4@shell_rule
+    - apply_rules@L337 calls L607:4@sql_rule
+    - apply_rules@L338 calls L642:4@hash_rule
+    - apply_rules@L339 calls L674:4@random_rule
+    - apply_rules@L345 calls L518:4@tls_rule
+    - push@L375 calls L278:4@truncate:String
+    - secret_rule@L414 calls L353:4@push
+    - secret_rule@L427 calls L353:4@push
+    - secret_rule@L431 calls L491:4@redact:String
+    - secret_rule@L440 calls L353:4@push
+    - secret_rule@L444 calls L491:4@redact:String
+    - secret_rule@L451 calls L319:4@norm:String
+    - secret_rule@L471 calls L497:4@entropy:f64
+    - secret_rule@L474 calls L353:4@push
+    - tls_rule@L519 calls L319:4@norm:String
+    - tls_rule@L532 calls L353:4@push
+    - shell_rule@L545 calls L319:4@norm:String
+    - shell_rule@L555 calls L319:4@norm:String
+    - shell_rule@L556 calls L319:4@norm:String
+    - shell_rule@L558 calls L353:4@push
+    - shell_rule@L570 calls L353:4@push
+    - shell_rule@L585 calls L319:4@norm:String
+    - shell_rule@L592 calls L319:4@norm:String
+    - shell_rule@L593 calls L319:4@norm:String
+    - shell_rule@L596 calls L700:4@only_literal_args:bool
+    - shell_rule@L598 calls L353:4@push
+    - sql_rule@L618 calls L700:4@only_literal_args:bool
+    - sql_rule@L634 calls L353:4@push
+    - hash_rule@L643 calls L319:4@norm:String
+    - hash_rule@L644 calls L319:4@norm:String
+    - hash_rule@L656 calls L319:4@norm:String
+    - hash_rule@L667 calls L353:4@push
+    - random_rule@L676 calls L319:4@norm:String
+    - random_rule@L691 calls L353:4@push
+    - run@L750 calls L155:4@collect:Option<Collected>
+    - run@L751 calls L323:4@apply_rules:Vec<Finding>
+    - a_shaped_token_is_found_without_any_surrounding_context@L760 calls L749:8@run:Vec<Finding>
+    - a_credential_name_plus_entropy_is_a_secret_but_a_placeholder_is_not@L774 calls L749:8@run:Vec<Finding>
+    - a_password_in_a_comment_or_prose_never_fires@L794 calls L749:8@run:Vec<Finding>
+    - shell_true_and_sh_dash_c_are_both_injection_surfaces@L803 calls L749:8@run:Vec<Finding>
+    - shell_true_and_sh_dash_c_are_both_injection_surfaces@L809 calls L749:8@run:Vec<Finding>
+    - a_constant_query_is_safe_and_a_built_one_is_not@L818 calls L749:8@run:Vec<Finding>
+    - a_constant_query_is_safe_and_a_built_one_is_not@L824 calls L749:8@run:Vec<Finding>
+    - tls_verification_off_is_high_whatever_the_ecosystem_calls_it@L838 calls L749:8@run:Vec<Finding>
+    - a_weak_hash_is_only_serious_in_a_security_context@L848 calls L749:8@run:Vec<Finding>
+    - a_weak_hash_is_only_serious_in_a_security_context@L853 calls L749:8@run:Vec<Finding>
+    - predictable_randomness_only_matters_for_unguessable_values@L860 calls L749:8@run:Vec<Finding>
+    - predictable_randomness_only_matters_for_unguessable_values@L863 calls L749:8@run:Vec<Finding>
+    - findings_carry_their_enclosing_function@L869 calls L749:8@run:Vec<Finding>
+    - a_regex_exec_is_not_a_process_call@L880 calls L749:8@run:Vec<Finding>
+    - a_regex_exec_is_not_a_process_call@L884 calls L749:8@run:Vec<Finding>
+    - a_regex_exec_is_not_a_process_call@L887 calls L749:8@run:Vec<Finding>
+    - shell_true_only_counts_on_a_call_that_starts_a_process@L894 calls L749:8@run:Vec<Finding>
+    - a_pem_label_is_not_a_pem_key@L901 calls L749:8@run:Vec<Finding>
+    - test_scopes_are_skipped_unless_asked_for@L909 calls L155:4@collect:Option<Collected>
+# note

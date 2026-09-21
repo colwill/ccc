@@ -1,0 +1,188 @@
+# audit.rs.md (20260921-12-11-30) UTC
+# source: src/audit.rs [rust]
+# modules
+# imports
+    - L5@anyhow (Result)
+    - L6@ignore (WalkBuilder)
+    - L7@serde (Deserialize, Serialize)
+    - L8@std::collections (BTreeMap, BTreeSet)
+    - L9@std::path (Path)
+    - L10@std::process (Command)
+    - L11@std::sync (Mutex)
+    - L1601@super
+# const
+    - L13@OSV_BATCH_URL:&str
+    - L14@OSV_VULN_URL:&str
+    - L15@FETCH_TIMEOUT_SECS:u64
+    - L17@BATCH_SIZE:usize
+    - L19@MAX_LOCKFILE_DEPTH:usize
+    - L24@CratesIo:Ecosystem
+    - L25@Npm:Ecosystem
+    - L26@Go:Ecosystem
+    - L27@PyPi:Ecosystem
+    - L28@NuGet:Ecosystem
+    - L130@LOCK_NAMES:&[&str]
+    - L145@MANIFEST_NAMES:&[&str]
+    - L1015@DECLARING:&[(&str, Ecosystem)]
+# funcs
+    - L32:12@osv:&'static str
+    - L42:12@label:&'static str
+    - L67:8@key:(Ecosystem, String, String)
+    - L110:12@direct_count:usize
+    - L115:12@runtime_findings:Vec<&Finding> // findings that reach production, which is the set worth acting on first
+    - L158:8@inputs:Vec<String> // every lockfile and manifest path this source holds, relative to the root
+    - L159:8@read:Option<String>
+    - L167:8@inputs:Vec<String>
+    - L188:8@read:Option<String>
+    - L202:12@new:Cached<'a>
+    - L211:8@inputs:Vec<String>
+    - L216:8@read:Option<String>
+    - L232:12@new:GitSource<'a>
+    - L243:8@inputs:Vec<String>
+    - L264:8@read:Option<String>
+    - L278:15@git_out:Option<String> // stdout of a git command, or None when git is absent or the command failed -
+    - L291:4@git_prefix:String // where `root` sits inside its repository, "" at the top
+    - L298:4@is_vendored:bool // a lockfile inside a dependency tree describes that dependency, not us
+    - L303:8@is_input_name:bool // the file names a resolution reads: lockfiles, and the manifests beside them
+    - L310:4@is_lock_name:bool
+    - L314:15@base_name:&str
+    - L322:15@join_rel:String // join a root-relative directory and a file name, "" being the root itself
+    - L331:8@resolve:AuditReport // find every lockfile under `root` and resolve it to exact packages
+    - L337:8@resolve_with:AuditReport // the same resolution against any source, so a committed tree and a working
+    - L447:4@rel_of:String
+    - L455:15@rel_dir_of:String // the directory part of a repo-relative file path, "" at the root
+    - L464:4@parse_toml_lock:Vec<Package> // `[[package]]` blocks with a name and an exact version. Cargo, poetry, uv and
+    - L527:4@parse_package_lock:Vec<Package> // npm lockfile v2/v3 keep a flat `packages` map keyed by install path; v1 nests `dependencies`
+    - L565:8@walk // v1 fallback: walk the nested `dependencies` tree
+    - L593:4@parse_yarn_lock:Vec<Package> // yarn classic and berry both write `<specs>:` then an indented `version`
+    - L635:4@yarn_name:Option<String> // `pkg@^1.0.0` / `@scope/pkg@npm:^1.0.0` -> the package name
+    - L642:4@parse_pnpm_lock:Vec<Package> // pnpm keys the `packages` map by `name@version`, with an optional peer suffix
+    - L698:4@pnpm_split:Option<(String, String)>
+    - L709:4@parse_pipfile_lock:Vec<Package> // pipenv splits runtime and dev into two maps, each `name -> {version: "==x"}`
+    - L741:4@parse_nuget_lock:Vec<Package> // nuget's lockfile nests by target framework, and marks each entry Direct or Transitive
+    - L772:4@parse_msbuild_project:(Vec<Package>, usize) // `<PackageReference Include="X" Version="1.2.3" />` - direct dependencies only,
+    - L805:4@xml_attr:Option<String>
+    - L814:4@parse_go_sum:Vec<Package> // `module version hash` lines; the `/go.mod` rows repeat a module already listed
+    - L839:4@parse_requirements:(Vec<Package>, usize) // only `name==version` pins resolve to something an advisory can be matched against;
+    - L876:4@direct_cargo:BTreeSet<String> // names a manifest declares, used only to mark a resolved package as direct
+    - L908:4@direct_npm:BTreeSet<String>
+    - L925:4@direct_python:BTreeSet<String> // pyproject and Pipfile both list what was asked for, whatever tool locked it
+    - L967:4@direct_go:BTreeSet<String>
+    - L1033:12@build:Locator
+    - L1040:12@locate:Vec<Location>
+    - L1046:8@locate // fill in `locations` for every finding, so an editor can draw them in a manifest
+    - L1050:8@locate_with
+    - L1059:4@locations_for:Vec<Location>
+    - L1106:4@manifest_declarations:Decls // every name a manifest declares, with the line it is declared on
+    - L1128:4@declarations_in:Vec<(String, usize)> // names declared by this manifest text, with 1-based line numbers
+    - L1208:4@reverse_edges:BTreeMap<String, BTreeSet<String>> // child -> the packages that require it, from whichever lockfiles record edges
+    - L1225:4@cargo_edges // `dependencies = [ "b", "c 1.0" ]` inside each `[[package]]` block
+    - L1263:4@npm_edges // v2/v3 record each install path's own `dependencies` map
+    - L1306:8@assess // ask osv which of the resolved packages are affected, and fill in the advisories
+    - L1323:4@query_osv:Result<Vec<Finding>>
+    - L1396:4@advisory_from:Advisory
+    - L1462:4@cvss_v3_band:Option<String> // CVSS v3.x base score from its vector, so an advisory carrying only a vector still
+    - L1538:4@roundup:f64 // the spec's own rounding, which is not the same as rounding to one decimal
+    - L1547:8@severity_rank:u8
+    - L1559:4@post:Result<String> // post json by shelling out to curl, for the same reason `externals` does
+    - L1575:4@get:Result<String>
+    - L1587:4@run_curl:Result<String>
+    - L1604:8@cargo_lock_yields_exact_versions_and_marks_direct_ones
+    - L1629:8@package_lock_v3_reads_the_flat_map_and_keeps_dev_apart
+    - L1651:8@go_sum_collapses_the_go_mod_rows
+    - L1659:8@requirements_takes_pins_and_ignores_ranges
+    - L1671:8@an_unreachable_database_is_reported_rather_than_fatal
+    - L1699:8@cvss_vectors_score_into_the_bands_the_databases_publish
+    - L1721:8@a_runtime_advisory_outranks_a_worse_dev_only_one
+    - L1764:8@yarn_classic_and_berry_both_resolve_including_scoped_names
+    - L1795:8@pnpm_strips_the_leading_slash_and_any_peer_suffix
+    - L1828:8@poetry_and_uv_share_cargos_package_block_shape
+    - L1850:8@pipfile_splits_runtime_from_develop
+    - L1865:8@nuget_lockfile_carries_the_transitive_closure_and_marks_direct_ones
+    - L1885:8@a_csproj_resolves_exact_versions_and_counts_the_ranges
+    - L1904:8@one_commit_repo:(std::path::PathBuf, String) // a throwaway repo whose only commit holds `files`, returning (dir, sha)
+    - L1946:8@a_committed_tree_resolves_to_what_the_same_content_on_disk_does
+    - L1986:8@severity_orders_worst_first
+# refs
+    - inputs@L173 calls L298:4@is_vendored:bool
+    - inputs@L180 calls L447:4@rel_of:String
+    - new@L236 calls L291:4@git_prefix:String
+    - inputs@L244 calls L278:15@git_out:Option<String>
+    - inputs@L252 calls L314:15@base_name:&str
+    - inputs@L252 calls L303:8@is_input_name:bool
+    - read@L270 calls L278:15@git_out:Option<String>
+    - git_prefix@L292 calls L278:15@git_out:Option<String>
+    - resolve@L332 calls L337:8@resolve_with:AuditReport
+    - resolve_with@L344 calls L314:15@base_name:&str
+    - resolve_with@L344 calls L310:4@is_lock_name:bool
+    - resolve_with@L346 calls L455:15@rel_dir_of:String
+    - resolve_with@L347 calls L314:15@base_name:&str
+    - resolve_with@L351 calls L876:4@direct_cargo:BTreeSet<String>
+    - resolve_with@L351 calls L464:4@parse_toml_lock:Vec<Package>
+    - resolve_with@L353 calls L908:4@direct_npm:BTreeSet<String>
+    - resolve_with@L353 calls L527:4@parse_package_lock:Vec<Package>
+    - resolve_with@L354 calls L908:4@direct_npm:BTreeSet<String>
+    - resolve_with@L354 calls L593:4@parse_yarn_lock:Vec<Package>
+    - resolve_with@L355 calls L908:4@direct_npm:BTreeSet<String>
+    - resolve_with@L355 calls L642:4@parse_pnpm_lock:Vec<Package>
+    - resolve_with@L356 calls L967:4@direct_go:BTreeSet<String>
+    - resolve_with@L356 calls L814:4@parse_go_sum:Vec<Package>
+    - resolve_with@L358 calls L925:4@direct_python:BTreeSet<String>
+    - resolve_with@L358 calls L464:4@parse_toml_lock:Vec<Package>
+    - resolve_with@L360 calls L709:4@parse_pipfile_lock:Vec<Package>
+    - resolve_with@L361 calls L741:4@parse_nuget_lock:Vec<Package>
+    - resolve_with@L363 calls L839:4@parse_requirements:(Vec<Package>, usize)
+    - resolve_with@L377 calls L322:15@join_rel:String
+    - resolve_with@L380 calls L772:4@parse_msbuild_project:(Vec<Package>, usize)
+    - resolve_with@L405 calls L314:15@base_name:&str
+    - resolve_with@L406 calls L314:15@base_name:&str
+    - resolve_with@L419 calls L455:15@rel_dir_of:String
+    - resolve_with@L422 calls L455:15@rel_dir_of:String
+    - walk@L585 calls L565:8@walk
+    - parse_package_lock@L588 calls L565:8@walk
+    - parse_yarn_lock@L607 calls L635:4@yarn_name:Option<String>
+    - parse_pnpm_lock@L668 calls L698:4@pnpm_split:Option<(String, String)>
+    - parse_msbuild_project@L780 calls L805:4@xml_attr:Option<String>
+    - parse_msbuild_project@L783 calls L805:4@xml_attr:Option<String>
+    - direct_cargo@L878 calls L322:15@join_rel:String
+    - direct_npm@L910 calls L322:15@join_rel:String
+    - direct_python@L928 calls L322:15@join_rel:String
+    - direct_go@L969 calls L322:15@join_rel:String
+    - build@L1035 calls L1106:4@manifest_declarations:Decls
+    - build@L1036 calls L1208:4@reverse_edges:BTreeMap<String, BTreeSet<String>>
+    - locate@L1041 calls L1059:4@locations_for:Vec<Location>
+    - locate@L1047 calls L1050:8@locate_with
+    - manifest_declarations@L1109 calls L314:15@base_name:&str
+    - manifest_declarations@L1119 calls L1128:4@declarations_in:Vec<(String, usize)>
+    - declarations_in@L1142 calls L805:4@xml_attr:Option<String>
+    - reverse_edges@L1211 calls L314:15@base_name:&str
+    - reverse_edges@L1217 calls L1225:4@cargo_edges
+    - reverse_edges@L1218 calls L1263:4@npm_edges
+    - assess@L1311 calls L1323:4@query_osv:Result<Vec<Finding>>
+    - query_osv@L1338 calls L1559:4@post:Result<String>
+    - query_osv@L1353 calls L1575:4@get:Result<String>
+    - query_osv@L1355 calls L1396:4@advisory_from:Advisory
+    - query_osv@L1388 calls L1547:8@severity_rank:u8
+    - cvss_v3_band@L1524 calls L1538:4@roundup:f64
+    - post@L1560 calls L1587:4@run_curl:Result<String>
+    - get@L1576 calls L1587:4@run_curl:Result<String>
+    - cargo_lock_yields_exact_versions_and_marks_direct_ones@L1618 calls L464:4@parse_toml_lock:Vec<Package>
+    - package_lock_v3_reads_the_flat_map_and_keeps_dev_apart@L1640 calls L527:4@parse_package_lock:Vec<Package>
+    - go_sum_collapses_the_go_mod_rows@L1653 calls L814:4@parse_go_sum:Vec<Package>
+    - requirements_takes_pins_and_ignores_ranges@L1661 calls L839:4@parse_requirements:(Vec<Package>, usize)
+    - an_unreachable_database_is_reported_rather_than_fatal@L1688 calls L1323:4@query_osv:Result<Vec<Finding>>
+    - an_unreachable_database_is_reported_rather_than_fatal@L1693 calls L1306:8@assess
+    - a_runtime_advisory_outranks_a_worse_dev_only_one@L1755 calls L1547:8@severity_rank:u8
+    - yarn_classic_and_berry_both_resolve_including_scoped_names@L1773 calls L593:4@parse_yarn_lock:Vec<Package>
+    - yarn_classic_and_berry_both_resolve_including_scoped_names@L1788 calls L593:4@parse_yarn_lock:Vec<Package>
+    - pnpm_strips_the_leading_slash_and_any_peer_suffix@L1813 calls L642:4@parse_pnpm_lock:Vec<Package>
+    - poetry_and_uv_share_cargos_package_block_shape@L1841 calls L464:4@parse_toml_lock:Vec<Package>
+    - pipfile_splits_runtime_from_develop@L1855 calls L709:4@parse_pipfile_lock:Vec<Package>
+    - nuget_lockfile_carries_the_transitive_closure_and_marks_direct_ones@L1875 calls L741:4@parse_nuget_lock:Vec<Package>
+    - a_csproj_resolves_exact_versions_and_counts_the_ranges@L1895 calls L772:4@parse_msbuild_project:(Vec<Package>, usize)
+    - a_committed_tree_resolves_to_what_the_same_content_on_disk_does@L1950 calls L1904:8@one_commit_repo:(std::path::PathBuf, String)
+    - a_committed_tree_resolves_to_what_the_same_content_on_disk_does@L1955 calls L331:8@resolve:AuditReport
+    - a_committed_tree_resolves_to_what_the_same_content_on_disk_does@L1956 calls L337:8@resolve_with:AuditReport
+    - a_committed_tree_resolves_to_what_the_same_content_on_disk_does@L1967 calls L337:8@resolve_with:AuditReport
+    - a_committed_tree_resolves_to_what_the_same_content_on_disk_does@L1980 calls L337:8@resolve_with:AuditReport
+# note

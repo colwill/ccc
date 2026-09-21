@@ -1,0 +1,88 @@
+# extension.ts.md (20260921-12-11-30) UTC
+# source: extensions/vscode/src/extension.ts [typescript]
+# modules
+# imports
+    - L1@vscode (vscode)
+    - L2@./binary (bootstrapCccBinary, CccBinaryError)
+    - L3@./codelens (CccCodeLensProvider)
+    - L4@./commands (CommandHost, registerCommands)
+    - L5@./config (Cfg, needsDecorationReload, readConfig)
+    - L6@./decorations (DecorationSet)
+    - L7@./hover (CccHoverProvider)
+    - L8@./log (Log)
+    - L9@./paths (isSupportedDocument, keyOf)
+    - L10@./session (WorkspaceSession)
+    - L11@./status (ActiveFileState, StatusBar)
+    - L12@./complexitypanel (ComplexityPanel)
+    - L13@./testpanel (TestTriggerPanel)
+    - L14@./vulns (VulnerabilityMarks)
+# const
+    - L17@DIRTY_DEBOUNCE_MS
+    - L19@FOCUS_COOLDOWN_MS
+    - L22@CHECKED_FOR_KEY
+# funcs
+    - L26:23@activate:Promise<void>
+    - L31:23@deactivate:Promise<void>
+    - L58:3@constructor
+    - L91:9@start:Promise<void>
+    - L170:17@ensureBinary:Promise<void> // Runs once per activation and only does real work when there is nothing to
+    - L204:11@warnMissingBinary:void // a missing binary is one problem for the whole window, so it is reported once,
+    - L221:17@retryStart:Promise<void> // a binary that arrives late leaves the sessions that wanted it sitting in `failed`
+    - L231:17@sessionFor:Promise<WorkspaceSession | undefined> // sessions start lazily so a twelve-folder workspace does not spawn twelve analysers
+    - L265:17@wake:Promise<void> // the lazy path starts the analyser from the active editor, which leaves the panels dead
+    - L273:3@activeSession:WorkspaceSession | undefined
+    - L286:3@sessions:WorkspaceSession[]
+    - L290:11@reportStartFailure:void
+    - L315:17@onConfigChanged:Promise<void>
+    - L340:17@onActiveEditor:Promise<void>
+    - L346:11@onSave:void
+    - L360:11@onEdit:void // the analyser reads disk not the buffer so an unsaved edit only dims the hints
+    - L375:11@onWindowState:void // catches git checkouts, codegen and edits made outside the editor
+    - L385:11@onFoldersChanged:void
+    - L395:9@render:Promise<void>
+    - L447:11@lensSignature:string // everything a CodeLens is drawn from - equal signature means identical lenses
+    - L460:11@clearAllDecorations:void
+    - L464:3@refreshAll:void
+    - L471:9@toggleHints:Promise<void>
+    - L478:9@shutdown:Promise<void>
+    - L488:10@binaryMessage:string | undefined // the user-facing form of "there is no binary", or undefined for any other failure
+    - L494:10@bearsOnBinary:boolean // settings that can turn "no binary" into "a binary", so are worth re-checking for
+# refs
+    - constructor@L82 calls L286:3@sessions:WorkspaceSession[]
+    - constructor@L83 calls L265:17@wake:Promise<void>
+    - constructor@L86 calls L286:3@sessions:WorkspaceSession[]
+    - constructor@L87 calls L265:17@wake:Promise<void>
+    - start@L109 calls L464:3@refreshAll:void
+    - start@L141 calls L170:17@ensureBinary:Promise<void>
+    - start@L146 calls L315:17@onConfigChanged:Promise<void>
+    - start@L148 calls L340:17@onActiveEditor:Promise<void>
+    - start@L152 calls L395:9@render:Promise<void>
+    - start@L154 calls L346:11@onSave:void
+    - start@L155 calls L360:11@onEdit:void
+    - start@L156 calls L375:11@onWindowState:void
+    - start@L157 calls L385:11@onFoldersChanged:void
+    - start@L160 calls L340:17@onActiveEditor:Promise<void>
+    - ensureBinary@L196 calls L204:11@warnMissingBinary:void
+    - ensureBinary@L197 calls L488:10@binaryMessage:string | undefined
+    - warnMissingBinary@L212 calls L170:17@ensureBinary:Promise<void>
+    - warnMissingBinary@L213 calls L221:17@retryStart:Promise<void>
+    - retryStart@L227 calls L340:17@onActiveEditor:Promise<void>
+    - sessionFor@L252 calls L395:9@render:Promise<void>
+    - sessionFor@L258 calls L290:11@reportStartFailure:void
+    - wake@L270 calls L231:17@sessionFor:Promise<WorkspaceSession | undefined>
+    - reportStartFailure@L294 calls L488:10@binaryMessage:string | undefined
+    - reportStartFailure@L297 calls L204:11@warnMissingBinary:void
+    - onConfigChanged@L327 calls L494:10@bearsOnBinary:boolean
+    - onConfigChanged@L327 calls L170:17@ensureBinary:Promise<void>
+    - onConfigChanged@L333 calls L460:11@clearAllDecorations:void
+    - onConfigChanged@L336 calls L221:17@retryStart:Promise<void>
+    - onConfigChanged@L337 calls L395:9@render:Promise<void>
+    - onActiveEditor@L342 calls L231:17@sessionFor:Promise<WorkspaceSession | undefined>
+    - onActiveEditor@L343 calls L395:9@render:Promise<void>
+    - onSave@L350 calls L395:9@render:Promise<void>
+    - onEdit@L367 calls L395:9@render:Promise<void>
+    - onEdit@L370 calls L395:9@render:Promise<void>
+    - onFoldersChanged@L392 calls L395:9@render:Promise<void>
+    - render@L396 calls L447:11@lensSignature:string
+    - render@L432 calls L273:3@activeSession:WorkspaceSession | undefined
+# note
