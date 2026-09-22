@@ -1,22 +1,17 @@
 //! Cross-repo links.
 //!
-//! calls do not stop at the process: a gateway calls a billing
-//! service that lives in another repository, in another language, behind an
-//! HTTP or gRPC hop that no parser can follow. `.ccc/map.json` names those
-//! peers under `externals`, and `ccc:serves` / `ccc:calls` comments name the
-//! key both ends agree on. Matching keys become real edges of the service
-//! graph, with a file and line at each end.
-//!
+//! calls do not stop at the process
 //! A peer is reached one of two ways, and both reduce to the same [`Surface`]:
 //!
 //!   - `path` - a directory: a sibling checkout, or another corner of a
 //!     monorepo. ccc parses it and derives the surface itself.
 //!   - `surface` - a file or URL holding a surface this peer published with
-//!     `ccc export`. No source, no toolchain for its language, no clone.
+//!     `ccc init`. No source, no toolchain for its language, no clone.
 //!
 //! Peer files deliberately never join `caches`
 //! everything downstream keys on paths relative to *this* root
 
+use crate::contracts::ContractIndex;
 use crate::model::{Boundary, FileCache};
 use crate::scan;
 use anyhow::{bail, Context, Result};
@@ -27,7 +22,19 @@ use std::process::Command;
 
 pub const SURFACE_SCHEMA: &str = "ccc-surface/1";
 // the conventional file name so `surface` can name a directory
-pub const SURFACE_NAME: &str = "ccc-surface.json";
+pub const SURFACE_NAME: &str = "surface.json";
+// what `ccc export` wrote before `ccc init` took the job. Still read, never
+// written: a peer repo that has not regenerated is not a peer that stopped
+// existing
+pub const LEGACY_SURFACE_NAME: &str = "ccc-surface.json";
+
+// the surface a directory publishes, current name first
+fn surface_in(dir: &Path) -> Option<PathBuf> {
+    std::iter::once(SURFACE_NAME)
+        .chain(std::iter::once(LEGACY_SURFACE_NAME))
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+}
 // a published surface *should* be small, anything larger considered a pebkac
 const MAX_SURFACE_BYTES: u64 = 8 * 1024 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 20;
@@ -44,6 +51,10 @@ pub struct Endpoint {
     // the service inside that repo when it names more than one
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    // `rpc` when derived from a `.proto` schema rather than written in a
+    // `ccc:` comment
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 // what a repository publishes and consumes and nothing else
@@ -62,14 +73,28 @@ pub struct Surface {
     pub provides: Vec<Endpoint>,
     #[serde(default)]
     pub consumes: Vec<Endpoint>,
+    // rpc endpoints were derived from `.proto` schemas. A surface without the
+    // flag predates that and says nothing about the rpcs its repo serves
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rpc_endpoints: bool,
 }
 
 impl Surface {
     // derive a surface from an already-parsed tree
-    pub fn from_caches(name: &str, generated: &str, caches: &[FileCache]) -> Surface {
-        let mut provides = Vec::new();
-        let mut consumes = Vec::new();
+    pub fn from_caches(
+        name: &str,
+        generated: &str,
+        caches: &[FileCache],
+        contracts: &ContractIndex,
+    ) -> Surface {
+        // the rpcs this repo serves and calls need no comment at either end
+        let (mut provides, mut consumes) = contracts.endpoints(caches);
         let mut languages = BTreeSet::new();
+        for e in provides.iter().chain(&consumes) {
+            if let Some(c) = caches.iter().find(|c| crate::changes::path_str(&c.rel_path) == e.file) {
+                languages.insert(c.language.as_str().to_string());
+            }
+        }
 
         for cache in caches {
             if cache.annotations.is_empty() {
@@ -85,6 +110,7 @@ impl Surface {
                     file: file.clone(),
                     line: ann.line,
                     service: None,
+                    via: None,
                 };
                 match ann.boundary {
                     Boundary::Serves => provides.push(endpoint),
@@ -103,6 +129,7 @@ impl Surface {
             languages: languages.into_iter().collect(),
             provides,
             consumes,
+            rpc_endpoints: true,
         }
     }
 
@@ -169,17 +196,25 @@ impl ExternalService {
 }
 
 // Resolve every peer named in the config. Errors are captured per peer.
+// `schemas` are this repo's `contracts`: a peer checkout is linked through
+// them as well as its own, since the schema often lives in neither repo.
 pub fn resolve_all(
     root: &Path,
     externals: &BTreeMap<String, ExternalRepo>,
+    schemas: &[FileCache],
 ) -> Vec<ExternalService> {
     externals
         .iter()
-        .map(|(name, config)| resolve_one(root, name, config))
+        .map(|(name, config)| resolve_one(root, name, config, schemas))
         .collect()
 }
 
-fn resolve_one(root: &Path, name: &str, config: &ExternalRepo) -> ExternalService {
+fn resolve_one(
+    root: &Path,
+    name: &str,
+    config: &ExternalRepo,
+    schemas: &[FileCache],
+) -> ExternalService {
     let mut service = ExternalService {
         name: name.to_string(),
         config: config.clone(),
@@ -194,7 +229,7 @@ fn resolve_one(root: &Path, name: &str, config: &ExternalRepo) -> ExternalServic
         let dir = resolve_path(root, path);
         service.source = format!("path {}", path);
         if dir.is_dir() {
-            match surface_from_dir(name, &dir) {
+            match surface_from_dir(name, &dir, schemas) {
                 Ok(surface) => {
                     service.surface = Some(surface);
                     return service;
@@ -238,14 +273,18 @@ fn resolve_path(root: &Path, path: &str) -> PathBuf {
 }
 
 // Parse a peer checkout and reduce it to its surface.
-fn surface_from_dir(name: &str, dir: &Path) -> Result<Surface> {
+fn surface_from_dir(name: &str, dir: &Path, schemas: &[FileCache]) -> Result<Surface> {
     // a checkout that already publishes one is cheaper, and is what its owners
     // consider their contract
-    let published = dir.join(".ccc").join(SURFACE_NAME);
-    if published.is_file() {
+    if let Some(published) = surface_in(&dir.join(".ccc")) {
         let raw = std::fs::read_to_string(&published)
             .with_context(|| format!("reading {}", published.display()))?;
-        if let Ok(mut surface) = Surface::parse(&raw, &published.display().to_string()) {
+        // one published before rpc endpoints existed would hide every rpc
+        // the checkout serves, and the checkout is right here to read
+        if let Ok(mut surface) = Surface::parse(&raw, &published.display().to_string())
+            .map_err(|_| ())
+            .and_then(|s| if s.rpc_endpoints { Ok(s) } else { Err(()) })
+        {
             surface.name = name.to_string();
             return Ok(surface);
         }
@@ -255,7 +294,14 @@ fn surface_from_dir(name: &str, dir: &Path) -> Result<Surface> {
     let files = scan::collect_files(dir)
         .with_context(|| format!("scanning external '{name}' at {}", dir.display()))?;
     let caches = scan::build_caches(dir, &files);
-    Ok(Surface::from_caches(name, &crate::render::now_ts(), &caches))
+    // the peer's own `contracts`, then ours
+    let peer_patterns = crate::changes::ChangesConfig::load(dir)
+        .map(|c| c.contracts)
+        .unwrap_or_default();
+    let mut all = crate::contracts::load_schemas(dir, &peer_patterns);
+    all.extend(schemas.iter().cloned());
+    let contracts = ContractIndex::build(&caches, &all);
+    Ok(Surface::from_caches(name, &crate::render::now_ts(), &caches, &contracts))
 }
 
 // Read a surface from a file, a directory holding one, or a URL.
@@ -266,7 +312,8 @@ fn load_surface(root: &Path, location: &str, auth: Option<&str>) -> Result<Surfa
     }
     let mut path = resolve_path(root, location.trim_start_matches("file://"));
     if path.is_dir() {
-        path = path.join(SURFACE_NAME);
+        // a directory names whichever surface it actually holds
+        path = surface_in(&path).unwrap_or_else(|| path.join(SURFACE_NAME));
     }
     let meta = std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
     if meta.len() > MAX_SURFACE_BYTES {
@@ -344,6 +391,8 @@ pub struct Crossing {
     pub remote: Option<Endpoint>,
     // the peer is another repository rather than a service in this one
     pub external: bool,
+    // tied by a `.proto` schema rather than a `ccc:` comment
+    pub rpc: bool,
 }
 
 // index a peers endpoints by key
@@ -358,4 +407,87 @@ pub fn index_by_key(endpoints: &[Endpoint]) -> BTreeMap<&str, Vec<&Endpoint>> {
 // normalise a key for matching
 pub fn norm_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A peer checkout serves an rpc from a schema only this repo holds, and
+    // sits beside a surface it published before rpc endpoints existed. The
+    // stale surface would hide the handler, so the checkout is read instead.
+    #[test]
+    fn a_peer_serves_an_rpc_through_this_repos_schema() {
+        let base = std::env::temp_dir().join(format!("ccc-peer-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, peer) = (base.join("app"), base.join("billing"));
+        std::fs::create_dir_all(root.join("proto")).unwrap();
+        std::fs::create_dir_all(peer.join(".ccc")).unwrap();
+        std::fs::write(
+            root.join("proto/billing.proto"),
+            "syntax = \"proto3\";\npackage acme.billing.v1;\n\
+             message CreateInvoiceRequest { string customer = 1; }\n\
+             message Invoice { string id = 1; }\n\
+             service Billing { rpc CreateInvoice(CreateInvoiceRequest) returns (Invoice); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            peer.join("server.go"),
+            "package billing\nimport billingv1 \"github.com/acme/gen/acme/billing/v1\"\n\
+             type server struct{}\n\
+             func (s *server) CreateInvoice(ctx context.Context, req *billingv1.CreateInvoiceRequest) (*billingv1.Invoice, error) {\n\
+             \treturn nil, nil\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            peer.join(".ccc").join(SURFACE_NAME),
+            format!("{{\"schema\": \"{SURFACE_SCHEMA}\", \"name\": \"billing\", \"generated\": \"old\"}}"),
+        )
+        .unwrap();
+
+        let schemas = crate::contracts::load_schemas(&root, &["proto".to_string()]);
+        let config = ExternalRepo { path: Some("../billing".to_string()), ..Default::default() };
+        let peers = resolve_all(&root, &BTreeMap::from([("billing".to_string(), config)]), &schemas);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let surface = peers[0].surface.as_ref().expect("resolved");
+        assert!(surface.rpc_endpoints);
+        let served: Vec<(&str, &str, Option<&str>)> = surface
+            .provides
+            .iter()
+            .map(|e| (e.key.as_str(), e.file.as_str(), e.via.as_deref()))
+            .collect();
+        assert_eq!(
+            served,
+            vec![("acme.billing.v1.Billing/CreateInvoice", "server.go", Some("rpc"))]
+        );
+        assert_eq!(surface.languages, vec!["go".to_string()]);
+    }
+
+    // Renaming what we write must not unpublish what peers already published.
+    // A repo that last ran `ccc export` still holds `ccc-surface.json`, and it
+    // is still a peer.
+    #[test]
+    fn a_peer_that_published_under_the_old_name_is_still_found() {
+        let dir = std::env::temp_dir().join(format!("ccc-surf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        assert!(surface_in(&dir).is_none(), "an empty directory publishes nothing");
+
+        std::fs::write(dir.join(LEGACY_SURFACE_NAME), "{}").expect("write");
+        assert_eq!(
+            surface_in(&dir).map(|p| p.file_name().unwrap().to_owned()),
+            Some(LEGACY_SURFACE_NAME.into())
+        );
+
+        // and once it regenerates, the current name is the one that answers
+        std::fs::write(dir.join(SURFACE_NAME), "{}").expect("write");
+        assert_eq!(
+            surface_in(&dir).map(|p| p.file_name().unwrap().to_owned()),
+            Some(SURFACE_NAME.into())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

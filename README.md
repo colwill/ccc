@@ -1,11 +1,11 @@
-<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="ContextCodeCache Logo"></a></p>
+<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="CodeCaChe Logo"></a></p>
 
 [![Release CodeCaChe](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
 
 
 # CodeCaChe (`ccc`)
 
-CodeCaChe provides insight into your code and improves developer experience by:
+CodeCaChe tells you, and your AI agent, what a change touches before you commit it - the functions, tests, services and cross-service contracts it reaches - by:
 
   - highlighting which tests will be ran with your changes
   
@@ -24,7 +24,7 @@ graph, and marker notes (TODO/FIXME/...).
 
 It is designed to give engineers a always-fresh index of a project, the latest changes, how those changes impact tests or other branches (compare working branch against any other branch). In addition it also provides language models a local MCP server for an always up-to-date map of your codebase, dependencies, call-graph and cross-service calls. 
 
-Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`, `Odin`, `TypeScript`
+Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`, `Odin`, `TypeScript`, `Protobuf`
 & `JavaScript` - see [`LANGUAGES.md`](docs/LANGUAGES.md) for what each one resolves.
 
 ## Table of content
@@ -62,11 +62,11 @@ Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`,
    cargo build --release && ./target/release/ccc -- install
    ```
 
-2. **Initialise `ccc changes --init` to generate the basic `.ccc/map.json`**
+2. **Initialise `ccc init` to generate the basic `.ccc/map.json`**
 
-    a. (recommended) edit dependency map `.ccc/map.json` to include service locations and dependencies
+    a. (recommended) edit dependency map `.ccc/map.json` to include service locations and cross-service calls
 
-3. **Start local MCP `ccc serve --html`**
+3. **Start local MCP `ccc run`**
 
     a. (recommended) visit `http://127.0.0.1:6767/insights` for Insights UI
 
@@ -84,30 +84,30 @@ Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`,
 ## Usage
 
 ```sh
-ccc changes [PATH] --telemetry        # changes vs the base branch: services to test, dependencies, otel
-ccc check [PATH] --format json        # exit non-zero if .ccc is stale - for CI
-ccc tokenize [PATH]                   # pre-encode an existing .ccc into tokens.bin + tokens.json
-ccc deps [PATH]                       # just the dependency delta of that report, for CI (JSON)
-ccc prompts [PATH]                    # which claude/copilot request produced each change (JSON)
-ccc serve [PATH] --html               # MCP server and optional insights UI: agents query the in-memory map
-ccc export [PATH]                     # publish what this project serves/calls, for other repos
-ccc insights [PATH] --html <File>     # the insights analysis as JSON (call graph, triggers, lints)
-ccc sast [PATH]                       # security findings; defaults to non-zero on a high finding
-ccc audit [PATH]                      # resolve lockfiles and check against the OSV advisory db
-ccc install [--dir] <DIR>             # install the ccc binary onto your PATH (Linux)
-ccc scan [PATH] --tokens              # regen PATH/.ccc  (PATH defaults to ".") (opt: output token stream)
+ccc run                               # Runs local in-memory map, MCP server and insights UI
+ccc init                              # Generate basic `.ccc/map.json` and `.ccc/surface.json` (prev ccc-surface.json)
+ccc changes [PATH] --telemetry        # Changes vs base ref (services to test for CT)
+ccc tokenize                          # Encode in-memory map of project into tokens.bin + tokens.json
+ccc deps [PATH]                       # Dependency delta (for CI as JSON)
+ccc prompts [PATH]                    # Which requests produced specific changes (JSON)
+ccc insights [PATH] --html <File>     # The insights analysis as JSON (call graph, triggers, lints)
+ccc sast [PATH]                       # Security findings, defaults to non-zero on a high finding
+ccc audit [PATH]                      # Resolve lockfiles and check against the OSV advisory db
+ccc install [--dir] <DIR>             # Install the ccc binary onto your PATH (Linux)
+ccc scan [PATH] --dir=<DIR> --tokens  # Parse tree and report map (legacy)
 ```
+
+`ccc run` builds the project map in memory and makes it queryable by MCP via tool calls and viewable by the local web UI @ `:6767/insights`.
 
 ## Insights
 
-The command `(ccc serve --html)` starts the MCP server with the insights UI on `http://localhost:6767/insights`. It is disabled by default and fetches
-`/insights.json` from the running server, so it tracks the in-memory ccc map at runtime.
+The command `(ccc run)` starts the MCP server with the insights UI on `http://localhost:6767/insights`. and fetches `/insights.json` from the running server, so it tracks the in-memory ccc map at runtime.
 
 ```sh
-ccc serve --html                      # then open http://127.0.0.1:6767/insights
-curl -s localhost:6767/insights.json  # the same data, for scripting
-ccc insights                          # the same analysis as JSON, no server
-ccc insights --html page.html         # insights as a single page, for static hosting
+ccc run                               # then open http://127.0.0.1:6767/insights
+curl -s localhost:6767/insights.json  # the same data, for other consumers
+ccc insights                          # same JSON data as above via direct command
+ccc insights --html page.html         # output format is html, as a single page app
 ```
 
 ## Extension
@@ -129,7 +129,7 @@ The `.ccc/map.json` file is used to hint to ccc where to find dependencies, for 
     "billing": ["apps/billing/**", "libs/money/**"],
     "gateway": ["apps/gateway/**"]
   },
-  "deps": {
+  "relatives": {
     "gateway": ["auth"] // gateway calls auth over HTTP, so declare it!
   },
   "externals": {
@@ -137,6 +137,8 @@ The `.ccc/map.json` file is used to hint to ccc where to find dependencies, for 
   }
 }
 ```
+
+`relatives` are the declared relationships: service to service here, or service to a peer under `externals`.
 
 ## Externals
 
@@ -159,7 +161,7 @@ func Charge(account string, amount int) error { ... }
 ```
 
 Matching keys become real edges of the service graph, with a file and line at each end, whatever
-language each side is written in. Publish a surface for others to consume with `ccc export`.
+language each side is written in. Publish a surface for others to consume with `ccc init`.
 
 See [EXTERNALS.md](docs/EXTERNALS.md).
 
@@ -182,14 +184,14 @@ Trailing prose after the marker is allowed, so a skip can say why.
 
 ## AGENTS.md
 
-#### Note: If you're not using `ccc serve`, you can generate a `.ccc` directory using `ccc scan` and then add a block to your AGENTS.md file  to scan the `.ccc` directory instead.
+#### Note: If you're not using `ccc serve`, you can generate a `.ccc` directory using `ccc scan --dir` and then add a block to your AGENTS.md file  to scan the `.ccc` directory instead.
 
 (recommended) For those using `ccc serve` and the MCP tools; add the following block to an AGENTS.md file at the root of your project - agents that read an [`AGENTS.md`](https://agents.md) at the repo root pick this up automatically e.g. Copilot, Claude, Cursor etc.
 
 ```md
 # AGENTS.md
 
-This repo has a ContextCodeCache - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
+This repo has a CodeCaChe - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
 as the entry point for everything you do here.
 
 - no bash, grep or sed usage for exploring the project

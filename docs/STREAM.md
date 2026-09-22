@@ -8,7 +8,7 @@
 > For exact Claude token counts, use Anthropic's `count_tokens` endpoint.
 > `tokens.json` carries this caveat inline (`approximate: true` + a `note`).
 
-`ccc tokenize` (or `ccc scan --tokens`) encodes the whole `.ccc` corpus with a
+`ccc tokenize` (or `ccc scan --dir --tokens`) encodes the whole map with a
 pretrained tiktoken vocabulary (`o200k_base` by default, `--encoding cl100k_base`
 also supported) and writes:
 
@@ -29,5 +29,5 @@ let ids: &[u32] = cache.file("src-main.rs.md").unwrap();    // raw tokens, ready
 let text = cache.decode(ids)?;                              // optional: back to markdown
 ```
 
-Token artifacts are derived, so a plain `ccc scan` clears them; re-run with
+Token artifacts are derived, so a `ccc scan --dir` clears them; re-run with
 `--tokens` (or `ccc tokenize`) to refresh.

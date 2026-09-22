@@ -2,12 +2,13 @@
 //! pretrained tiktoken vocabulary. Downstream consumers load raw token IDs
 //! (`&[u32]`) directly from `tokens.bin` - no re-tokenization at load time.
 //!
-//! Layout written into `.ccc/`:
+//! Layout written into the cache directory (`.ccc/` unless `--dir` moved it):
 //! - `tokens.bin`  - little-endian `u32` token IDs for every cache file, concatenated
 //! - `tokens.json` - index: encoding, layout, and per-file `(offset, len)` in tokens
 
 use anyhow::{anyhow, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tiktoken_rs::CoreBPE;
@@ -88,25 +89,28 @@ pub struct TokenizeReport {
     pub bin_path: PathBuf,
 }
 
-// encode every `.md` cache file under `<root>/.ccc` into `tokens.bin` +
-// `tokens.json`, then verify the persisted stream decodes back to the corpus
-pub fn tokenize(root: &Path, enc: Encoding) -> Result<TokenizeReport> {
-    let ccc = root.join(".ccc");
-    ensure!(
-        ccc.is_dir(),
-        "no .ccc directory at {} - run `ccc scan` first",
-        ccc.display()
-    );
+// Encode a rendered map into `tokens.bin` + `tokens.json` under `ccc`, then
+// verify the persisted stream decodes back to it.
+//
+// The corpus is passed in rather than read back off disk: the map is built in
+// memory by whoever called this, and re-reading the markdown would encode a
+// round trip through the filesystem instead of the thing that was mapped. It
+// also means a token stream can be produced for a project that never writes
+// the markdown at all.
+pub fn tokenize(
+    corpus: &BTreeMap<String, String>,
+    ccc: &Path,
+    enc: Encoding,
+) -> Result<TokenizeReport> {
+    ensure!(!corpus.is_empty(), "nothing to encode - the map is empty");
     let bpe = enc.load()?;
-
-    let names = list_markdown(&ccc)?;
-    ensure!(!names.is_empty(), "no .md cache files in {}", ccc.display());
+    let names = ordered_names(corpus);
 
     let mut stream: Vec<u32> = Vec::new();
     let mut entries: Vec<FileEntry> = Vec::new();
     for name in &names {
-        let text = fs::read_to_string(ccc.join(name)).with_context(|| format!("reading {name}"))?;
-        let toks = bpe.encode_ordinary(&text);
+        let text = &corpus[name];
+        let toks = bpe.encode_ordinary(text);
         entries.push(FileEntry {
             file: name.clone(),
             offset: stream.len(),
@@ -114,6 +118,8 @@ pub fn tokenize(root: &Path, enc: Encoding) -> Result<TokenizeReport> {
         });
         stream.extend_from_slice(&toks);
     }
+
+    fs::create_dir_all(ccc).with_context(|| format!("creating {}", ccc.display()))?;
 
     // tokens.bin - little-endian u32 stream
     let mut bytes = Vec::with_capacity(stream.len() * 4);
@@ -139,7 +145,7 @@ pub fn tokenize(root: &Path, enc: Encoding) -> Result<TokenizeReport> {
         .with_context(|| format!("writing {}", ccc.join(TOKENS_INDEX).display()))?;
 
     // verify the persisted artifacts round-trip back to the exact corpus
-    verify_roundtrip(root, enc, &names)?;
+    verify_roundtrip(ccc, enc, corpus, &names)?;
 
     Ok(TokenizeReport {
         files: index.files.len(),
@@ -163,13 +169,17 @@ pub fn clear(ccc: &Path) -> Result<()> {
 }
 
 // reload persisted tokens from disk and confirm they decode to the corpus
-fn verify_roundtrip(root: &Path, enc: Encoding, names: &[String]) -> Result<()> {
-    let cache = TokenCache::load(root)?;
+fn verify_roundtrip(
+    ccc: &Path,
+    enc: Encoding,
+    corpus: &BTreeMap<String, String>,
+    names: &[String],
+) -> Result<()> {
+    let cache = TokenCache::load(ccc)?;
     let bpe = enc.load()?;
-    let ccc = root.join(".ccc");
     let mut expected = String::new();
     for name in names {
-        expected.push_str(&fs::read_to_string(ccc.join(name))?);
+        expected.push_str(&corpus[name]);
     }
     let decoded = bpe
         .decode(cache.all())
@@ -178,21 +188,15 @@ fn verify_roundtrip(root: &Path, enc: Encoding, names: &[String]) -> Result<()> 
     Ok(())
 }
 
-fn list_markdown(ccc: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for entry in fs::read_dir(ccc)? {
-        let name = entry?.file_name().to_string_lossy().to_string();
-        if name.ends_with(".md") {
-            names.push(name);
-        }
-    }
-    names.sort();
-    // keep the index first for a stable, human-friendly layout
+// the corpus in stream order: the index first, then the rest by name, so the
+// layout is stable and a reader can find `CCC.md` at offset zero
+fn ordered_names(corpus: &BTreeMap<String, String>) -> Vec<String> {
+    let mut names: Vec<String> = corpus.keys().cloned().collect();
     if let Some(pos) = names.iter().position(|n| n == "CCC.md") {
         let c = names.remove(pos);
         names.insert(0, c);
     }
-    Ok(names)
+    names
 }
 
 // loaded token cache: the raw `u32` stream plus its index
@@ -204,8 +208,7 @@ pub struct TokenCache {
 }
 
 impl TokenCache {
-    pub fn load(root: &Path) -> Result<TokenCache> {
-        let ccc = root.join(".ccc");
+    pub fn load(ccc: &Path) -> Result<TokenCache> {
         let idx_path = ccc.join(TOKENS_INDEX);
         let json = fs::read_to_string(&idx_path)
             .with_context(|| format!("reading {} (run `ccc tokenize`)", idx_path.display()))?;
@@ -268,24 +271,27 @@ impl TokenCache {
 mod tests {
     use super::*;
 
+    fn corpus() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("CCC.md".to_string(), "# CodeCaChe\n# files\n".to_string()),
+            (
+                "src-main.rs.md".to_string(),
+                "# main.rs.md\n# funcs\n    - L1:4@main\n".to_string(),
+            ),
+        ])
+    }
+
     #[test]
     fn tokenize_load_roundtrip() {
         let dir = std::env::temp_dir().join(format!("ccc-tok-{}", std::process::id()));
         let ccc = dir.join(".ccc");
-        fs::create_dir_all(&ccc).unwrap();
-        fs::write(ccc.join("CCC.md"), "# ContextCodeCache\n# files\n").unwrap();
-        fs::write(
-            ccc.join("src-main.rs.md"),
-            "# main.rs.md\n# funcs\n    - L1:4@main\n",
-        )
-        .unwrap();
-
-        let report = tokenize(&dir, Encoding::O200kBase).unwrap();
+        // the destination need not exist, and the corpus need never be on disk
+        let report = tokenize(&corpus(), &ccc, Encoding::O200kBase).unwrap();
         assert_eq!(report.files, 2);
         assert!(report.total_tokens > 0);
         assert_eq!(report.bytes, report.total_tokens * 4);
 
-        let cache = TokenCache::load(&dir).unwrap();
+        let cache = TokenCache::load(&ccc).unwrap();
         // stream is labeled approximate / non-Claude
         assert!(cache.index.approximate);
         assert!(cache.index.note.contains("Claude"));
@@ -295,6 +301,8 @@ mod tests {
         let toks = cache.file("src-main.rs.md").unwrap();
         let decoded = cache.decode(toks).unwrap();
         assert_eq!(decoded, "# main.rs.md\n# funcs\n    - L1:4@main\n");
+        // no markdown was written, only the stream
+        assert!(!ccc.join("CCC.md").exists());
 
         fs::remove_dir_all(&dir).ok();
     }

@@ -1,0 +1,8 @@
+{
+  "schema": "ccc-surface/1",
+  "name": "codecache",
+  "generated": "20260921-21-51-30",
+  "languages": ["rust", "typescript"],
+  "provides": [],
+  "consumes": []
+}

@@ -4,6 +4,7 @@
 //! `--service` flags), diffs the branch against a base ref.
 // ccc:skip
 
+use crate::contracts::ContractIndex;
 use crate::coverage;
 use crate::extract::BDD_REGISTRARS;
 use crate::model::{Boundary, FileCache};
@@ -49,12 +50,16 @@ pub struct ChangesOptions {
 pub struct ChangesConfig {
     #[serde(default)]
     pub services: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub deps: BTreeMap<String, Vec<String>>,
+    // Declared relationships
+    #[serde(default, alias = "deps")]
+    pub relatives: BTreeMap<String, Vec<String>>,
     // peer repositories: another checkout, or a published surface. Their names
     // are service names too, so `deps` may point at them.
     #[serde(default)]
     pub externals: BTreeMap<String, crate::externals::ExternalRepo>,
+    // `.proto` schemas kept outside the project
+    #[serde(default)]
+    pub contracts: Vec<String>,
 }
 
 impl ChangesConfig {
@@ -64,6 +69,7 @@ impl ChangesConfig {
         };
         let raw =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        warn_legacy_deps_key(&path, &raw);
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -76,6 +82,25 @@ impl ChangesConfig {
     }
 }
 
+
+// `relatives` was called `deps` back when it could only name a service
+fn warn_legacy_deps_key(path: &Path, raw: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let uses_deps = serde_json::from_str::<Value>(raw)
+        .ok()
+        .is_some_and(|v| v.get("deps").is_some());
+    if !uses_deps {
+        return;
+    }
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: {} uses `deps`, which is now `relatives` - it may name a peer \
+             repository from `externals`, not only a service in this repo. `deps` is \
+             still read and will be removed in 2.0.0.",
+            path.display()
+        );
+    });
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ChangedFile {
@@ -226,7 +251,7 @@ pub fn changes(root: &Path, root_label: &str, opts: &ChangesOptions) -> Result<C
 }
 
 // Same analysis against an already-parsed map, so a caller that holds one
-// (`ccc serve`) does not pay to walk and re-parse the tree.
+// (`ccc run`) does not pay to walk and re-parse the tree.
 pub fn changes_with_caches(
     root: &Path,
     root_label: &str,
@@ -246,9 +271,9 @@ pub fn changes_with_caches(
         // no config: the whole root is one service "." no cross-service edges
         config.services.insert(".".into(), vec!["**".into()]);
     }
-    // A peer repository is a service too - it owns no files here, but `deps`
-    // may name it and edges may end at it.
-    for (from, tos) in &config.deps {
+    // A peer repository is a service too - it owns no files here, but
+    // `relatives` may name it and edges may end at it.
+    for (from, tos) in &config.relatives {
         for t in std::iter::once(from).chain(tos) {
             if config.services.contains_key(t) || config.externals.contains_key(t) {
                 continue;
@@ -256,7 +281,7 @@ pub fn changes_with_caches(
             let mut known: Vec<String> = config.services.keys().cloned().collect();
             known.extend(config.externals.keys().cloned());
             bail!(
-                "map.json deps mention unknown service '{t}' \
+                "map.json relatives mention unknown service '{t}' \
                  (known: {})",
                 known.join(", ")
             );
@@ -272,7 +297,10 @@ pub fn changes_with_caches(
     }
     let matchers = build_matchers(&config.services)?;
     let service_names: Vec<String> = config.services.keys().cloned().collect();
-    let externals = crate::externals::resolve_all(root, &config.externals);
+    // the rpcs every schema declares, and the code in any language tied to them
+    let schemas = crate::contracts::load_schemas(root, &config.contracts);
+    let contracts = ContractIndex::build(caches, &schemas);
+    let externals = crate::externals::resolve_all(root, &config.externals, &contracts.schemas);
 
     let (base_label, base_sha) = resolve_base(root, opts.base.as_deref())?;
     let head_sha = git(root, &["rev-parse", "HEAD"])?.trim().to_string();
@@ -358,14 +386,22 @@ pub fn changes_with_caches(
     // `insights`, so the two reports cannot disagree about what is covered.
     let project_ids: BTreeSet<String> =
         manifest_identities(root).into_iter().map(|(id, _)| id).collect();
-    let cov = coverage::build(caches, &project_ids);
+    let cov = coverage::build(caches, &project_ids, &contracts);
 
     // cross-service edges + per-symbol caller map
-    let (mut edges, symbol_callers, unresolved_calls) = detect_edges(&idx, &config.deps);
+    let (mut edges, mut symbol_callers, mut unresolved_calls) = detect_edges(&idx, &config.relatives);
+    merge_rpc_edges(
+        &mut edges,
+        &mut symbol_callers,
+        &mut unresolved_calls,
+        caches,
+        &matchers,
+        &contracts,
+    );
 
     // boundary crossings: the calls that leave the process, which the call
-    // graph cannot see and the author had to name
-    let crossings = detect_crossings(caches, &matchers, &externals);
+    // graph cannot see - named by an author, or derived from a schema
+    let crossings = detect_crossings(caches, &matchers, &externals, &contracts);
     merge_crossings(&mut edges, &crossings);
 
     // changed files -> services
@@ -562,6 +598,8 @@ fn crossing_json(c: &crate::externals::Crossing) -> Value {
         "line": c.line,
         "function": c.function,
         "external": c.external,
+        // `rpc` when a schema tied it, `annotation` when a `ccc:` comment did
+        "via": if c.rpc { crate::contracts::VIA } else { "annotation" },
         // absent when nothing answers this key
         "remote": c.remote.as_ref().map(|r| serde_json::json!({
             "function": r.function,
@@ -604,7 +642,7 @@ pub fn init_config(root: &Path) -> Result<PathBuf> {
     if services.is_empty() {
         bail!("no supported source files found under {}", root.display());
     }
-    let out = serde_json::json!({ "services": services, "deps": {} });
+    let out = serde_json::json!({ "services": services, "relatives": {} });
     fs::create_dir_all(path.parent().unwrap())?;
     fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&out)?))?;
     Ok(path)
@@ -1178,38 +1216,46 @@ pub(crate) fn detect_crossings(
     caches: &[FileCache],
     matchers: &[(String, GlobSet)],
     externals: &[crate::externals::ExternalService],
+    contracts: &ContractIndex,
 ) -> Vec<crate::externals::Crossing> {
     use crate::externals::{norm_key, Crossing, Endpoint};
 
-    // every handler this repo publishes, by key
-    let mut local_handlers: BTreeMap<String, Vec<(String, Endpoint)>> = BTreeMap::new();
+    // every boundary endpoint here
+    let mut local: Vec<(Boundary, Endpoint)> = Vec::new();
     for cache in caches {
         let file = path_str(&cache.rel_path);
-        let services = assign(matchers, &file);
         for ann in &cache.annotations {
-            if ann.boundary != Boundary::Serves {
-                continue;
-            }
             let endpoint = Endpoint {
                 key: ann.key.clone(),
                 transport: ann.transport.clone(),
                 function: ann.function.clone(),
                 file: file.clone(),
                 line: ann.line,
-                service: services.first().cloned(),
+                service: None,
+                via: None,
             };
-            for service in services.iter() {
-                local_handlers
-                    .entry(norm_key(&ann.key))
-                    .or_default()
-                    .push((service.clone(), endpoint.clone()));
-            }
-            if services.is_empty() {
-                local_handlers
-                    .entry(norm_key(&ann.key))
-                    .or_default()
-                    .push((String::new(), endpoint.clone()));
-            }
+            local.push((ann.boundary, endpoint));
+        }
+    }
+    let (rpc_provides, rpc_consumes) = contracts.endpoints(caches);
+    local.extend(rpc_provides.into_iter().map(|e| (Boundary::Serves, e)));
+    local.extend(rpc_consumes.into_iter().map(|e| (Boundary::Calls, e)));
+
+    // every handler this repo publishes, by key
+    let mut local_handlers: BTreeMap<String, Vec<(String, Endpoint)>> = BTreeMap::new();
+    for (boundary, endpoint) in &local {
+        if *boundary != Boundary::Serves {
+            continue;
+        }
+        let services = assign(matchers, &endpoint.file);
+        let mut endpoint = endpoint.clone();
+        endpoint.service = services.first().cloned();
+        let owners = if services.is_empty() { vec![String::new()] } else { services };
+        for service in owners {
+            local_handlers
+                .entry(norm_key(&endpoint.key))
+                .or_default()
+                .push((service, endpoint.clone()));
         }
     }
 
@@ -1217,37 +1263,39 @@ pub(crate) fn detect_crossings(
 
     // outbound: a call here, matched against peers first, then against this
     // repo's own handlers
-    for cache in caches {
-        let file = path_str(&cache.rel_path);
-        let services = assign(matchers, &file);
-        for ann in &cache.annotations {
-            if ann.boundary != Boundary::Calls {
+    for (boundary, call) in &local {
+        if *boundary != Boundary::Calls {
+            continue;
+        }
+        let rpc = call.via.is_some();
+        let key = norm_key(&call.key);
+        let from = assign(matchers, &call.file).first().cloned().unwrap_or_default();
+
+        let mut matched = false;
+        for external in externals {
+            let Some(surface) = &external.surface else {
                 continue;
+            };
+            for endpoint in surface.provides.iter().filter(|e| norm_key(&e.key) == key) {
+                matched = true;
+                out.push(Crossing {
+                    key: call.key.clone(),
+                    transport: pick_transport(&call.transport, &endpoint.transport),
+                    from: from.clone(),
+                    to: external.name.clone(),
+                    file: call.file.clone(),
+                    line: call.line,
+                    function: call.function.clone(),
+                    remote: Some(endpoint.clone()),
+                    external: true,
+                    rpc: rpc || endpoint.via.is_some(),
+                });
             }
-            let key = norm_key(&ann.key);
-            let from = services.first().cloned().unwrap_or_default();
+        }
 
-            let mut matched = false;
-            for external in externals {
-                let Some(surface) = &external.surface else {
-                    continue;
-                };
-                for endpoint in surface.provides.iter().filter(|e| norm_key(&e.key) == key) {
-                    matched = true;
-                    out.push(Crossing {
-                        key: ann.key.clone(),
-                        transport: pick_transport(&ann.transport, &endpoint.transport),
-                        from: from.clone(),
-                        to: external.name.clone(),
-                        file: file.clone(),
-                        line: ann.line,
-                        function: ann.function.clone(),
-                        remote: Some(endpoint.clone()),
-                        external: true,
-                    });
-                }
-            }
-
+        // this repo's own rpc handlers are reached through the call graph
+        // already, as `rpc` service edges
+        if !rpc {
             for (service, endpoint) in local_handlers.get(&key).into_iter().flatten() {
                 // a handler in the same service is an internal detail, not a
                 // boundary crossing
@@ -1256,33 +1304,37 @@ pub(crate) fn detect_crossings(
                 }
                 matched = true;
                 out.push(Crossing {
-                    key: ann.key.clone(),
-                    transport: pick_transport(&ann.transport, &endpoint.transport),
+                    key: call.key.clone(),
+                    transport: pick_transport(&call.transport, &endpoint.transport),
                     from: from.clone(),
                     to: service.clone(),
-                    file: file.clone(),
-                    line: ann.line,
-                    function: ann.function.clone(),
+                    file: call.file.clone(),
+                    line: call.line,
+                    function: call.function.clone(),
                     remote: Some(endpoint.clone()),
                     external: false,
+                    rpc: false,
                 });
             }
+        }
 
-            // A call naming a key nobody answers is worth reporting: it is
-            // either a typo at one end, or a peer that was never configured.
-            if !matched {
-                out.push(Crossing {
-                    key: ann.key.clone(),
-                    transport: ann.transport.clone(),
-                    from,
-                    to: String::new(),
-                    file: file.clone(),
-                    line: ann.line,
-                    function: ann.function.clone(),
-                    remote: None,
-                    external: false,
-                });
-            }
+        // A call naming a key nobody answers is worth reporting: it is either
+        // a typo at one end, or a peer that was never configured. An rpc with
+        // no handler anywhere in view is more often a third-party API, which
+        // is not a mistake to report.
+        if !matched && !rpc {
+            out.push(Crossing {
+                key: call.key.clone(),
+                transport: call.transport.clone(),
+                from,
+                to: String::new(),
+                file: call.file.clone(),
+                line: call.line,
+                function: call.function.clone(),
+                remote: None,
+                external: false,
+                rpc: false,
+            });
         }
     }
 
@@ -1305,6 +1357,7 @@ pub(crate) fn detect_crossings(
                     function: endpoint.function.clone(),
                     remote: Some(consumed.clone()),
                     external: true,
+                    rpc: endpoint.via.is_some() || consumed.via.is_some(),
                 });
             }
         }
@@ -1314,6 +1367,88 @@ pub(crate) fn detect_crossings(
         (&a.from, &a.to, &a.key, &a.file, a.line).cmp(&(&b.from, &b.to, &b.key, &b.file, b.line))
     });
     out
+}
+
+// Service edges an rpc makes: the caller's service depends on each handler's,
+// and both depend on the service holding the schema - so a changed `.proto`
+// reaches everything generated from it, in every language.
+fn merge_rpc_edges(
+    edges: &mut Vec<ServiceEdge>,
+    symbol_callers: &mut BTreeMap<String, BTreeSet<String>>,
+    unresolved: &mut Vec<UnresolvedCall>,
+    caches: &[FileCache],
+    matchers: &[(String, GlobSet)],
+    contracts: &ContractIndex,
+) {
+    let services_of = |fi: usize| assign(matchers, &path_str(&caches[fi].rel_path));
+    let symbol = |key: &str, file: &str, line: usize, kind: &str| EdgeSymbol {
+        symbol: key.to_string(),
+        file: file.to_string(),
+        line,
+        via: crate::contracts::VIA.to_string(),
+        kind: kind.to_string(),
+    };
+    let mut linked: BTreeSet<(String, usize)> = BTreeSet::new();
+    for link in &contracts.callers {
+        let c = &contracts.contracts[link.contract];
+        let file = path_str(&caches[link.file].rel_path);
+        let line = caches[link.file].calls[link.call].line;
+        linked.insert((file.clone(), line));
+        for from in services_of(link.file) {
+            for h in contracts.handlers_of(link.contract) {
+                for to in services_of(h.def.0).into_iter().filter(|to| *to != from) {
+                    add_edge_symbol(edges, &from, &to, symbol(&c.key, &file, line, "call"));
+                    symbol_callers
+                        .entry(caches[h.def.0].funcs[h.def.1].name.clone())
+                        .or_default()
+                        .insert(from.clone());
+                }
+            }
+            if let Some((schema, _)) = c.def {
+                for to in services_of(schema).into_iter().filter(|to| *to != from) {
+                    add_edge_symbol(edges, &from, &to, symbol(&c.key, &file, line, "type"));
+                }
+            }
+        }
+    }
+    // a handler depends on its schema just as a caller does
+    for h in &contracts.handlers {
+        let c = &contracts.contracts[h.contract];
+        let Some((schema, _)) = c.def else { continue };
+        let file = path_str(&caches[h.def.0].rel_path);
+        let line = caches[h.def.0].funcs[h.def.1].line;
+        for from in services_of(h.def.0) {
+            for to in services_of(schema).into_iter().filter(|to| *to != from) {
+                add_edge_symbol(edges, &from, &to, symbol(&c.key, &file, line, "type"));
+            }
+        }
+    }
+    // a call the schema accounts for is not an unresolved one
+    unresolved.retain(|u| !linked.contains(&(u.file.clone(), u.line)));
+    edges.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
+}
+
+// one piece of evidence on the edge `from -> to`, creating the edge if needed
+fn add_edge_symbol(edges: &mut Vec<ServiceEdge>, from: &str, to: &str, symbol: EdgeSymbol) {
+    match edges.iter_mut().find(|e| e.from == from && e.to == to) {
+        Some(edge) => {
+            let seen = edge
+                .symbols
+                .iter()
+                .any(|s| s.symbol == symbol.symbol && s.line == symbol.line && s.file == symbol.file);
+            if !seen {
+                edge.symbols.push(symbol);
+            }
+            edge.detected = true;
+        }
+        None => edges.push(ServiceEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            declared: false,
+            detected: true,
+            symbols: vec![symbol],
+        }),
+    }
 }
 
 // One side may name a transport and the other leave it out; prefer whichever
@@ -1333,35 +1468,19 @@ fn merge_crossings(edges: &mut Vec<ServiceEdge>, crossings: &[crate::externals::
         if crossing.from.is_empty() || crossing.to.is_empty() {
             continue;
         }
+        let via = if crossing.rpc {
+            crate::contracts::VIA
+        } else {
+            Via::Annotation.label()
+        };
         let symbol = EdgeSymbol {
             symbol: crossing.key.clone(),
             file: crossing.file.clone(),
             line: crossing.line,
-            via: Via::Annotation.label().to_string(),
+            via: via.to_string(),
             kind: crossing.transport.clone(),
         };
-        match edges
-            .iter_mut()
-            .find(|e| e.from == crossing.from && e.to == crossing.to)
-        {
-            Some(edge) => {
-                if !edge
-                    .symbols
-                    .iter()
-                    .any(|s| s.symbol == symbol.symbol && s.line == symbol.line && s.file == symbol.file)
-                {
-                    edge.symbols.push(symbol);
-                }
-                edge.detected = true;
-            }
-            None => edges.push(ServiceEdge {
-                from: crossing.from.clone(),
-                to: crossing.to.clone(),
-                declared: false,
-                detected: true,
-                symbols: vec![symbol],
-            }),
-        }
+        add_edge_symbol(edges, &crossing.from, &crossing.to, symbol);
     }
     edges.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
 }
@@ -1370,7 +1489,7 @@ fn merge_crossings(edges: &mut Vec<ServiceEdge>, crossings: &[crate::externals::
 fn via_rank(via: &str) -> usize {
     match via {
         "annotation" => 0,
-        "receiver-type" => 1,
+        "receiver-type" | "rpc" => 1,
         "qualifier" => 2,
         "project" => 3,
         "import" => 4,
@@ -1951,6 +2070,131 @@ diff --git a/gone.rs b/gone.rs
         build_matchers(&services).expect("globs")
     }
 
+    const BILLING_PROTO: &str = "syntax = \"proto3\";\n\
+        package acme.billing.v1;\n\
+        message CreateInvoiceRequest { string customer = 1; }\n\
+        message Invoice { string id = 1; }\n\
+        service Billing { rpc CreateInvoice(CreateInvoiceRequest) returns (Invoice); }\n";
+
+    // a typescript client and a go server, with the schema in a third service
+    fn rpc_repo() -> (Vec<FileCache>, Vec<(String, GlobSet)>) {
+        use crate::languages::Language;
+        let caches = vec![
+            fixture(
+                Language::TypeScript,
+                "gateway/charge.ts",
+                "import { BillingClient } from \"../gen/acme/billing/v1/billing_grpc_pb\";\n\
+                 export function charge() {\n\
+                 \x20 const client = new BillingClient(\"addr\");\n\
+                 \x20 client.createInvoice({});\n\
+                 }\n",
+            ),
+            fixture(
+                Language::Go,
+                "billing/server.go",
+                "package billing\n\
+                 import billingv1 \"github.com/acme/gen/acme/billing/v1\"\n\
+                 type server struct{}\n\
+                 func (s *server) CreateInvoice(ctx context.Context, req *billingv1.CreateInvoiceRequest) (*billingv1.Invoice, error) {\n\
+                 \treturn nil, nil\n\
+                 }\n",
+            ),
+            fixture(Language::Proto, "shared/billing.proto", BILLING_PROTO),
+        ];
+        let mut services = BTreeMap::new();
+        for s in ["gateway", "billing", "shared"] {
+            services.insert(s.to_string(), vec![format!("{s}/**")]);
+        }
+        (caches, build_matchers(&services).expect("globs"))
+    }
+
+    // no comment at either end: the schema is what joins them
+    #[test]
+    fn an_rpc_joins_a_client_to_its_handler_across_languages() {
+        let (caches, matchers) = rpc_repo();
+        let contracts = ContractIndex::build(&caches, &[]);
+        let mut edges = Vec::new();
+        let mut callers = BTreeMap::new();
+        let mut unresolved = vec![UnresolvedCall {
+            symbol: "createInvoice".into(),
+            file: "gateway/charge.ts".into(),
+            line: 4,
+            from: "gateway".into(),
+            reason: "no-evidence".into(),
+            candidates: Vec::new(),
+        }];
+        merge_rpc_edges(&mut edges, &mut callers, &mut unresolved, &caches, &matchers, &contracts);
+
+        let found: Vec<(&str, &str, &str)> = edges
+            .iter()
+            .flat_map(|e| e.symbols.iter().map(move |s| (e.from.as_str(), e.to.as_str(), s.kind.as_str())))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                // the handler depends on the schema it implements
+                ("billing", "shared", "type"),
+                ("gateway", "billing", "call"),
+                ("gateway", "shared", "type"),
+            ]
+        );
+        assert!(edges.iter().flat_map(|e| &e.symbols).all(|s| s.via == "rpc"
+            && s.symbol == "acme.billing.v1.Billing/CreateInvoice"));
+        // the go handler's report names the typescript service that calls it
+        assert_eq!(callers["CreateInvoice"], BTreeSet::from(["gateway".to_string()]));
+        // and the call the name-based resolver gave up on is accounted for
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+
+        // a changed schema reaches both ends
+        let impact = impact_closure(&BTreeSet::from(["shared".to_string()]), &edges);
+        let hit: BTreeSet<&str> = impact.iter().map(|i| i.service.as_str()).collect();
+        assert_eq!(hit, BTreeSet::from(["shared", "billing", "gateway"]));
+    }
+
+    // Two repositories: the client here, the server in a peer that published
+    // a surface. The rpc key is the same string at both ends because both were
+    // derived from the same schema.
+    #[test]
+    fn an_rpc_reaches_a_handler_in_a_peer_repository() {
+        let (mut caches, matchers) = rpc_repo();
+        caches.retain(|c| !c.rel_path.starts_with("billing"));
+        let contracts = ContractIndex::build(&caches, &[]);
+        let peer = crate::externals::ExternalService {
+            name: "billing".to_string(),
+            config: Default::default(),
+            source: "surface".to_string(),
+            surface: Some(crate::externals::Surface {
+                schema: crate::externals::SURFACE_SCHEMA.to_string(),
+                name: "billing".to_string(),
+                generated: "t".to_string(),
+                repo: None,
+                languages: vec!["go".to_string()],
+                provides: vec![crate::externals::Endpoint {
+                    key: "acme.billing.v1.Billing/CreateInvoice".to_string(),
+                    transport: "grpc".to_string(),
+                    function: "CreateInvoice".to_string(),
+                    file: "svc/server.go".to_string(),
+                    line: 4,
+                    service: None,
+                    via: Some("rpc".to_string()),
+                }],
+                consumes: Vec::new(),
+                rpc_endpoints: true,
+            }),
+            error: None,
+        };
+        let crossings = detect_crossings(&caches, &matchers, &[peer], &contracts);
+        assert_eq!(crossings.len(), 1, "{crossings:?}");
+        let c = &crossings[0];
+        assert_eq!((c.from.as_str(), c.to.as_str()), ("gateway", "billing"));
+        assert!(c.rpc && c.external);
+        assert_eq!(c.remote.as_ref().unwrap().file, "svc/server.go");
+
+        // with no peer serving it, an rpc is not reported as a dangling key
+        let crossings = detect_crossings(&caches, &matchers, &[], &contracts);
+        assert!(crossings.is_empty(), "{crossings:?}");
+    }
+
     // The monorepo case: two directories in one repo, joined by a key rather
     // than by a call the parser could ever follow.
     #[test]
@@ -1967,7 +2211,7 @@ diff --git a/gone.rs b/gone.rs
                 "// ccc:serves queue audit.events\npub fn record(e: &str) -> usize { e.len() }\n",
             ),
         ];
-        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[], &ContractIndex::default());
         assert_eq!(crossings.len(), 1, "{crossings:?}");
         let c = &crossings[0];
         assert_eq!((c.from.as_str(), c.to.as_str()), ("gateway", "shared"));
@@ -2005,12 +2249,14 @@ diff --git a/gone.rs b/gone.rs
                     file: "svc/charge.go".to_string(),
                     line: 42,
                     service: None,
+                    via: None,
                 }],
                 consumes: Vec::new(),
+                rpc_endpoints: false,
             }),
             error: None,
         };
-        let crossings = detect_crossings(&caches, &two_service_matchers(), &[peer]);
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[peer], &ContractIndex::default());
         assert_eq!(crossings.len(), 1, "{crossings:?}");
         let c = &crossings[0];
         assert_eq!(c.to, "billing");
@@ -2034,7 +2280,7 @@ diff --git a/gone.rs b/gone.rs
                 "package b\n\n// ccc:serves grpc billing.v1.charge\nfunc Charge() {}\n",
             ),
         ];
-        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[], &ContractIndex::default());
         assert_eq!(crossings.len(), 1, "{crossings:?}");
         assert!(crossings[0].remote.is_some());
     }
@@ -2048,7 +2294,7 @@ diff --git a/gone.rs b/gone.rs
             "gateway/main.rs",
             "pub fn a() {\n    // ccc:calls grpc nobody.Answers\n}\n",
         )];
-        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[], &ContractIndex::default());
         assert_eq!(crossings.len(), 1);
         assert!(crossings[0].remote.is_none());
         assert_eq!(crossings[0].to, "");
@@ -2062,7 +2308,7 @@ diff --git a/gone.rs b/gone.rs
             "gateway/main.rs",
             "// ccc:serves queue x.y\npub fn h() {}\n\npub fn a() {\n    // ccc:calls queue x.y\n}\n",
         )];
-        let crossings = detect_crossings(&caches, &two_service_matchers(), &[]);
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[], &ContractIndex::default());
         assert!(crossings.iter().all(|c| c.remote.is_none()), "{crossings:?}");
     }
 
@@ -2093,11 +2339,13 @@ diff --git a/gone.rs b/gone.rs
                     file: "svc/charge.go".to_string(),
                     line: 7,
                     service: None,
+                    via: None,
                 }],
+                rpc_endpoints: false,
             }),
             error: None,
         };
-        let crossings = detect_crossings(&caches, &two_service_matchers(), &[peer]);
+        let crossings = detect_crossings(&caches, &two_service_matchers(), &[peer], &ContractIndex::default());
         assert_eq!(crossings.len(), 1, "{crossings:?}");
         let c = &crossings[0];
         assert_eq!((c.from.as_str(), c.to.as_str()), ("billing", "shared"));
@@ -2112,7 +2360,7 @@ diff --git a/gone.rs b/gone.rs
             "svc/charge.go",
             "package svc\n\n// ccc:serves grpc billing.v1.Charge\nfunc Charge() {}\n\nfunc C() {\n\t// ccc:calls grpc ledger.v1.Write\n}\n",
         )];
-        let surface = crate::externals::Surface::from_caches("billing", "t", &caches);
+        let surface = crate::externals::Surface::from_caches("billing", "t", &caches, &ContractIndex::default());
         assert_eq!(surface.provides.len(), 1);
         assert_eq!(surface.consumes.len(), 1);
         assert_eq!(surface.languages, vec!["go".to_string()]);
@@ -2124,11 +2372,34 @@ diff --git a/gone.rs b/gone.rs
 
     // `deps` may name a peer, but a name cannot be both a local service and a
     // repository somewhere else.
+    // The rename has to be invisible to a map.json written before it, and
+    // loud enough that the file gets fixed.
+    #[test]
+    fn the_old_deps_spelling_is_still_read_and_reported() {
+        let dir = std::env::temp_dir().join(format!("ccc-relatives-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".ccc")).unwrap();
+        let write = |body: &str| fs::write(dir.join(".ccc").join(CONFIG_NAME), body).unwrap();
+
+        write(r#"{"services":{"gateway":["gateway/**"]},"deps":{"gateway":["auth"]}}"#);
+        let cfg = ChangesConfig::load(&dir).expect("legacy map.json still loads");
+        assert_eq!(cfg.relatives["gateway"], vec!["auth".to_string()]);
+
+        // both spellings in one file is a contradiction, not a merge
+        write(r#"{"services":{},"deps":{"a":[]},"relatives":{"a":["b"]}}"#);
+        let err = format!("{:#}", ChangesConfig::load(&dir).expect_err("both keys"));
+        assert!(err.contains("duplicate field"), "{err}");
+
+        write(r#"{"services":{},"relatives":{"gateway":["auth"]}}"#);
+        assert!(ChangesConfig::load(&dir).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_dep_may_name_an_external_but_a_name_cannot_be_both() {
         let cfg: ChangesConfig = serde_json::from_str(
             r#"{"services":{"gateway":["gateway/**"]},
-                "deps":{"gateway":["billing"]},
+                "relatives":{"gateway":["billing"]},
                 "externals":{"billing":{"path":"../billing"}}}"#,
         )
         .expect("parse");
@@ -2136,8 +2407,13 @@ diff --git a/gone.rs b/gone.rs
         assert_eq!(cfg.externals["billing"].path.as_deref(), Some("../billing"));
         // unknown keys stay ignored, so an older ccc reads a newer map.json
         let old: ChangesConfig =
-            serde_json::from_str(r#"{"services":{},"deps":{},"future_field":42}"#).expect("parse");
+            serde_json::from_str(r#"{"services":{},"relatives":{},"future_field":42}"#).expect("parse");
         assert!(old.services.is_empty());
+        // `relatives` was `deps` when it could only name a service in this
+        // repo. A map.json written then still declares what it declared.
+        let legacy: ChangesConfig =
+            serde_json::from_str(r#"{"services":{},"deps":{"gateway":["auth"]}}"#).expect("parse");
+        assert_eq!(legacy.relatives["gateway"], vec!["auth".to_string()]);
     }
 
     #[test]
@@ -2264,7 +2540,7 @@ diff --git a/gone.rs b/gone.rs
         let dir = std::env::temp_dir().join(format!("ccc-legacy-cfg-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".ccc")).unwrap();
-        let cfg = r#"{ "services": { "billing": ["billing/**"] }, "deps": { "billing": [] } }"#;
+        let cfg = r#"{ "services": { "billing": ["billing/**"] }, "relatives": { "billing": [] } }"#;
 
         // every name this file has had still resolves, one at a time
         for old in LEGACY_CONFIG_NAMES {
@@ -2563,7 +2839,7 @@ diff --git a/gone.rs b/gone.rs
     "billing": ["billing/**"],
     "gateway": ["gateway/**"]
   },
-  "deps": { "gateway": ["auth"] }
+  "relatives": { "gateway": ["auth"] }
 }"#;
         let base: &[(&str, &str)] = &[
             (".ccc/map.json", MAP_JSON),

@@ -2,7 +2,7 @@
   "name": "ccc-codecache",
   "displayName": "CodeCaChe (ccc)",
   "description": "Test-coverage, untested-changes and cross-service hints from the ccc static analyser, inline in your editor.",
-  "version": "1.4.2",
+  "version": "1.4.4",
   "publisher": "colwill",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -520,11 +520,11 @@
       "ccc": [
         {
           "id": "ccc.testTriggers",
-          "name": "[CCC] Test Impact"
+          "name": "Tests Triggered"
         },
         {
           "id": "ccc.complexity",
-          "name": "[CCC] Complexity"
+          "name": "Complexity"
         }
       ]
     }

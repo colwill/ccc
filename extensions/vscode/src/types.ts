@@ -186,7 +186,7 @@ export interface ServicesEdge {
 export interface ServicesSection {
   // grouping provenance; the only signal of how services were derived
   source: string;
-  declared_deps: Record<string, string[]>;
+  declared_relatives: Record<string, string[]>;
   services: { name: string; globs: string[]; files: number; funcs: number; paths: string[] }[];
   edges: ServicesEdge[];
   unassigned_files: string[];
