@@ -9,7 +9,9 @@ that call: there is no symbol to resolve, and the code on the other side is not 
 - **`externals` in `.ccc/map.json`** names the peer repositories.
 - **`ccc:serves` / `ccc:calls` comments** name the key both ends agree on.
 
-Matching keys become real edges of the service graph, with a file and line at each end.
+Matching keys become real edges of the service graph, with a file and line at each end. For gRPC
+the key needs no comment at all: the `.proto` schema supplies it
+([gRPC without comments](#grpc-without-comments)).
 
 ## The hints
 
@@ -62,7 +64,7 @@ function happens to appear later.
     "gateway": ["gateway/**"],
     "shared":  ["shared/**"]
   },
-  "deps": { "gateway": ["billing"] },
+  "relatives": { "gateway": ["billing"] },
   "externals": {
     "billing": {
       "repo": "acme/billing",
@@ -71,20 +73,20 @@ function happens to appear later.
     },
     "ledger": {
       "repo": "acme/ledger",
-      "surface": "https://artifacts.internal/ledger/ccc-surface.json",
+      "surface": "https://artifacts.internal/ledger/surface.json",
       "auth": "env:CCC_TOKEN"
     }
   }
 }
 ```
 
-An external is a service like any other: `deps` may name it, and edges end at it. A name cannot be
-both a service and an external — it is either code in this repo or code in another one.
+An external is a service like any other: `relatives` may name it, and edges end at it. 
+A name cannot be both a service and an external — it is either code in this repo or code in another one.
 
 | field | meaning |
 |---|---|
 | `path` | A directory to parse: a sibling checkout, or another corner of a monorepo. Relative paths resolve against the repo root. |
-| `surface` | A file, a directory containing `ccc-surface.json`, or an `http(s)` URL, holding a surface published with `ccc export`. |
+| `surface` | A file, a directory containing `surface.json` (or the older `ccc-surface.json`, still read), or an `http(s)` URL, holding a surface published with `ccc init`. |
 | `auth` | `env:VARIABLE` — the variable holding a bearer token for a private URL. Only this form is accepted; a literal token in a file that belongs in git is a mistake, not a feature. |
 | `repo` | `owner/repo`, for display. |
 | `lang` | The peer's language, for display when no surface is reachable. |
@@ -100,8 +102,8 @@ analysis runs exactly as before.
 ## Publishing a surface
 
 ```sh
-ccc export --name billing --repo acme/billing      # -> .ccc/ccc-surface.json
-ccc export --name billing -o -                     # stdout, for a CI artifact
+ccc init --name billing --repo acme/billing        # -> .ccc/surface.json
+ccc init --name billing -o -                       # stdout, for a CI artifact
 ```
 
 A surface is only what a repository publishes and consumes — no bodies, no call graph, no private
@@ -130,9 +132,9 @@ language, and no access to its source — which is what makes a private peer wor
 place. Publish it from CI on merge:
 
 ```yaml
-- run: ccc export --name billing --repo ${{ github.repository }}
+- run: ccc init --name billing --repo ${{ github.repository }}
 - uses: actions/upload-artifact@v4
-  with: { name: ccc-surface, path: .ccc/ccc-surface.json }
+  with: { name: ccc-surface, path: .ccc/surface.json }
 ```
 
 `consumes` is what lets a repository learn that something out there calls **in** to it — the one
@@ -165,6 +167,57 @@ others depend on.
 The VS Code extension shows a crossing as a CodeLens above the call — `↑ calls billing in
 acme/billing` — and opens the handler when that peer is checked out locally, or says where it lives
 when it is not.
+
+## gRPC without comments
+
+An rpc is the rare call that crosses languages on purpose, and the schema every side was generated from already names it. 
+
+Each rpc is keyed by its wire name, `acme.billing.v1.Billing/CreateInvoice`,
+and code is tied to it by evidence — never by a name alone, because the name changes with the
+generator: `CreateInvoice` in Go, `createInvoice` in TypeScript, `create_invoice` in Rust.
+
+| side | tied when the name matches (case and `_` ignored) and | evidence |
+|---|---|---|
+| handler | a parameter is the rpc's request message | `request-type` |
+| handler | its owning type is named after the service, and the file imports the generated code | `service-owner` |
+| caller | the receiver is the service's generated stub (`BillingClient`, `BillingStub`, …) | `stub-type` |
+| caller | the file imports the generated code (`billing_pb2_grpc`, `…/billing/v1`, `billing_connect`) | `generated-import` |
+
+Where the evidence fits two rpcs equally, nothing is linked. Generated files themselves
+(`*.pb.go`, `*_pb2_grpc.py`, `*_connect.ts`, `*Grpc.cs`, …) are never read as handlers or callers.
+
+What the links feed:
+
+- **`/references`** — looking up an rpc by any spelling (`create_invoice`, `Billing.CreateInvoice`,
+  the wire name) adds an `rpcs` block: the schema, its handlers and its callers, in every language.
+- **Coverage** — a Python test through the stub covers the Go handler (evidence `rpc`).
+- **The call graph** — client → rpc in the schema → handler.
+- **`ccc changes`** — `rpc` edges from each caller's service to each handler's, and from both to the
+  service holding the schema, so a changed `.proto` reaches everything generated from it.
+- **Surfaces** — `ccc init` publishes handlers under `provides` and calls under `consumes`, marked
+  `"via": "rpc"`, so a peer repository links to them exactly as it would to a `ccc:` comment.
+
+### Schemas kept elsewhere
+
+Schemas inside the project are found by the scan. When they live in a shared protos repository, a
+buf module or a vendored directory, name them under `contracts` in `.ccc/map.json`:
+
+```json
+{
+  "contracts": ["../protos/acme/**/*.proto", "third_party/proto"]
+}
+```
+
+Each entry is a file, a directory (every `.proto` under it) or a glob, relative to the repository
+root and free to leave it. Ignore files are not consulted — vendored schemas are routinely ignored,
+and naming them here is the opt-in. A peer checkout named by `path` is linked through its own
+`contracts` and this repository's, since the schema is often in neither.
+
+A surface published before rpc links existed lacks `"rpc_endpoints": true`. A `path` peer whose
+published surface is that old is parsed instead; a `surface`-only peer needs to re-run `ccc init`.
+
+An rpc call that nothing in view serves is not reported as an unanswered key: that is usually a
+third-party API rather than a typo.
 
 ## What this does and does not establish
 

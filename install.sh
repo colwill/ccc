@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# This script is part of ContextCodeCache (ccc) and is distributed under the
+# This script is part of CodeCaChe (ccc) and is distributed under the
 # MIT License (see https://github.com/colwill/ccc/LICENSE).
 #
-# ContextCodeCache (ccc) installer
+# CodeCaChe (ccc) installer
 # Auto-detects OS and architecture, downloads the matching release asset from
 # https://github.com/colwill/ccc, then lets the binary install itself onto
 # your PATH with `ccc install` (defaults to ~/.local/bin; no sudo).
@@ -88,4 +88,4 @@ else
 fi
 
 say "installed $("$BIN" --version)"
-say "try: ccc serve or ccc scan ."
+say "try: ccc run or ccc scan ."

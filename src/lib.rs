@@ -16,9 +16,13 @@ pub mod sast;
 pub mod scan;
 pub mod serve;
 pub mod changes;
+pub mod contracts;
 pub mod telemetry;
 pub mod tokenize;
 
+// `check` is deprecated but still re-exported: deprecating it is what warns
+// callers, and pulling the re-export would break them instead
+#[allow(deprecated)]
 pub use scan::{check, scan, Change, ChangeKind, CheckReport, ScanReport};
 pub use serve::{serve, ServeOptions};
 pub use changes::{init_config, changes, ChangesOptions, ChangesReport};

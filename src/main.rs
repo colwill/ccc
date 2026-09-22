@@ -7,13 +7,15 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     name = "ccc",
-    about = "Scan a project and generate a ContextCodeCache (.ccc) directory",
+    about = "Map a project for agents and CI: serve it, diff it, or write it out",
     version
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+const CACHE_DIR: &str = ".ccc";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputFormat {
@@ -25,19 +27,37 @@ enum OutputFormat {
 
 #[derive(Subcommand)]
 enum Command {
-    // scan a project and (re)generate the `.ccc` directory
+    // parse a project and report what the map holds. Writes nothing without
+    // `--dir`: the map is what every other command reads, and it is built in
+    // memory whether or not a copy is left on disk
     Scan {
         #[arg(default_value = ".")]
         path: PathBuf,
-        #[arg(long)]
+        // Also write the markdown cache. Bare `--dir` writes `<PATH>/.ccc`;
+        // `--dir=DIR` writes there instead, relative to `PATH`. The value needs
+        // `=` so a bare `--dir` cannot swallow the path argument after it.
+        #[arg(long, value_name = "DIR", num_args = 0..=1, require_equals = true,
+              default_missing_value = CACHE_DIR)]
+        dir: Option<PathBuf>,
+        // pre-encode the written markdown into a token stream. Needs `--dir`:
+        // the stream is an encoding of those files, so they have to exist
+        #[arg(long, requires = "dir")]
         tokens: bool,
         #[arg(long, default_value = "o200k_base")]
         encoding: String,
     },
-    // verify `.ccc` is up to date; exit non-zero if it would change
+    // Deprecated, and hidden from `--help` because of it: still callable so the
+    // pipelines built on it keep passing, but no longer offered. It verifies a
+    // written cache, and a written cache is now the exception - `ccc scan`
+    // builds the map in memory and only `--dir` puts a copy on disk for
+    // something outside `ccc` to read.
+    #[command(hide = true)]
     Check {
         #[arg(default_value = ".")]
         path: PathBuf,
+        // the cache to verify, relative to `PATH` (default `.ccc`)
+        #[arg(long, value_name = "DIR", default_value = CACHE_DIR)]
+        dir: PathBuf,
         // output format: `text` (default) or `json` (changed files as an array)
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
@@ -45,11 +65,16 @@ enum Command {
     Tokenize {
         #[arg(default_value = ".")]
         path: PathBuf,
+        // the cache to encode, relative to `PATH` (default `.ccc`)
+        #[arg(long, value_name = "DIR", default_value = CACHE_DIR)]
+        dir: PathBuf,
         #[arg(long, default_value = "o200k_base")]
         encoding: String,
     },
-    // publish what this project serves and calls across process boundaries
-    Export {
+    // Set `.ccc/` up: a starter service map, and the surface other repos
+    // consume. Both come out of one parse of the tree, and both are things a
+    // person edits afterwards rather than output to be regenerated blindly.
+    Init {
         #[arg(default_value = ".")]
         path: PathBuf,
         // name other repos will know this one by; defaults to the directory
@@ -58,8 +83,8 @@ enum Command {
         // "owner/repo", recorded for display on the consuming side
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
-        // where to write it; defaults to `<path>/.ccc/ccc-surface.json`.
-        // `-` writes to stdout.
+        // write the surface here instead of `<path>/.ccc/surface.json`.
+        // `-` writes it to stdout
         #[arg(short, long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
@@ -84,8 +109,11 @@ enum Command {
         // exit non-zero when changed functions have no detected test reference
         #[arg(long)]
         fail_untested: bool,
-        // write a starter `.ccc/map.json` inferred from top-level directories
-        #[arg(long)]
+        // Moved to `ccc init`. Kept hidden only so the old spelling fails with
+        // somewhere to go: unlike the other retired flags this one *did*
+        // something, and quietly accepting it would hand back a change report
+        // where a scaffolded config was asked for
+        #[arg(long, hide = true)]
         init: bool,
         // include uncommitted edits and untracked files in the diff. CI wants
         // the committed view (the default); a local run usually wants this
@@ -106,7 +134,7 @@ enum Command {
         #[arg(long)]
         fail_introduced: bool,
         // also write a single-file HTML view of the report (Tailwind + HTMX
-        // live-query panel against `ccc serve`), e.g. ccc-changes-rust.html
+        // live-query panel against `ccc run`), e.g. ccc-changes-rust.html
         #[arg(long, value_name = "FILE")]
         html: Option<PathBuf>,
         // render --html from an existing changes JSON report instead of running
@@ -150,9 +178,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
     },
-    // serve the code map over HTTP for AI agents: REST endpoints
-    // (/find /references /dependencies ...) + an MCP endpoint at /mcp
-    Serve {
+    // run the code map over HTTP for AI agents and people: REST endpoints
+    // (/find /references /dependencies ...), an MCP endpoint at /mcp, and the
+    // insights UI at /insights. `serve` was the original name; kept so existing
+    // scripts and editor integrations keep working
+    #[command(alias = "serve")]
+    Run {
         #[arg(default_value = ".")]
         path: PathBuf,
         // bind address (loopback by default; think twice before widening)
@@ -167,9 +198,13 @@ enum Command {
         // disable file watching (rescan only via POST /refresh)
         #[arg(long)]
         no_watch: bool,
-        // also serve the human-facing insights UI at /insights
+        // The insights UI is served either way now. Accepted so the scripts and
+        // editor integrations that pass it keep working, but it turns nothing on
         #[arg(long)]
         html: bool,
+        // leave the human-facing UI off and serve the agent endpoints alone
+        #[arg(long, conflicts_with = "html")]
+        no_html: bool,
         #[arg(long)]
         deps: bool,
     },
@@ -211,8 +246,13 @@ enum Command {
     },
     // install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
     Install {
-        // directory to install into (default: ~/.local/bin)
-        #[arg(long)]
+        // Directory to install into, positionally: `ccc install ~/bin`. Every
+        // other command takes its path this way, and naming a destination is
+        // the only argument this one has.
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+        // the same directory as a flag, for anyone already spelling it out
+        #[arg(long, value_name = "DIR", conflicts_with = "path")]
         dir: Option<PathBuf>,
         // overwrite an existing `ccc` in the target directory
         #[arg(long)]
@@ -236,34 +276,50 @@ fn run() -> Result<ExitCode> {
     match cli.command {
         Command::Scan {
             path,
+            dir,
             tokens,
             encoding,
         } => {
             let root = canonical(&path);
-            let report = codecache::scan(&root)?;
+            // a relative `--dir` is relative to what was scanned, so the same
+            // flag means the same place whatever directory it was run from
+            let out = dir.map(|d| root.join(d));
+            let report = codecache::scan(&root, out.as_deref())?;
             let t = report.totals;
-            println!(
-                "Wrote {} ({} files: {} funcs, {} consts, {} refs, {} notes)",
-                report.ccc_dir.display(),
-                report.files,
-                t.funcs,
-                t.consts,
-                t.refs,
-                t.notes
+            let mapped = format!(
+                "{} files: {} funcs, {} consts, {} refs, {} notes",
+                report.files, t.funcs, t.consts, t.refs, t.notes
             );
+            match &report.out_dir {
+                Some(d) => println!("Mapped {mapped}\nWrote {}", d.display()),
+                // nothing was written, and saying so is the difference between
+                // "it worked" and "where did my files go"
+                None => println!("Mapped {mapped} (in memory; --dir writes the markdown)"),
+            }
             if tokens {
-                run_tokenize(&root, &encoding)?;
+                let d = out.as_deref().expect("clap enforces --tokens requires --dir");
+                // exactly what was written above, not a re-read of it
+                run_tokenize(&report.rendered, d, &encoding)?;
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Check { path, format } => {
+        Command::Check { path, dir, format } => {
+            // stderr, so a `--format json` pipeline reading stdout is unaffected
+            eprintln!(
+                "warning: `ccc check` is deprecated and will be removed. It verifies a written \
+                 cache, and `ccc scan` no longer writes one unless `--dir` asks. If you still \
+                 commit a cache, regenerate it with `ccc scan --dir` and let your VCS report the \
+                 diff; everything else reads the map `ccc` builds in memory."
+            );
             // Canonicalize for the check itself (so results match `scan`, which
             // does the same), but keep the original `path` for building the
             // repo-relative cache paths reported in JSON.
-            let report = codecache::check(&canonical(&path))?;
+            let root = canonical(&path);
+            #[allow(deprecated)]
+            let report = codecache::check(&root, &root.join(&dir))?;
             match format {
-                OutputFormat::Text => print_check_text(&report),
-                OutputFormat::Json => print_check_json(&path, &report)?,
+                OutputFormat::Text => print_check_text(&report, &dir),
+                OutputFormat::Json => print_check_json(&path, &dir, &report)?,
             }
             if report.up_to_date {
                 Ok(ExitCode::SUCCESS)
@@ -271,20 +327,36 @@ fn run() -> Result<ExitCode> {
                 Ok(ExitCode::FAILURE)
             }
         }
-        Command::Export {
+        Command::Init {
             path,
             name,
             repo,
             out,
         } => {
             let root = canonical(&path);
+            // The service map first: it is the file a person is meant to edit,
+            // and an existing one is their work, not something to overwrite.
+            match codecache::changes::ChangesConfig::path(&root) {
+                Some(existing) => println!("kept {}", existing.display()),
+                None => {
+                    let cfg = codecache::init_config(&root)?;
+                    println!(
+                        "Wrote {} - edit the service globs, then re-run `ccc changes`",
+                        cfg.display()
+                    );
+                }
+            }
+
             let files = codecache::scan::collect_files(&root)?;
             let caches = codecache::scan::build_caches(&root, &files);
             let label = name.unwrap_or_else(|| path_str(&root));
+            // what the schemas tie this repo to is published with the rest
+            let contracts = codecache::contracts::ContractIndex::for_root(&root, &caches);
             let mut surface = codecache::Surface::from_caches(
                 &label,
                 &codecache::render::now_ts(),
                 &caches,
+                &contracts,
             );
             surface.repo = repo;
             let body = serde_json::to_string_pretty(&surface)?;
@@ -304,20 +376,25 @@ fn run() -> Result<ExitCode> {
                     }
                     std::fs::write(&target, format!("{body}\n"))
                         .with_context(|| format!("writing {}", target.display()))?;
-                    eprintln!(
-                        "{}: {} provided, {} consumed -> {}",
-                        surface.name,
+                    println!(
+                        "Wrote {} - {} provided, {} consumed",
+                        target.display(),
                         surface.provides.len(),
                         surface.consumes.len(),
-                        target.display()
                     );
                 }
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Tokenize { path, encoding } => {
+        Command::Tokenize { path, dir, encoding } => {
             let root = canonical(&path);
-            run_tokenize(&root, &encoding)?;
+            // the map, built here and now - not read back off a `.ccc` that may
+            // not exist and may not match the source if it does
+            let files = codecache::scan::collect_files(&root)?;
+            let caches = codecache::scan::build_caches(&root, &files);
+            let corpus =
+                codecache::scan::render_all(&root, &caches, &codecache::render::now_ts());
+            run_tokenize(&corpus, &root.join(dir), &encoding)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Changes {
@@ -339,9 +416,10 @@ fn run() -> Result<ExitCode> {
             let _ = deps;
             let root = canonical(&path);
             if init {
-                let cfg = codecache::init_config(&root)?;
-                println!("Wrote {} - edit the service globs, then re-run `ccc changes`", cfg.display());
-                return Ok(ExitCode::SUCCESS);
+                return Err(anyhow!(
+                    "`ccc changes --init` has moved to `ccc init`, which writes the same \
+                     `.ccc/map.json` and the surface beside it"
+                ));
             }
 
             // render the HTML view from a saved report, no analysis
@@ -469,22 +547,29 @@ fn run() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Serve {
+        Command::Run {
             path,
             addr,
             port,
             watch_interval,
             no_watch,
             html,
-            deps
+            no_html,
+            deps,
         } => {
             let watch = if no_watch || watch_interval == 0 {
                 None
             } else {
                 Some(std::time::Duration::from_secs(watch_interval))
             };
-            let _ = deps; // discard
-            let opts = codecache::ServeOptions { addr, port, watch, html };
+            // neither flag turns anything on; only `--no-html` turns one off
+            let _ = (deps, html);
+            let opts = codecache::ServeOptions {
+                addr,
+                port,
+                watch,
+                html: !no_html,
+            };
             codecache::serve(&canonical(&path), &opts)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -545,7 +630,7 @@ fn run() -> Result<ExitCode> {
             };
             Ok(if gating > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
         }
-        Command::Install { dir, force } => run_install(dir, force),
+        Command::Install { path, dir, force } => run_install(path.or(dir), force),
     }
 }
 
@@ -795,11 +880,18 @@ fn print_changes_text(r: &ChangesReport) {
     }
 }
 
-fn print_check_text(report: &CheckReport) {
+fn print_check_text(report: &CheckReport, dir: &Path) {
+    let name = path_str(dir);
     if report.up_to_date {
-        println!(".ccc is up to date");
+        println!("{name} is up to date");
     } else {
-        eprintln!(".ccc is out of date; run `ccc scan`:");
+        // name the flag that writes, because a bare `ccc scan` no longer does
+        let flag = if dir == Path::new(CACHE_DIR) {
+            "--dir".to_string()
+        } else {
+            format!("--dir={name}")
+        };
+        eprintln!("{name} is out of date; run `ccc scan {flag}`:");
         for c in &report.changes {
             eprintln!("  {:9} {}", format!("{}:", c.kind.as_str()), c.file);
         }
@@ -809,8 +901,8 @@ fn print_check_text(report: &CheckReport) {
 // Emit `{ root, up_to_date, files[], changes[] }` as one JSON line. `files` is
 // the repo-relative paths of the changed cache entries — ready to hand to
 // another GitHub Action via `fromJSON(...)`.
-fn print_check_json(root: &Path, report: &CheckReport) -> Result<()> {
-    let ccc_rel = rel_join(root, Path::new(".ccc"));
+fn print_check_json(root: &Path, dir: &Path, report: &CheckReport) -> Result<()> {
+    let ccc_rel = rel_join(root, dir);
     let changes: Vec<_> = report
         .changes
         .iter()
@@ -864,10 +956,16 @@ fn html_title(p: &Path) -> String {
         .to_string()
 }
 
-fn run_tokenize(root: &Path, encoding: &str) -> Result<()> {
+// `corpus` is the rendered map to encode and `ccc` where the stream lands -
+// beside the markdown when there is any, on its own when there is not
+fn run_tokenize(
+    corpus: &std::collections::BTreeMap<String, String>,
+    ccc: &Path,
+    encoding: &str,
+) -> Result<()> {
     let enc = Encoding::parse(encoding)
         .ok_or_else(|| anyhow!("unknown encoding '{encoding}' (use o200k_base or cl100k_base)"))?;
-    let report = codecache::tokenize(root, enc)?;
+    let report = codecache::tokenize(corpus, ccc, enc)?;
     println!(
         "Wrote {} ({} tokens from {} files, {} bytes, {} encoding; round-trip verified)",
         report.bin_path.display(),

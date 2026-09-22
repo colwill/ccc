@@ -32,7 +32,10 @@ const MAX_FILE_BYTES: u64 = 2_000_000;
 pub struct ScanReport {
     pub files: usize,
     pub totals: Counts,
-    pub ccc_dir: PathBuf,
+    // The markdown as rendered, kept only when it was written
+    pub rendered: BTreeMap<String, String>,
+    // where the markdown was written
+    pub out_dir: Option<PathBuf>,
 }
 
 pub struct CheckReport {
@@ -159,7 +162,9 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
     })
 }
 
-fn render_all(root: &Path, caches: &[FileCache], ts: &str) -> BTreeMap<String, String> {
+// the whole cache as `name -> markdown`, which is what gets written, compared
+// against, or encoded - never re-derived from whatever is on disk
+pub fn render_all(root: &Path, caches: &[FileCache], ts: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for c in caches {
         map.insert(c.cache_name.clone(), render::render_file(c, ts));
@@ -168,21 +173,30 @@ fn render_all(root: &Path, caches: &[FileCache], ts: &str) -> BTreeMap<String, S
     map
 }
 
-// scan root and (re)write the `.ccc` directory
-pub fn scan(root: &Path) -> Result<ScanReport> {
+// Parse `root` into the map, and write the markdown only when `out` names
+// somewhere to put it. Every other command builds this same map in memory and
+// never reads the files, so writing them is a choice rather than a step.
+pub fn scan(root: &Path, out: Option<&Path>) -> Result<ScanReport> {
     let files = collect_files(root)?;
     let caches = build_caches(root, &files);
-    let ts = render::now_ts();
-    let rendered = render_all(root, &caches, &ts);
 
-    let ccc = root.join(".ccc");
-    fs::create_dir_all(&ccc).with_context(|| format!("creating {}", ccc.display()))?;
-    clear_generated(&ccc)?;
-    crate::tokenize::clear(&ccc)?;
-    for (name, content) in &rendered {
-        let path = ccc.join(name);
-        fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
-    }
+    let (out_dir, rendered) = match out {
+        Some(dir) => {
+            let ts = render::now_ts();
+            let rendered = render_all(root, &caches, &ts);
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            clear_generated(dir)?;
+            crate::tokenize::clear(dir)?;
+            for (name, content) in &rendered {
+                let path = dir.join(name);
+                fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
+            }
+            (Some(dir.to_path_buf()), rendered)
+        }
+        // rendering is only ever done to be written, so without a destination
+        // it is not done at all
+        None => (None, BTreeMap::new()),
+    };
 
     let mut totals = Counts::default();
     for c in &caches {
@@ -191,18 +205,27 @@ pub fn scan(root: &Path) -> Result<ScanReport> {
     Ok(ScanReport {
         files: caches.len(),
         totals,
-        ccc_dir: ccc,
+        rendered,
+        out_dir,
     })
 }
 
-// verify .ccc outputs for CI
-pub fn check(root: &Path) -> Result<CheckReport> {
+// Verify a written cache for CI. Deprecated alongside the `ccc check` command:
+// it answers "does the copy on disk match the source", and since `scan` only
+// writes a copy when `--dir` asks for one, most projects no longer have a copy
+// to be stale. The map every other entry point reads is built from source each
+// time and cannot go out of date.
+#[deprecated(
+    since = "1.4.3",
+    note = "a written cache is now opt-in; regenerate with `scan(root, Some(dir))` and diff it, \
+            or read the in-memory map that every other entry point builds"
+)]
+pub fn check(root: &Path, ccc: &Path) -> Result<CheckReport> {
     let files = collect_files(root)?;
     let caches = build_caches(root, &files);
     let ts = render::now_ts();
     let expected = render_all(root, &caches, &ts);
 
-    let ccc = root.join(".ccc");
     let mut changes = Vec::new();
 
     for (name, content) in &expected {
@@ -224,7 +247,7 @@ pub fn check(root: &Path) -> Result<CheckReport> {
 
     if ccc.is_dir() { // clean stale
         let mut existing = BTreeSet::new();
-        for entry in fs::read_dir(&ccc)? {
+        for entry in fs::read_dir(ccc)? {
             let name = entry?.file_name().to_string_lossy().to_string();
             if name.ends_with(".md") {
                 existing.insert(name);
@@ -256,4 +279,81 @@ fn clear_generated(ccc: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ccc-scan-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).expect("mkdir");
+        fs::write(dir.join("src/lib.rs"), "pub fn charge(c: u64) -> u64 { c }\n").expect("write");
+        dir
+    }
+
+    fn md_names(dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.ends_with(".md"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // The map is the product; the markdown is a copy of it somebody asked for.
+    // A scan that writes nothing has to leave the tree exactly as it found it -
+    // not an empty `.ccc`, not a directory at all.
+    #[test]
+    fn a_scan_without_a_destination_writes_nothing() {
+        let dir = fixture("memory");
+        let report = scan(&dir, None).expect("scan");
+        assert_eq!(report.files, 1);
+        assert_eq!(report.totals.funcs, 1);
+        assert!(report.out_dir.is_none());
+        assert!(!dir.join(".ccc").exists(), "a bare scan created .ccc");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // `check` is deprecated, not gone - it still has to work for the pipelines
+    // that call it, so it is still covered
+    #[allow(deprecated)]
+    #[test]
+    fn a_destination_gets_the_markdown_and_check_reads_it_back() {
+        let dir = fixture("written");
+        for out in [dir.join(".ccc"), dir.join("docs/map")] {
+            let report = scan(&dir, Some(&out)).expect("scan");
+            assert_eq!(report.out_dir.as_deref(), Some(out.as_path()));
+            let names = md_names(&out);
+            assert!(names.contains("CCC.md"), "{names:?}");
+            assert!(names.contains("src-lib.rs.md"), "{names:?}");
+            // and the cache just written is by definition up to date
+            assert!(check(&dir, &out).expect("check").up_to_date);
+        }
+        // a destination that was never written reads as wholly missing rather
+        // than as up to date
+        let report = check(&dir, &dir.join("nowhere")).expect("check");
+        assert!(!report.up_to_date);
+        assert!(report.changes.iter().all(|c| c.kind == ChangeKind::Missing));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // rewriting a destination clears what a previous scan left, so a deleted
+    // source file does not linger as a cache entry nothing maps to
+    #[test]
+    fn rewriting_a_destination_clears_the_last_one() {
+        let dir = fixture("stale");
+        let out = dir.join(".ccc");
+        fs::write(dir.join("src/gone.rs"), "pub fn gone() {}\n").expect("write");
+        scan(&dir, Some(&out)).expect("scan");
+        assert!(md_names(&out).contains("src-gone.rs.md"));
+
+        fs::remove_file(dir.join("src/gone.rs")).expect("rm");
+        scan(&dir, Some(&out)).expect("scan");
+        assert!(!md_names(&out).contains("src-gone.rs.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

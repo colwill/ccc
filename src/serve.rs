@@ -1,10 +1,11 @@
-//! `ccc serve` local REST/MCP endpoints for AI agents.
+//! `ccc run` local REST/MCP endpoints for AI agents, plus the insights UI.
 //!
 //! On startup the whole project is parsed into an in-memory map (the same
 //! model `.ccc` is rendered from); every query answers from memory. A watcher
 //! thread polls a walk fingerprint (path + mtime + size) and swaps a freshly
 //! parsed map in whenever source changes - `/refresh` forces it immediately.
 
+use crate::contracts::ContractIndex;
 use crate::model::{FileCache, Counts};
 use crate::{audit, deps, insights, render, sast, scan};
 use anyhow::Result;
@@ -34,7 +35,7 @@ impl Default for ServeOptions {
             addr: "127.0.0.1".into(),
             port: 6767,
             watch: Some(std::time::Duration::from_secs(2)),
-            html: false,
+            html: true,
         }
     }
 }
@@ -44,6 +45,8 @@ struct MapState {
     root_label: String,
     ts: String,
     caches: Vec<FileCache>,
+    // the rpcs the schemas declare and the code tied to them; rebuilt with `caches`
+    contracts: ContractIndex,
     externals: Vec<ExternalDep>,
     facade: Option<String>,
     watch_secs: Option<u64>,
@@ -80,11 +83,12 @@ impl MapState {
             root: root.to_path_buf(),
             root_label,
             ts: render::now_ts(),
+            contracts: ContractIndex::for_root(root, &caches),
             caches,
             externals: manifest_deps(root),
             facade: cargo_package_name(root),
             watch_secs: None,
-            html: false,
+            html: true,
             // `--port 0` picks one at runtime
             origin: {
                 let d = ServeOptions::default();
@@ -150,6 +154,7 @@ impl MapState {
         let before = self.caches.len();
         let files = scan::collect_files(&self.root)?;
         self.caches = scan::build_caches(&self.root, &files);
+        self.contracts = ContractIndex::for_root(&self.root, &self.caches);
         self.externals = manifest_deps(&self.root);
         self.facade = cargo_package_name(&self.root);
         self.ts = render::now_ts();
@@ -160,6 +165,7 @@ impl MapState {
     // swap in a fresh map (built outside lock by watcher)
     fn swap_in(&mut self, caches: Vec<FileCache>) {
         self.caches = caches;
+        self.contracts = ContractIndex::for_root(&self.root, &self.caches);
         self.externals = manifest_deps(&self.root);
         self.facade = cargo_package_name(&self.root);
         self.ts = render::now_ts();
@@ -1046,14 +1052,71 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     if !exported_as.is_empty() {
         out["exported_as"] = Value::Array(exported_as);
     }
+    let rpcs = rpc_references(map, symbol, qualifier, name);
+    if !rpcs.is_empty() {
+        out["rpcs"] = Value::Array(rpcs);
+    }
     // A miss is an answer, not an error: say what was covered and what to try,
     // so the lookup can be carried on rather than abandoned.
-    if out["counts"]["definitions"] == 0 && total_refs == 0 {
+    if out["counts"]["definitions"] == 0 && total_refs == 0 && out.get("rpcs").is_none() {
         out["miss"] = json!(true);
         out["suggestions"] = Value::Array(nearest_names(map, name, 8));
         add_miss_evidence(map, &mut out, qualifier);
     }
     Ok(out)
+}
+
+// The rpcs a lookup names, with everything tied to each one in any language:
+// the schema that declares it, the handlers that implement it, and the call
+// sites that reach it through a generated stub. Nothing else in `references`
+// crosses a language, because no name does - `CreateInvoice` in Go is
+// `createInvoice` in TypeScript and `create_invoice` in Rust.
+fn rpc_references(map: &MapState, symbol: &str, qualifier: Option<&str>, name: &str) -> Vec<Value> {
+    // the wire form `acme.billing.v1.Billing/CreateInvoice`
+    let (qualifier, name) = match symbol.rsplit_once('/') {
+        Some((q, n)) if !n.is_empty() => (Some(q).filter(|q| !q.is_empty()), n),
+        _ => (qualifier, name),
+    };
+    let idx = &map.contracts;
+    let lang = |fi: usize| map.caches[fi].language.as_str();
+    idx.matching(name, qualifier)
+        .into_iter()
+        .map(|ci| {
+            let c = &idx.contracts[ci];
+            let handlers: Vec<Value> = idx
+                .handlers_of(ci)
+                .map(|h| {
+                    let f = &map.caches[h.def.0].funcs[h.def.1];
+                    json!({
+                        "file": map.path_of(&map.caches[h.def.0]), "line": f.line,
+                        "function": f.name, "owner": f.owner, "language": lang(h.def.0),
+                        "evidence": h.evidence.label(),
+                    })
+                })
+                .collect();
+            let callers: Vec<Value> = idx
+                .callers_of(ci)
+                .take(REFS_CAP)
+                .map(|l| {
+                    let site = &map.caches[l.file].calls[l.call];
+                    json!({
+                        "file": map.path_of(&map.caches[l.file]), "line": site.line,
+                        "name": site.name, "caller": site.caller, "language": lang(l.file),
+                        "test_ctx": site.test_ctx, "evidence": l.evidence.label(),
+                    })
+                })
+                .collect();
+            json!({
+                "key": c.key,
+                "schema": {"file": c.file, "line": c.line, "in_project": c.def.is_some()},
+                "request": c.request,
+                "response": c.response,
+                "handlers": handlers,
+                "callers": callers,
+                "counts": {"handlers": idx.handlers_of(ci).count(), "callers": idx.callers_of(ci).count()},
+            })
+        })
+        .collect()
 }
 
 // package name from a root Cargo.toml, if any - the name code uses to
@@ -1680,7 +1743,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "references",
-            "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions and imports are covered, so a struct used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
+            "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions and imports are covered, so a struct used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. An rpc declared in a `.proto` schema (looked up by any spelling - `CreateInvoice`, `create_invoice`, `Billing.CreateInvoice`, `acme.billing.v1.Billing/CreateInvoice`) also lists its handlers and its callers through generated stubs in every language, each with the evidence that tied it. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
             json!({"symbol": {"type": "string", "description": "exact symbol name, optionally qualified (a::b or a.b)"}}),
             &["symbol"],
         ),
@@ -1798,7 +1861,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "services",
-            "ANSWERS how the parts of this system talk to each other, and which code carries each hop. The service map and the call edges between services, with the call sites behind them. Services come from `.ccc/map.json` when present, top-level directories otherwise. An edge is `declared` if the config lists it, `detected` if calls were resolved across it - both are reported, since a declared HTTP or queue link resolves no calls by design. Edges also cross repositories: `externals` in `.ccc/map.json` names peer repos (a local checkout, or a surface they published with `ccc export`), and `ccc:calls` / `ccc:serves` comments naming the same key join a call here to its handler there, whatever language that repo is written in.",
+            "ANSWERS how the parts of this system talk to each other, and which code carries each hop. The service map and the call edges between services, with the call sites behind them. Services come from `.ccc/map.json` when present, top-level directories otherwise. An edge is `declared` if the config lists it, `detected` if calls were resolved across it - both are reported, since a declared HTTP or queue link resolves no calls by design. Edges also cross repositories: `externals` in `.ccc/map.json` names peer repos (a local checkout, or a surface they published with `ccc init`), and `ccc:calls` / `ccc:serves` comments naming the same key join a call here to its handler there, whatever language that repo is written in.",
             json!({
                 "service": {"type": "string", "description": "drill into one service: its definition plus every edge touching it"},
                 "limit": {"type": "integer", "description": "edges per page (default 25, max 500)"},
@@ -1810,7 +1873,7 @@ fn mcp_tools() -> Value {
         // the one tool aimed at the person rather than the agent
         tool(
             "insights",
-            "CALL THIS WHEN THE USER ASKS TO SEE the analysis - show me the insights, open the dashboard, what does this codebase look like. Opens the human-facing insights UI (`/insights`) in their browser: the flame graph of the static call tree, hot paths, the service map, this branch's changes, test triggers and targets, lints and per-language totals - the same analysis pass the other tools read, laid out to be looked at rather than parsed. Returns the URL and the headline totals, so you can talk about the page while they read it. Needs the server started with `ccc serve --html`; without it the tool says so, and the data is at /insights.json either way.",
+            "CALL THIS WHEN THE USER ASKS TO SEE the analysis - show me the insights, open the dashboard, what does this codebase look like. Opens the human-facing insights UI (`/insights`) in their browser: the flame graph of the static call tree, hot paths, the service map, this branch's changes, test triggers and targets, lints and per-language totals - the same analysis pass the other tools read, laid out to be looked at rather than parsed. Returns the URL and the headline totals, so you can talk about the page while they read it. Served by default; only `ccc run --no-html` turns it off, and then the tool says so and the data is still at /insights.json.",
             json!({}),
             &[],
         ),
@@ -1833,10 +1896,10 @@ fn mcp_initialize(params: &Value) -> Value {
         "capabilities": {"tools": {}, "resources": {}},
         "serverInfo": {
             "name": "ccc",
-            "title": "ContextCodeCache",
+            "title": "CodeCaChe",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Code map of this project (the .ccc ContextCodeCache), held in \
+        "instructions": "Code map of this project (the ccc CodeCaChe), held in \
             memory and refreshed automatically about three seconds after source changes.\n\n\
             1. SEARCHING - always start here. For any question about where something is \
             defined, called, imported or changed in this project, call a ccc tool before \
@@ -2294,6 +2357,31 @@ fn md_references(v: &Value) -> String {
         }
     }
     md_section(&mut out, "references", &hits("references"));
+    for rpc in jarr(v, "rpcs") {
+        let schema = rpc.get("schema").cloned().unwrap_or_default();
+        out.push_str(&format!(
+            "\n## rpc {}\ndeclared at {}:{}{}\n",
+            jstr(&rpc, "key"),
+            jstr(&schema, "file"),
+            jnum(&schema, "line"),
+            if jbool(&schema, "in_project") { "" } else { " (schema from map.json contracts)" },
+        ));
+        let row = |r: &Value, what: &str| {
+            format!(
+                "{}:{} {} [{}, {}]{}\n",
+                jstr(r, "file"),
+                jnum(r, "line"),
+                jstr(r, what),
+                jstr(r, "language"),
+                jstr(r, "evidence"),
+                if jbool(r, "test_ctx") { " (test)" } else { "" },
+            )
+        };
+        let handlers: String = jarr(&rpc, "handlers").iter().map(|h| row(h, "function")).collect();
+        let callers: String = jarr(&rpc, "callers").iter().map(|c| row(c, "caller")).collect();
+        md_section(&mut out, "handlers", &handlers);
+        md_section(&mut out, "callers", &callers);
+    }
     let name_only = hits("name_only_matches");
     if !name_only.is_empty() {
         out.push_str(&format!(
@@ -3193,7 +3281,7 @@ fn q_insights(map: &MapState, open: impl Fn(&str) -> Result<(), String>) -> Resu
     let url = format!("{}/insights", map.origin);
     if !map.html {
         return Err(format!(
-            "the insights UI is disabled; restart the server with `ccc serve --html` to \
+            "the insights UI is disabled by `--no-html`; restart the server as `ccc run` to \
              serve it at {url} (the analysis itself is at {}/insights.json, and the \
              `changes`, `test_triggers`, `test_targets`, `lints`, `hot` and `services` \
              tools read the same pass)",
@@ -3371,7 +3459,7 @@ fn mcp_resources_list(state: &RwLock<MapState>) -> Value {
     let mut resources = vec![json!({
         "uri": "ccc://index",
         "name": "CCC.md",
-        "description": "ContextCodeCache index for the whole project",
+        "description": "CodeCaChe index for the whole project",
         "mimeType": "text/markdown",
     })];
     for c in &map.caches {
@@ -3694,7 +3782,7 @@ const ENDPOINTS: &[&str] = &[
     "GET /health",
     "GET /prompts[?base=<ref>] (which claude/copilot request produced each change)",
     "GET /insights.json[?base=<ref>] (the whole analysis payload)",
-    "GET /insights (human UI over the same data; needs --html)",
+    "GET /insights (human UI over the same data; off with --no-html)",
     "POST /refresh",
     "POST /mcp (Model Context Protocol, JSON-RPC)",
     "GET /fragment/{find,references,dependencies,health} (HTML for HTMX)",
@@ -3799,13 +3887,13 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
             let map = state.read().expect("map lock poisoned");
             ok((*map.analysis(get("base"))).clone())
         }
-        // human-facing insights UI; off unless `ccc serve --html`
+        // human-facing insights UI; on unless `ccc run --no-html`
         ("GET", "/insights") => {
             let map = state.read().expect("map lock poisoned");
             if !map.html {
                 return bad(
                     404,
-                    "insights UI is disabled; restart with `ccc serve --html` \
+                    "insights UI is disabled by `--no-html`; restart with `ccc run` \
                      (the data is at /insights.json either way)",
                 );
             }
@@ -3913,7 +4001,7 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     {
         let map = state.read().expect("map lock poisoned");
         println!(
-            "ccc serve: {} files mapped from {}",
+            "ccc run: {} files mapped from {}",
             map.caches.len(),
             root.display()
         );
@@ -4046,6 +4134,70 @@ mod tests {
 
     // The shapes the fixture above has nothing to say about: imports, a name
     // shared by two owners, type definitions, and a manifest.
+    // The schema lives in a sibling protos checkout, named by `contracts`; the
+    // lookup is spelled the way the rust caller spells it.
+    #[test]
+    fn references_to_an_rpc_list_its_handlers_and_callers_in_every_language() {
+        let base = std::env::temp_dir().join(format!("ccc-serve-rpc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (app, protos) = (base.join("app"), base.join("protos/acme/billing/v1"));
+        fs::create_dir_all(app.join(".ccc")).unwrap();
+        fs::create_dir_all(app.join("svc")).unwrap();
+        fs::create_dir_all(app.join("client/src")).unwrap();
+        fs::create_dir_all(&protos).unwrap();
+        fs::write(
+            protos.join("billing.proto"),
+            "syntax = \"proto3\";\npackage acme.billing.v1;\n\
+             message CreateInvoiceRequest { string customer = 1; }\n\
+             message Invoice { string id = 1; }\n\
+             service Billing { rpc CreateInvoice(CreateInvoiceRequest) returns (Invoice); }\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join(".ccc/map.json"),
+            "{\"contracts\": [\"../protos/**/*.proto\"]}\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join("svc/server.go"),
+            "package svc\nimport billingv1 \"github.com/acme/gen/acme/billing/v1\"\n\
+             type server struct{}\n\
+             func (s *server) CreateInvoice(ctx context.Context, req *billingv1.CreateInvoiceRequest) (*billingv1.Invoice, error) {\n\
+             \treturn nil, nil\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join("client/src/lib.rs"),
+            "use billing::v1::billing_client::BillingClient;\n\
+             pub async fn charge() {\n\
+             \x20   let mut client = BillingClient::connect(\"http://x\").await.unwrap();\n\
+             \x20   client.create_invoice(req).await;\n\
+             }\n",
+        )
+        .unwrap();
+        let map = MapState::build(&app).unwrap();
+        let _ = fs::remove_dir_all(&base);
+
+        for symbol in ["create_invoice", "Billing.CreateInvoice", "acme.billing.v1.Billing/CreateInvoice"] {
+            let v = q_references(&map, symbol).unwrap();
+            let rpcs = v["rpcs"].as_array().unwrap_or_else(|| panic!("{symbol}: {v}"));
+            assert_eq!(rpcs.len(), 1, "{symbol}");
+            let rpc = &rpcs[0];
+            assert_eq!(rpc["key"], "acme.billing.v1.Billing/CreateInvoice");
+            assert_eq!(rpc["schema"]["in_project"], false);
+            assert_eq!(rpc["handlers"][0]["file"], "svc/server.go");
+            assert_eq!(rpc["handlers"][0]["evidence"], "request-type");
+            assert_eq!(rpc["callers"][0]["file"], "client/src/lib.rs");
+            assert_eq!(rpc["callers"][0]["caller"], "charge");
+            assert_eq!(rpc["callers"][0]["language"], "rust");
+            assert!(v.get("miss").is_none(), "{symbol}: an rpc hit is not a miss");
+        }
+        let md = md_references(&q_references(&map, "create_invoice").unwrap());
+        assert!(md.contains("## rpc acme.billing.v1.Billing/CreateInvoice"), "{md}");
+        assert!(md.contains("client/src/lib.rs:4 charge [rust, stub-type]"), "{md}");
+        assert!(q_references(&map, "Ledger.CreateInvoice").unwrap().get("rpcs").is_none());
+    }
+
     fn fixture_imports() -> MapState {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5384,11 +5536,14 @@ mod tests {
     }
 
     #[test]
-    fn insights_ui_is_opt_in() {
+    fn the_insights_ui_is_served_unless_it_is_refused() {
         let state = RwLock::new(fixture());
-        assert_eq!(route(&state, "GET", "/insights", b"").status, 404);
+        // off only when asked: the error names the flag that turned it off and
+        // the JSON way in, which stays open either way
+        state.write().unwrap().html = false;
         let off = route(&state, "GET", "/insights", b"");
-        assert!(json_of(&off)["error"].as_str().unwrap().contains("--html"));
+        assert_eq!(off.status, 404);
+        assert!(json_of(&off)["error"].as_str().unwrap().contains("--no-html"));
         assert_eq!(route(&state, "GET", "/insights.json", b"").status, 200);
 
         state.write().unwrap().html = true;
@@ -5429,9 +5584,10 @@ mod tests {
 
         // disabled UI: the error names the flag and the JSON way in, and no
         // browser is opened for a page that would 404
-        let err = q_insights(&map, |_| panic!("must not open a browser with --html off"))
-            .expect_err("the UI is off in the fixture");
-        assert!(err.contains("ccc serve --html"), "{err}");
+        map.html = false;
+        let err = q_insights(&map, |_| panic!("must not open a browser with --no-html"))
+            .expect_err("the UI was turned off above");
+        assert!(err.contains("--no-html"), "{err}");
         assert!(err.contains("http://127.0.0.1:7788/insights.json"), "{err}");
 
         map.html = true;

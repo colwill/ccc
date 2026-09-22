@@ -1,12 +1,12 @@
 # MCP
 
-`ccc serve` parses the project into an **in-memory copy of the map** and
+`ccc run` parses the project into an **in-memory copy of the map** and
 serves it over local HTTP, so AI agents query the code map directly instead
 of reading `.ccc` files from disk. A file watcher rescans automatically when
 source changes (default: every 2s; `--no-watch` to disable):
 
 ```sh
-ccc serve      # http://127.0.0.1:6767  (MCP endpoint at /mcp -- insights at /insights)
+ccc run        # http://127.0.0.1:6767  (MCP endpoint at /mcp -- insights at /insights)
 ```
 
 ```sh

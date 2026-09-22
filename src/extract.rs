@@ -455,6 +455,11 @@ fn type_scope(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
             let name = type_def_name(node, ctx)?;
             Some((oneline(text(name, ctx.src)), Some("self".to_string())))
         }
+        // rpcs are the service's methods; there is no receiver to call through
+        (Language::Proto, "service") => {
+            let name = type_def_name(node, ctx)?;
+            Some((oneline(text(name, ctx.src)), None))
+        }
         _ => None,
     }
 }
@@ -560,7 +565,7 @@ fn const_eligible(ctx: &Ctx) -> bool {
         | Language::C
         | Language::Zig => !ctx.in_type(),
         Language::CSharp => true,
-        Language::Rust | Language::Go | Language::Odin => true,
+        Language::Rust | Language::Go | Language::Odin | Language::Proto => true,
     }
 }
 
@@ -659,18 +664,11 @@ pub fn normalize_type(raw: &str) -> String {
 // side may be absent: an unannotated JS parameter has no type, a C++
 // `void f(int)` has no name.
 fn param_pairs(node: Node, ctx: &Ctx) -> Vec<(Option<String>, Option<String>)> {
-    let kinds = ctx.lang.param_list_kinds();
-    let mut list = None;
-    let mut stack = vec![node];
-    while let Some(n) = stack.pop() {
-        if kinds.contains(&n.kind()) {
-            list = Some(n);
-            break;
-        }
-        let mut c = n.walk();
-        stack.extend(n.children(&mut c));
+    // an rpc takes exactly one unnamed request message
+    if ctx.lang == Language::Proto {
+        return proto_rpc_types(node, ctx).0.map(|t| (None, Some(t))).into_iter().collect();
     }
-    let Some(list) = list else { return Vec::new() };
+    let Some(list) = param_list(node, ctx) else { return Vec::new() };
     let mut out = Vec::new();
     let mut cursor = list.walk();
     for p in list.named_children(&mut cursor) {
@@ -770,6 +768,8 @@ fn bind_declaration(node: Node, ctx: &mut Ctx) {
     let value = node
         .child_by_field_name("value")
         .or_else(|| node.child_by_field_name("declarator"))
+        // go `x := ...`
+        .or_else(|| node.child_by_field_name("right"))
         .map(name_of);
     let ty = declared.or_else(|| value.as_deref().and_then(constructed_type));
     let Some(ty) = ty else { return };
@@ -823,7 +823,8 @@ fn constructed_type(value: &str) -> Option<String> {
     // `Client::new(...)` / `Client::default()` - the type is the qualifier
     if let Some((head, tail)) = v.split_once("::") {
         let ctor = tail.split(['(', ':']).next().unwrap_or("");
-        if matches!(ctor, "new" | "default" | "from" | "with_capacity" | "create") {
+        // `connect` is how a tonic client is built (`BillingClient::connect(addr)`)
+        if matches!(ctor, "new" | "default" | "from" | "with_capacity" | "create" | "connect") {
             let name = head.rsplit("::").next()?.trim();
             return (!name.is_empty()).then(|| name.to_string());
         }
@@ -845,8 +846,24 @@ fn constructed_type(value: &str) -> Option<String> {
         .next()
         .is_some_and(|c| c.is_ascii_uppercase())
         && head.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':');
-    if is_type_name && (v.contains('{') || v.contains('(')) {
-        return Some(head.rsplit("::").next()?.to_string());
+    // `Client::lookup(..)` is a call through the type, not a literal of it
+    let last = head.rsplit("::").next()?;
+    let last_is_type = last.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    if is_type_name && last_is_type && (v.contains('{') || v.contains('(')) {
+        return Some(last.to_string());
+    }
+    // go's constructor convention: `NewClient(..)` / `billingv1.NewBillingClient(..)`
+    // returns the type it is named after
+    if v.contains('(') {
+        let callee = v.split('(').next()?.trim();
+        let func = callee.rsplit('.').next()?;
+        if let Some(ty) = func.strip_prefix("New") {
+            let is_type = ty.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && ty.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if is_type {
+                return Some(ty.to_string());
+            }
+        }
     }
     None
 }
@@ -868,20 +885,36 @@ fn func_metrics(node: Node, own_name: &str, ctx: &Ctx) -> FuncMetrics {
 }
 
 fn count_params(node: Node, ctx: &Ctx) -> usize {
+    if ctx.lang == Language::Proto {
+        return usize::from(proto_rpc_types(node, ctx).0.is_some());
+    }
+    // `self`/`this` receivers are parameters of the call, not the API
+    param_list(node, ctx).map_or(0, |n| {
+        n.named_children(&mut n.walk())
+            .filter(|c| !c.kind().contains("self"))
+            .count()
+    })
+}
+
+// The node holding a definition's parameters. The `parameters` field names it
+// exactly where the grammar has one; otherwise the first list in source order.
+// A go method has three lists - receiver, parameters, results - and a search
+// that met the results first read the return types as the parameters.
+fn param_list<'a>(node: Node<'a>, ctx: &Ctx) -> Option<Node<'a>> {
     let kinds = ctx.lang.param_list_kinds();
+    if let Some(n) = node.child_by_field_name("parameters").filter(|n| kinds.contains(&n.kind())) {
+        return Some(n);
+    }
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         if kinds.contains(&n.kind()) {
-            // `self`/`this` receivers are parameters of the call, not the API
-            return n
-                .named_children(&mut n.walk())
-                .filter(|c| !c.kind().contains("self"))
-                .count();
+            return Some(n);
         }
-        let mut cursor = n.walk();
-        stack.extend(n.children(&mut cursor));
+        let mut c = n.walk();
+        let children: Vec<Node> = n.children(&mut c).collect();
+        stack.extend(children.into_iter().rev());
     }
-    0
+    None
 }
 
 fn walk_metrics(
@@ -1055,6 +1088,11 @@ fn func_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<(String, Node<'a>)> {
     if let Some(n) = node.child_by_field_name("name") {
         return Some((oneline(text(n, ctx.src)), n));
     }
+    // `rpc Charge(...)` names itself through an `rpc_name` wrapper
+    if ctx.lang == Language::Proto {
+        let n = first_child_of_kind(node, "rpc_name")?;
+        return Some((oneline(text(n, ctx.src)), n));
+    }
     // odin declares by binding a name to a procedure literal
     if ctx.lang == Language::Odin {
         if let Some(n) = first_child_of_kind(node, "identifier") {
@@ -1182,11 +1220,16 @@ fn type_def_name<'a>(node: Node<'a>, ctx: &Ctx) -> Option<Node<'a>> {
         }
         // `Codec :: struct { ... }` - an unlabelled identifier child
         Language::Odin => first_child_of_kind(node, "identifier"),
+        // `message Invoice` -> `message_name`, and likewise for enum/service
+        Language::Proto => first_child_of_kind(node, &format!("{}_name", node.kind())),
         _ => None,
     }
 }
 
 fn func_return(node: Node, ctx: &Ctx) -> Option<String> {
+    if ctx.lang == Language::Proto {
+        return proto_rpc_types(node, ctx).1;
+    }
     // odin wraps the signature in a `procedure` node
     if ctx.lang == Language::Odin {
         let proc = first_child_of_kind(node, "procedure")?;
@@ -1206,6 +1249,20 @@ fn func_return(node: Node, ctx: &Ctx) -> Option<String> {
     } else {
         Some(t)
     }
+}
+
+// (request, response) of an rpc. Neither side is a labelled field, so they
+// are told apart by order: `rpc Watch(stream Req) returns (stream Resp)`
+fn proto_rpc_types(node: Node, ctx: &Ctx) -> (Option<String>, Option<String>) {
+    if node.kind() != "rpc" {
+        return (None, None);
+    }
+    let mut cursor = node.walk();
+    let mut types = node
+        .children(&mut cursor)
+        .filter(|c| c.kind() == "message_or_enum_type")
+        .map(|c| oneline(text(c, ctx.src)));
+    (types.next(), types.next())
 }
 
 fn extract_consts(node: Node, ctx: &mut Ctx) {
@@ -1392,6 +1449,8 @@ fn extract_consts(node: Node, ctx: &mut Ctx) {
                 }
             }
         }
+        // no `const_kinds`, so never reached
+        Language::Proto => {}
     }
 }
 
@@ -1537,6 +1596,23 @@ fn receiver_type(callee: Node, qualifier: Option<&str>, ctx: &Ctx) -> Option<Str
 
 // index one enum variant/enumerator as a const-like definition
 fn extract_variant(node: Node, ctx: &mut Ctx) {
+    // proto: enum_field(identifier) < enum_body < enum(enum_name)
+    if ctx.lang == Language::Proto {
+        let Some(name) = first_child_of_kind(node, "identifier") else {
+            return;
+        };
+        let ty = node
+            .parent()
+            .and_then(|body| body.parent())
+            .and_then(|e| type_def_name(e, ctx))
+            .map(|n| oneline(text(n, ctx.src)));
+        ctx.consts.push(Const {
+            line: pos(name).0,
+            name: oneline(text(name, ctx.src)),
+            ty,
+        });
+        return;
+    }
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
@@ -1681,6 +1757,7 @@ fn is_reexport(lang: Language, stmt: &str) -> bool {
             .trim_start()
             .strip_prefix("pub")
             .is_some_and(|rest| rest.starts_with(['(', ' ', '\t'])),
+        Language::Proto => stmt.split_whitespace().nth(1) == Some("public"),
         _ => false,
     }
 }
@@ -1848,6 +1925,15 @@ fn parse_import(lang: Language, stmt: &str) -> Vec<(String, Vec<String>)> {
                 .collect();
             vec![(module, names)]
         }
+        // `import "google/protobuf/timestamp.proto";` / `import public "a.proto";`
+        // binds no names - the package inside the file does
+        Language::Proto => {
+            let module = stmt.split('"').nth(1).unwrap_or("").to_string();
+            if module.is_empty() {
+                return Vec::new();
+            }
+            vec![(module, Vec::new())]
+        }
         Language::Odin => {
             // `import "core:fmt"` / `import os "core:os"`
             let module = stmt.split('"').nth(1).unwrap_or("").to_string();
@@ -1986,6 +2072,18 @@ fn loose_name(node: Node, ctx: &Ctx) -> Option<(Option<String>, String)> {
                 _ => tail,
             };
             named(Some(q), name)
+        }
+        // proto `google.protobuf.Timestamp` is a flat run of identifiers
+        "message_or_enum_type" => {
+            let mut cursor = node.walk();
+            let parts: Vec<Node> = node.named_children(&mut cursor).collect();
+            let (&last, head) = parts.split_last()?;
+            let qualifier = head
+                .iter()
+                .map(|n| oneline(text(*n, src)))
+                .collect::<Vec<_>>()
+                .join(".");
+            Some(((!qualifier.is_empty()).then_some(qualifier), oneline(text(last, src))))
         }
         // js/ts `a.b`
         "member_expression" => named(
@@ -2923,6 +3021,64 @@ mod tests {
         let get = ex.funcs.iter().find(|f| f.name == "Get").unwrap();
         assert_eq!(get.owner.as_deref(), Some("Box"));
         assert_eq!(get.ret.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn a_proto_schema_indexes_messages_enums_and_rpcs() {
+        let src = "syntax = \"proto3\";\n\
+                   package acme.billing.v1;\n\
+                   import \"google/protobuf/timestamp.proto\";\n\
+                   import public \"acme/common.proto\";\n\
+                   message Invoice {\n\
+                   \x20   google.protobuf.Timestamp created = 1;\n\
+                   \x20   message LineItem { string sku = 1; }\n\
+                   }\n\
+                   enum Status { STATUS_UNSPECIFIED = 0; PAID = 1; }\n\
+                   service Billing {\n\
+                   \x20   // creates one\n\
+                   \x20   rpc Create(CreateRequest) returns (Invoice);\n\
+                   \x20   rpc Watch(stream WatchRequest) returns (stream Invoice);\n\
+                   }\n";
+        let ex = extract(Language::Proto, src).unwrap();
+        let types: Vec<(&str, &str)> =
+            ex.types.iter().map(|t| (t.name.as_str(), t.kind.as_str())).collect();
+        assert_eq!(
+            types,
+            vec![
+                ("Invoice", "struct"),
+                ("LineItem", "struct"),
+                ("Status", "enum"),
+                ("Billing", "interface"),
+            ]
+        );
+        assert_eq!(ex.modules, vec!["acme.billing.v1".to_string()]);
+        let consts: Vec<(&str, Option<&str>)> =
+            ex.consts.iter().map(|c| (c.name.as_str(), c.ty.as_deref())).collect();
+        assert_eq!(consts, vec![("STATUS_UNSPECIFIED", Some("Status")), ("PAID", Some("Status"))]);
+
+        // an rpc is a method of its service, taking its request and returning
+        // its response - `stream` is a modifier, not part of either type
+        let create = ex.funcs.iter().find(|f| f.name == "Create").unwrap();
+        assert_eq!(create.owner.as_deref(), Some("Billing"));
+        assert_eq!(create.param_types, vec!["CreateRequest".to_string()]);
+        assert_eq!(create.ret.as_deref(), Some("Invoice"));
+        assert_eq!(create.comment.as_deref(), Some("creates one"));
+        let watch = ex.funcs.iter().find(|f| f.name == "Watch").unwrap();
+        assert_eq!(watch.param_types, vec!["WatchRequest".to_string()]);
+        assert_eq!(watch.ret.as_deref(), Some("Invoice"));
+
+        let imports: Vec<(&str, bool)> =
+            ex.imports.iter().map(|i| (i.module.as_str(), i.reexport)).collect();
+        assert_eq!(
+            imports,
+            vec![("google/protobuf/timestamp.proto", false), ("acme/common.proto", true)]
+        );
+        // a qualified field type is a use of that type
+        assert!(
+            ex.uses.iter().any(|u| u.name == "Timestamp"
+                && u.qualifier.as_deref() == Some("google.protobuf")),
+            "{:?}", ex.uses.iter().map(|u| &u.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]

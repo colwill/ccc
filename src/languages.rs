@@ -16,6 +16,7 @@ pub enum Language {
     CSharp,
     Zig,
     Odin,
+    Proto,
 }
 
 impl Language {
@@ -31,6 +32,7 @@ impl Language {
         Language::CSharp,
         Language::Zig,
         Language::Odin,
+        Language::Proto,
     ];
 
     pub fn from_path(path: &Path) -> Option<Language> {
@@ -48,6 +50,7 @@ impl Language {
             "cs" | "csx" => Language::CSharp,
             "zig" => Language::Zig,
             "odin" => Language::Odin,
+            "proto" => Language::Proto,
             _ => return None,
         })
     }
@@ -65,6 +68,7 @@ impl Language {
             Language::CSharp => "csharp",
             Language::Zig => "zig",
             Language::Odin => "odin",
+            Language::Proto => "proto",
         }
     }
 
@@ -82,6 +86,7 @@ impl Language {
             Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Language::Zig => tree_sitter_zig::LANGUAGE.into(),
             Language::Odin => tree_sitter_odin::LANGUAGE.into(),
+            Language::Proto => tree_sitter_proto::LANGUAGE.into(),
         }
     }
 
@@ -108,6 +113,8 @@ impl Language {
             ],
             Language::Zig => &["function_declaration"],
             Language::Odin => &["procedure_declaration"],
+            // an rpc is the one callable a schema declares
+            Language::Proto => &["rpc"],
         }
     }
 
@@ -127,6 +134,8 @@ impl Language {
             // the same node; the type case is split back out in `extract`
             Language::Zig => &["variable_declaration"],
             Language::Odin => &["const_declaration"],
+            // enum values arrive through `variant_kinds`; proto has no other constants
+            Language::Proto => &[],
         }
     }
 
@@ -139,6 +148,7 @@ impl Language {
             Language::Go => &["call_expression"],
             Language::Cpp | Language::C | Language::Zig | Language::Odin => &["call_expression"],
             Language::CSharp => &["invocation_expression", "object_creation_expression"],
+            Language::Proto => &[],
         }
     }
 
@@ -156,6 +166,8 @@ impl Language {
             Language::CSharp => &["member_access_expression"],
             Language::Zig => &["field_expression"],
             Language::Odin => &["member_expression"],
+            // `google.protobuf.Timestamp` in a field or rpc signature
+            Language::Proto => &["message_or_enum_type"],
         }
     }
 
@@ -178,6 +190,7 @@ impl Language {
             | Language::Odin => &[],
             // told apart from a struct field by its parent, in `extract`
             Language::Zig => &["container_field"],
+            Language::Proto => &["enum_field"],
         }
     }
 
@@ -194,6 +207,7 @@ impl Language {
             Language::CSharp => &["using_directive"],
             Language::Zig => &["variable_declaration"],
             Language::Odin => &["import_declaration"],
+            Language::Proto => &["import"],
         }
     }
 
@@ -204,7 +218,7 @@ impl Language {
             Language::Python | Language::JavaScript | Language::TypeScript | Language::Tsx
             | Language::Go => &["comment"],
             Language::Cpp | Language::C | Language::CSharp | Language::Zig
-            | Language::Odin => &["comment"],
+            | Language::Odin | Language::Proto => &["comment"],
         }
     }
 
@@ -219,6 +233,7 @@ impl Language {
                 | Language::CSharp
                 | Language::Zig
                 | Language::Odin
+                | Language::Proto
                 | Language::TypeScript
                 | Language::Tsx
         )
@@ -235,6 +250,8 @@ impl Language {
             Language::CSharp => "csharp",
             Language::Zig => "zig",
             Language::Odin => "odin",
+            // generated stubs are what other languages call, never the schema itself
+            Language::Proto => "proto",
         }
     }
 
@@ -242,7 +259,7 @@ impl Language {
     pub fn package_scoped(self) -> bool {
         matches!(
             self,
-            Language::Go | Language::CSharp | Language::C | Language::Cpp
+            Language::Go | Language::CSharp | Language::C | Language::Cpp | Language::Proto
         )
     }
 
@@ -294,6 +311,11 @@ impl Language {
                 ("union_declaration", "union"),
                 ("bit_field_declaration", "struct"),
             ],
+            Language::Proto => &[
+                ("message", "struct"),
+                ("enum", "enum"),
+                ("service", "interface"),
+            ],
             Language::TypeScript | Language::Tsx => &[
                 ("class_declaration", "class"),
                 ("abstract_class_declaration", "class"),
@@ -316,6 +338,7 @@ impl Language {
             Language::Rust => &["mod_item"],
             Language::CSharp => &["namespace_declaration", "file_scoped_namespace_declaration"],
             Language::Odin => &["package_declaration"],
+            Language::Proto => &["package"],
             Language::TypeScript | Language::Tsx => &["internal_module", "module"],
             _ => &[],
         }
@@ -352,6 +375,7 @@ impl Language {
             ],
             Language::Zig => &["for_statement", "while_statement"],
             Language::Odin => &["for_statement"],
+            Language::Proto => &[],
         }
     }
 
@@ -389,6 +413,7 @@ impl Language {
             ],
             Language::Zig => &["if_statement", "if_expression", "switch_case"],
             Language::Odin => &["if_statement", "switch_case"],
+            Language::Proto => &[],
         }
     }
 
@@ -401,6 +426,8 @@ impl Language {
                 &["parameter_list"]
             }
             Language::Zig | Language::Odin => &["parameters"],
+            // an rpc takes its one request type bare; `extract` reads it off the rpc
+            Language::Proto => &[],
         }
     }
 
@@ -481,6 +508,7 @@ impl Language {
                 ("setInterval", "clearInterval"),
                 ("createObjectURL", "revokeObjectURL"),
             ],
+            Language::Proto => &[],
         }
     }
 
@@ -498,6 +526,7 @@ impl Language {
             Language::JavaScript | Language::TypeScript | Language::Tsx => {
                 "monomorphic call site (JIT inlines these)"
             }
+            Language::Proto => "n/a - a schema has no bodies to inline",
         }
     }
 
@@ -549,6 +578,8 @@ impl Language {
             Language::Zig => Some("type"),
             Language::Odin => None,
             Language::JavaScript => None,
+            // the response type sits after `returns` with no field of its own
+            Language::Proto => None,
         }
     }
 }
@@ -600,7 +631,7 @@ mod tests {
     #[test]
     fn every_language_is_reachable_by_extension() {
         let found: BTreeSet<&str> = ["a.rs", "a.py", "a.js", "a.ts", "a.tsx", "a.go", "a.cpp",
-            "a.c", "a.cs", "a.zig", "a.odin"]
+            "a.c", "a.cs", "a.zig", "a.odin", "a.proto"]
             .iter()
             .filter_map(|f| Language::from_path(Path::new(f)))
             .map(Language::as_str)

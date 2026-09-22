@@ -450,7 +450,7 @@ function complexityHover(fn: FileFunc): vscode.MarkdownString {
   const score = fn.complexity_score ?? 0;
   const md = new vscode.MarkdownString();
   md.supportThemeIcons = true;
-  md.appendMarkdown(`**[ccc] Complexity ${score}/10** - _${SCORE_DESCRIPTION[score] ?? ''}_`);
+  md.appendMarkdown(`**Complexity ${score}/10** - _${SCORE_DESCRIPTION[score] ?? ''}_`);
   const parts: string[] = [];
   if (typeof fn.complexity === 'number') parts.push(`${fn.complexity} independent path(s)`);
   if (typeof fn.branches === 'number' && fn.branches > 0) {

@@ -7,6 +7,7 @@
 //! line and measurement it came from so a reader can check it. The UI is
 //! labelled accordingly; do not present these as proofs.
 
+use crate::contracts::ContractIndex;
 use crate::coverage::{self, CoverageIndex, TestSite};
 use crate::extract::TOP_LEVEL;
 use crate::languages::Language;
@@ -101,7 +102,7 @@ impl<'a> Graph<'a> {
 // the callee is imported from it - but at function granularity rather than
 // file granularity. A call with no evidence, or with evidence for more than
 // one target, produces no edge: an absent edge is better than a wrong one.
-fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
+fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex) -> Graph<'a> {
     let mut nodes = Vec::new();
     // (file, name) -> every node with that name, in definition order. A name
     // is not unique within a file: overloads share one, and so does an
@@ -263,6 +264,40 @@ fn build_graph<'a>(caches: &'a [FileCache]) -> Graph<'a> {
                 g.into[to].insert(from);
                 g.call_sites[to] += 1;
             }
+        }
+    }
+
+    // rpc edges, the only ones allowed to cross languages: a call through a
+    // generated stub reaches the rpc in the schema, and the schema reaches
+    // each handler. With the schema outside the project the call reaches the
+    // handlers directly.
+    let pos_of: BTreeMap<NodeId, usize> =
+        g.nodes.iter().copied().enumerate().map(|(p, id)| (id, p)).collect();
+    let node = |(f, k): (usize, usize)| pos_of.get(&NodeId(f, k)).copied();
+    for link in &contracts.callers {
+        let call = &caches[link.file].calls[link.call];
+        let Some(from) = owner_of(link.file, call.caller.as_str(), call.line) else {
+            continue;
+        };
+        let targets: Vec<(usize, usize)> = match contracts.contracts[link.contract].def {
+            Some(def) => vec![def],
+            None => contracts.handlers_of(link.contract).map(|h| h.def).collect(),
+        };
+        for to in targets.into_iter().filter_map(node) {
+            if from != to && g.out[from].insert(to) {
+                g.into[to].insert(from);
+                g.call_sites[to] += 1;
+            }
+        }
+    }
+    for h in &contracts.handlers {
+        let (Some(from), Some(to)) = (contracts.contracts[h.contract].def.and_then(node), node(h.def))
+        else {
+            continue;
+        };
+        if g.out[from].insert(to) {
+            g.into[to].insert(from);
+            g.call_sites[to] += 1;
         }
     }
     g
@@ -737,7 +772,9 @@ fn lints(g: &Graph) -> (Vec<Value>, bool) {
 struct ServiceCtx {
     source: String,
     map: BTreeMap<String, Vec<String>>,
-    deps: BTreeMap<String, Vec<String>>,
+    // declared relationships from `map.json`: service to service, or service
+    // to a peer under `externals`
+    relatives: BTreeMap<String, Vec<String>>,
     // per cache index, the services that own that file
     of_file: Vec<Vec<String>>,
     // the grouping degenerated to one unit per file, so "service" means
@@ -759,7 +796,7 @@ impl ServiceCtx {
     }
 }
 
-fn service_ctx(g: &Graph, root: &Path) -> ServiceCtx {
+fn service_ctx(g: &Graph, root: &Path, contracts: &ContractIndex) -> ServiceCtx {
     let cfg = ChangesConfig::load(root).unwrap_or_default();
     let paths: Vec<String> = g.caches.iter().map(|c| changes::path_str(&c.rel_path)).collect();
     let (mut map, mut source) = if cfg.services.is_empty() {
@@ -813,9 +850,9 @@ fn service_ctx(g: &Graph, root: &Path) -> ServiceCtx {
     // Peer repositories, and the boundary crossings that reach them. Resolving
     // a peer may parse a whole other checkout, so this rides the same memoised
     // analysis as everything else rather than running per request.
-    let externals = crate::externals::resolve_all(root, &cfg.externals);
+    let externals = crate::externals::resolve_all(root, &cfg.externals, &contracts.schemas);
     let crossings = match changes::build_matchers(&map) {
-        Ok(matchers) => changes::detect_crossings(&g.caches, &matchers, &externals),
+        Ok(matchers) => changes::detect_crossings(&g.caches, &matchers, &externals, contracts),
         Err(_) => Vec::new(),
     };
 
@@ -823,7 +860,7 @@ fn service_ctx(g: &Graph, root: &Path) -> ServiceCtx {
         per_file: source.starts_with("one unit per file"),
         source: source.to_string(),
         map,
-        deps: cfg.deps,
+        relatives: cfg.relatives,
         of_file,
         externals,
         crossings,
@@ -902,7 +939,7 @@ fn services(g: &Graph, ctx: &ServiceCtx) -> Value {
     // the same list - flagged `declared` so a reader can tell them from the
     // ones that were detected, exactly as `changes` reports them.
     let mut declared: BTreeSet<(String, String)> = BTreeSet::new();
-    for (from, tos) in &ctx.deps {
+    for (from, tos) in &ctx.relatives {
         for to in tos {
             declared.insert((from.clone(), to.clone()));
             edges.entry((from.clone(), to.clone())).or_default();
@@ -943,7 +980,7 @@ fn services(g: &Graph, ctx: &ServiceCtx) -> Value {
 
     json!({
         "source": ctx.source,
-        "declared_deps": ctx.deps,
+        "declared_relatives": ctx.relatives,
         "externals": ctx.externals.iter().map(|e| e.json()).collect::<Vec<_>>(),
         "external_names": external_names.iter().collect::<Vec<_>>(),
         "crossings": ctx.crossings.iter().map(|c| json!({
@@ -1702,15 +1739,16 @@ pub fn insights(
     base: Option<&str>,
 ) -> Value {
     let started = Instant::now();
-    let g = build_graph(caches);
+    let contracts = ContractIndex::for_root(root, caches);
+    let g = build_graph(caches, &contracts);
     // The coverage relation, built from the same evidence rules as the graph
     // and shared by every section that reports what a test reaches.
     let project_ids: BTreeSet<String> = changes::manifest_identities(root)
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    let cov = coverage::build(caches, &project_ids);
-    let ctx = service_ctx(&g, root);
+    let cov = coverage::build(caches, &project_ids, &contracts);
+    let ctx = service_ctx(&g, root, &contracts);
     let n = g.nodes.len();
 
     // The change set is computed once, here, and every consumer refers to this
@@ -1776,8 +1814,8 @@ pub fn insights(
     // trees are expected to leave their own boundary. Without them every real
     // service gets one - but not when the grouping degenerated to one unit per
     // file, where it would just redraw the same tree once per module.
-    let flame_keys: Vec<String> = if !ctx.deps.is_empty() {
-        ctx.deps.keys().cloned().collect()
+    let flame_keys: Vec<String> = if !ctx.relatives.is_empty() {
+        ctx.relatives.keys().cloned().collect()
     } else if ctx.per_file {
         Vec::new()
     } else {
@@ -1804,7 +1842,7 @@ pub fn insights(
         let (t, cut) = flame(&g, &ctx, &svc_roots, &mut b);
         groups.push(json!({
             "service": key,
-            "declares": ctx.deps.get(key),
+            "declares": ctx.relatives.get(key),
             "roots": t,
             "truncated": cut,
         }));
@@ -1925,6 +1963,44 @@ mod tests {
     use super::*;
     use crate::scan;
 
+    fn graph_of(caches: &[FileCache]) -> Graph<'_> {
+        build_graph(caches, &ContractIndex::build(caches, &[]))
+    }
+
+    // the call graph follows an rpc from a typescript client, through the
+    // schema, into the go handler
+    #[test]
+    fn an_rpc_is_a_path_through_the_schema_between_languages() {
+        let (_dir, caches) = map(
+            "rpc-graph",
+            &[
+                ("proto/billing.proto", "syntax = \"proto3\";\npackage acme.billing.v1;\nmessage CreateInvoiceRequest { string customer = 1; }\nmessage Invoice { string id = 1; }\nservice Billing { rpc CreateInvoice(CreateInvoiceRequest) returns (Invoice); }\n"),
+                ("svc/server.go", "package svc\nimport billingv1 \"github.com/acme/gen/acme/billing/v1\"\ntype server struct{}\nfunc (s *server) CreateInvoice(ctx context.Context, req *billingv1.CreateInvoiceRequest) (*billingv1.Invoice, error) {\n\treturn nil, nil\n}\n"),
+                (
+                    "web/charge.ts",
+                    "import { BillingClient } from \"./gen/billing_grpc_pb\";\n\
+                     export function charge() {\n\
+                     \x20 const client = new BillingClient(\"addr\");\n\
+                     \x20 client.createInvoice({});\n\
+                     }\n",
+                ),
+            ],
+        );
+        let g = graph_of(&caches);
+        let at = |file: &str, name: &str| {
+            (0..g.nodes.len())
+                .find(|&i| g.file(i) == file && g.name(i) == name)
+                .unwrap_or_else(|| panic!("no node {name} in {file}"))
+        };
+        let (client, schema, handler) = (
+            at("web/charge.ts", "charge"),
+            at("proto/billing.proto", "CreateInvoice"),
+            at("svc/server.go", "CreateInvoice"),
+        );
+        assert_eq!(g.out[client], BTreeSet::from([schema]));
+        assert_eq!(g.out[schema], BTreeSet::from([handler]));
+    }
+
     // `tag` must be unique per test: these run in parallel in one process
     fn map(tag: &str, files: &[(&str, &str)]) -> (tempdir::Dir, Vec<FileCache>) {
         let dir = tempdir::Dir::new(tag);
@@ -2027,7 +2103,7 @@ mod tests {
                  fn main() { let _ = charge(1); }\n",
             ),
         ]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let pos = |name: &str| (0..g.nodes.len()).find(|&i| g.name(i) == name).unwrap();
         // same-file edge from `refs`
         assert!(g.out[pos("charge")].contains(&pos("helper")));
@@ -2046,7 +2122,7 @@ mod tests {
             ("src/b.rs", "pub fn run() -> u8 { 2 }\n"),
             ("src/c.rs", "fn go() -> u8 { run() }\n"),
         ]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let go = (0..g.nodes.len()).find(|&i| g.name(i) == "go").unwrap();
         assert!(
             g.out[go].is_empty(),
@@ -2071,7 +2147,7 @@ mod tests {
                 "from mypkg.cli import main\n\nraise SystemExit(main())\n",
             ),
         ]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let pos = |name: &str| (0..g.nodes.len()).find(|&i| g.name(i) == name).unwrap();
         let (top, main) = (pos(TOP_LEVEL), pos("main"));
         assert!(g.is_module(top));
@@ -2096,7 +2172,7 @@ mod tests {
             ("mypkg/__init__.py", "from .cli import run\n\n__all__ = [\"run\"]\n"),
             ("mypkg/app.py", "from mypkg import run\n\n\ndef go():\n    return run()\n"),
         ]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let pos = |name: &str| (0..g.nodes.len()).find(|&i| g.name(i) == name).unwrap();
         assert!(g.out[pos("go")].contains(&pos("run")));
         drop(dir);
@@ -2113,7 +2189,7 @@ mod tests {
                 "from mypkg.cli import run\n\n\ndef go():\n    return run()\n",
             ),
         ]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let cli = caches.iter().position(|c| c.rel_path.ends_with("cli.py")).unwrap();
         let go = (0..g.nodes.len()).find(|&i| g.name(i) == "go").unwrap();
         let called: Vec<String> = g.out[go].iter().map(|&i| g.file(i)).collect();
@@ -2174,7 +2250,7 @@ mod tests {
 
         for pair in PAIRS {
             let (dir, caches) = map(pair.tag, pair.files);
-            let g = build_graph(&caches);
+            let g = graph_of(&caches);
             let pos = |name: &str| {
                 (0..g.nodes.len())
                     .find(|&i| g.name(i) == name)
@@ -2203,7 +2279,7 @@ mod tests {
              \x20   private int Settle(int a) { return a; }\n\
              }\n",
         )]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let at = |line: usize| {
             (0..g.nodes.len())
                 .find(|&i| g.func(i).line == line)
@@ -2236,7 +2312,7 @@ mod tests {
         ];
         for (tag, files) in cases {
             let (dir, caches) = map(tag, files);
-            let g = build_graph(&caches);
+            let g = graph_of(&caches);
             let pos = |name: &str| {
                 (0..g.nodes.len())
                     .find(|&i| g.name(i) == name)
@@ -2259,10 +2335,10 @@ mod tests {
              fn top() -> u8 { mid() }\n\
              fn spin(n: u8) -> u8 { spin(n) }\n",
         )]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let mut budget = FLAME_NODES;
         let roots: Vec<usize> = (0..g.nodes.len()).filter(|&i| g.is_root(i)).collect();
-        let ctx = service_ctx(&g, dir.path());
+        let ctx = service_ctx(&g, dir.path(), &ContractIndex::default());
         let (tree, _) = flame(&g, &ctx, &roots, &mut budget);
         let top = tree.iter().find(|n| n["name"] == "top").unwrap();
         // top -> mid -> leaf, so the root covers three frames
@@ -2296,7 +2372,7 @@ mod tests {
                 "void t() { char* q = (char*)malloc(4); }\n",
             ),
         ]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let (found, _) = lints(&g);
         let rules: Vec<&str> = found.iter().map(|f| f["rule"].as_str().unwrap()).collect();
         assert!(rules.contains(&"leak-risk"), "{rules:?}");
@@ -2365,7 +2441,7 @@ mod tests {
                  \x20   return 1\n",
             ),
         ]);
-        let g = build_graph(&caches);
+        let g = graph_of(&caches);
         let (found, _) = lints(&g);
         let leaks: Vec<&str> = found
             .iter()
@@ -2392,7 +2468,7 @@ mod tests {
                 (
                     ".ccc/map.json",
                     r#"{"services":{"auth":["auth/**"],"billing":["billing/**"],"gateway":["gateway/**"]},
-                        "deps":{"gateway":["auth"]}}"#,
+                        "relatives":{"gateway":["auth"]}}"#,
                 ),
                 ("auth/lib.rs", "pub fn verify(t: &str) -> bool { !t.is_empty() }\n"),
                 ("billing/charge.rs", "pub fn charge(c: u64) -> u64 { c }\n"),
@@ -2405,8 +2481,8 @@ mod tests {
                 ("tools/codegen.rs", "pub fn helper() -> u64 { 7 }\n"),
             ],
         );
-        let g = build_graph(&caches);
-        let s = services(&g, &service_ctx(&g, dir.path()));
+        let g = graph_of(&caches);
+        let s = services(&g, &service_ctx(&g, dir.path(), &ContractIndex::default()));
 
         assert_eq!(s["source"], ".ccc/map.json");
         let names: Vec<&str> = s["services"]
@@ -2446,14 +2522,14 @@ mod tests {
     // one flame graph per service that declares deps, with the frames a call
     // reached by leaving its caller's service marked
     #[test]
-    fn flame_groups_follow_declared_deps_and_mark_crossings() {
+    fn flame_groups_follow_declared_relatives_and_mark_crossings() {
         let (dir, caches) = map(
             "flamedeps",
             &[
                 (
                     ".ccc/map.json",
                     r#"{"services":{"gateway":["gateway/**"],"billing":["billing/**"],"store":["store/**"]},
-                        "deps":{"gateway":["billing"]}}"#,
+                        "relatives":{"gateway":["billing"]}}"#,
                 ),
                 ("store/db.rs", "pub fn fetch(id: u64) -> u64 { id }
 "),
@@ -2529,8 +2605,8 @@ pub fn helper() -> u64 { 1 }
                 ),
             ],
         );
-        let g = build_graph(&caches);
-        let s = services(&g, &service_ctx(&g, dir.path()));
+        let g = graph_of(&caches);
+        let s = services(&g, &service_ctx(&g, dir.path(), &ContractIndex::default()));
         let edge = s["edges"]
             .as_array()
             .unwrap()
@@ -2694,14 +2770,14 @@ pub fn helper() -> u64 { 1 }
 
     // Declaring a dependency in map.json must never stand in for analysing it
     #[test]
-    fn declared_deps_are_still_resolved_not_skipped() {
+    fn declared_relatives_are_still_resolved_not_skipped() {
         let (dir, caches) = map(
             "declared",
             &[
                 (
                     ".ccc/map.json",
                     r#"{"services":{"gateway":["gateway/**"],"auth":["auth/**"],"queue":["queue/**"]},
-                        "deps":{"gateway":["auth","queue"]}}"#,
+                        "relatives":{"gateway":["auth","queue"]}}"#,
                 ),
                 ("auth/lib.rs", "pub fn verify(t: &str) -> bool { !t.is_empty() }\n"),
                 // traversed, declared, and genuinely uncallable
@@ -2712,8 +2788,8 @@ pub fn helper() -> u64 { 1 }
                 ),
             ],
         );
-        let g = build_graph(&caches);
-        let s = services(&g, &service_ctx(&g, dir.path()));
+        let g = graph_of(&caches);
+        let s = services(&g, &service_ctx(&g, dir.path(), &ContractIndex::default()));
         let edge = |to: &str| {
             s["edges"]
                 .as_array()

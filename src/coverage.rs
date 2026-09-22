@@ -1,29 +1,7 @@
 //! Which tests exercise which functions.
-//!
-//! One relation, built once and read by everything that reports coverage:
-//! `changes` (`tested` / `tested_by`), `insights::test_targets` (`covered` /
-//! `covered_by`) and the trigger walk. They used to compute it separately, each
-//! keyed on the callee's bare name, which made a test a "cover" of every
-//! same-named function in the repository - a Rust test calling `std::fs::write`
-//! was reported as covering a TypeScript method called `write`.
-//!
-//! A test reference is tied to a *definition*, addressed by (file, index into
-//! that file's `funcs`), and only when something beyond the name agrees:
-//!
-//!   1. calls whose receiver or qualifier resolves to nothing in the project
-//!      are external - `std::fs::write` covers nothing, it leaves the project;
-//!   2. a candidate must be in the caller's runtime family, so a name shared by
-//!      two ecosystems is never one definition;
-//!   3. what is left needs evidence - the receiver's declared type, the same
-//!      file, an import, or a qualifier naming the defining file - and where
-//!      the evidence fits more than one definition it produces nothing, the
-//!      same discipline `insights::build_graph` applies to call edges.
-//!
-//! Name-only matching survives in one corner: an untyped language calling a
-//! name with exactly one definition in the project. It is labelled as such,
-//! since it is the weakest thing here that is still worth reporting.
 
 use crate::changes::{is_test_fn_name, is_test_path, module_segments, names_project, path_str};
+use crate::contracts::ContractIndex;
 use crate::extract::TOP_LEVEL;
 use crate::model::FileCache;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +43,9 @@ pub enum Evidence {
     Import,
     // a qualifier segment names the defining file's module, type, stem or dir
     Qualifier,
+    // the call goes through an rpc's generated stub, which reaches the rpc and
+    // whatever implements it, in any language - see `contracts`
+    Rpc,
     // untyped language, and the name has exactly one definition in the project
     NameOnly,
 }
@@ -77,6 +58,7 @@ impl Evidence {
             Evidence::SamePackage => "same-package",
             Evidence::Import => "import",
             Evidence::Qualifier => "qualifier",
+            Evidence::Rpc => "rpc",
             Evidence::NameOnly => "name-only",
         }
     }
@@ -270,7 +252,11 @@ fn stem_of(c: &FileCache) -> &str {
 // Build the coverage relation. `project_ids` are the identities declared by
 // manifests (crate name, go module path, npm name), so an integration test
 // calling `mycrate::parse` is understood as staying inside the project.
-pub fn build(caches: &[FileCache], project_ids: &BTreeSet<String>) -> CoverageIndex {
+pub fn build(
+    caches: &[FileCache],
+    project_ids: &BTreeSet<String>,
+    contracts: &ContractIndex,
+) -> CoverageIndex {
     let aliases = file_aliases(caches);
     let imported = imported_names(caches);
     let alias_any: BTreeSet<&str> = aliases.iter().flatten().map(String::as_str).collect();
@@ -319,7 +305,7 @@ pub fn build(caches: &[FileCache], project_ids: &BTreeSet<String>) -> CoverageIn
     for (a, c) in caches.iter().enumerate() {
         let path = path_str(&c.rel_path);
         let file_is_test = is_test_path(&path);
-        for call in &c.calls {
+        for (ci, call) in c.calls.iter().enumerate() {
             if !(file_is_test || call.test_ctx || is_test_fn_name(&call.caller)) {
                 continue;
             }
@@ -327,7 +313,13 @@ pub fn build(caches: &[FileCache], project_ids: &BTreeSet<String>) -> CoverageIn
             if selectable {
                 tests.insert((a, call.caller.as_str()));
             }
-            let matched = resolve(
+            // An rpc is the one call that crosses runtime families on purpose:
+            // a python test through the stub exercises the go handler behind
+            // it. Settled before `resolve`, whose family rule would refuse it.
+            let rpc = contracts
+                .caller(a, ci)
+                .map(|link| (contracts.targets(link.contract), Evidence::Rpc));
+            let matched = rpc.or_else(|| resolve(
                 Site {
                     file: a,
                     name: call.name.as_str(),
@@ -348,7 +340,7 @@ pub fn build(caches: &[FileCache], project_ids: &BTreeSet<String>) -> CoverageIn
                     families: &families,
                     dirs: &dirs,
                 },
-            );
+            ));
             let Some((defs, evidence)) = matched else {
                 external_calls += 1;
                 continue;
@@ -583,7 +575,43 @@ mod tests {
     }
 
     fn index(caches: &[FileCache]) -> CoverageIndex {
-        build(caches, &BTreeSet::new())
+        build(caches, &BTreeSet::new(), &ContractIndex::default())
+    }
+
+    // A python test through the generated stub exercises the go handler behind
+    // it. The family rule refuses that pairing for every other call, and must
+    // keep doing so: without the schema this is two unrelated functions.
+    #[test]
+    fn a_test_through_an_rpc_stub_covers_the_handler_in_another_language() {
+        let (_dir, caches) = caches(
+            "rpc",
+            &[
+                ("proto/billing.proto", "syntax = \"proto3\";\npackage acme.billing.v1;\nmessage CreateInvoiceRequest { string customer = 1; }\nmessage Invoice { string id = 1; }\nservice Billing { rpc CreateInvoice(CreateInvoiceRequest) returns (Invoice); }\n"),
+                ("svc/server.go", "package svc\nimport billingv1 \"github.com/acme/gen/acme/billing/v1\"\ntype server struct{}\nfunc (s *server) CreateInvoice(ctx context.Context, req *billingv1.CreateInvoiceRequest) (*billingv1.Invoice, error) {\n\treturn nil, nil\n}\n"),
+                (
+                    "tests/test_billing.py",
+                    "from acme.billing.v1 import billing_pb2_grpc\n\
+                     def test_create_invoice(channel):\n\
+                     \x20   stub = billing_pb2_grpc.BillingStub(channel)\n\
+                     \x20   stub.CreateInvoice(None)\n",
+                ),
+            ],
+        );
+        let handler = def(&caches, "svc/server.go", "CreateInvoice");
+        let schema = def(&caches, "proto/billing.proto", "CreateInvoice");
+
+        assert!(!index(&caches).is_covered(handler), "no schema index, no link");
+
+        let contracts = ContractIndex::build(&caches, &[]);
+        let cov = build(&caches, &BTreeSet::new(), &contracts);
+        for d in [handler, schema] {
+            let by: Vec<(&str, &str)> = cov
+                .covering(d)
+                .iter()
+                .map(|r| (r.site.name.as_str(), r.evidence.label()))
+                .collect();
+            assert_eq!(by, vec![("test_create_invoice", "rpc")]);
+        }
     }
 
     fn def(caches: &[FileCache], file: &str, name: &str) -> (usize, usize) {
@@ -762,7 +790,7 @@ mod tests {
                 }
             }
         }
-        let cov = build(&caches, &BTreeSet::new());
+        let cov = build(&caches, &BTreeSet::new(), &ContractIndex::default());
 
         let (mut before, mut after, mut total) = (0usize, 0usize, 0usize);
         let mut lost: Vec<(String, String, usize)> = Vec::new();

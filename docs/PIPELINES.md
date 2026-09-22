@@ -7,7 +7,7 @@ maps the diff down to function granularity, groups files into named *services*
 Service A calls Service B and B changes, both land in the test set:
 
 ```sh
-ccc changes --init          # scaffold .ccc/map.json from your top-level dirs
+ccc init                    # scaffold .ccc/map.json from your top-level dirs, and the surface
 ccc changes                 # one line of JSON: services_to_test, edges, untested, ...
 ccc changes --format text   # human-readable summary
 ccc changes --fail-untested # gate: exit 1 when changed functions lack test references

@@ -1,5 +1,5 @@
 //! rendering of `FileCache` entries and the `CCC.md` index to markdown per the
-//! ContextCodeCache spec in PLAN.md
+//! CodeCaChe spec in PLAN.md
 
 use crate::model::{Counts, FileCache};
 use std::fmt::Write as _;
@@ -117,7 +117,7 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
 
     // agent guide kept at the very top in metadata
     let _ = writeln!(out, "---");
-    let _ = writeln!(out, "ContextCodeCache - agent guide");
+    let _ = writeln!(out, "CodeCaChe - agent guide");
     let _ = writeln!(out);
     let _ = writeln!(out, "what:  a GENERATED map of this project's source. Each source file has a");
     let _ = writeln!(out, "        `<module>-<file>.<ext>.md` entry listing the submodules it declares,");
@@ -132,18 +132,20 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     let _ = writeln!(out, "        as APPROXIMATE tiktoken (o200k) ids - for a downstream model that");
     let _ = writeln!(out, "        shares that vocabulary, NOT for Claude (different tokenizer; its API");
     let _ = writeln!(out, "        takes text, not token ids). Feed Claude the markdown above as text.");
-    let _ = writeln!(out, "query: `ccc serve` exposes this map over local HTTP - REST endpoints");
+    let _ = writeln!(out, "query: `ccc run` exposes this map over local HTTP - REST endpoints");
     let _ = writeln!(out, "        (/find /references /dependencies /file /notes) plus an MCP");
     let _ = writeln!(out, "        endpoint at /mcp - so agents can query instead of reading files.");
     let _ = writeln!(out, "keep-fresh: whenever you change tracked source, regenerate with");
-    let _ = writeln!(out, "        `ccc scan` (add `--tokens` to refresh the token stream). CI runs");
-    let _ = writeln!(out, "        `ccc check`, which fails when `.ccc` is out of date.");
+    let _ = writeln!(out, "        `ccc scan --dir` (add `--tokens` to refresh the token stream). A");
+    let _ = writeln!(out, "        bare `ccc scan` only builds the map in memory and writes nothing.");
+    let _ = writeln!(out, "        A stale copy is a diff your VCS will show you; `ccc check`");
+    let _ = writeln!(out, "        still reports one but is deprecated.");
     let _ = writeln!(out, "do-not-edit: never hand-edit files under `.ccc` - they are overwritten on");
     let _ = writeln!(out, "        the next scan. To change the cache, change the source, then rescan.");
     let _ = writeln!(out, "---");
     let _ = writeln!(out);
 
-    let _ = writeln!(out, "# ContextCodeCache ({}) UTC", ts);
+    let _ = writeln!(out, "# CodeCaChe ({}) UTC", ts);
     let _ = writeln!(out, "### project: {}", root_label);
     let _ = writeln!(
         out,
@@ -156,7 +158,7 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
         totals.mods,
         totals.reexports
     );
-    let _ = writeln!(out, "### regenerate: `ccc scan`");
+    let _ = writeln!(out, "### regenerate: `ccc scan --dir`");
     let _ = writeln!(out, "### files");
     for c in caches {
         let n = c.counts();
