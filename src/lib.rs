@@ -10,6 +10,7 @@ pub mod insights;
 pub mod languages;
 pub mod model;
 pub mod naming;
+pub mod pr_summary;
 pub mod prompts;
 pub mod render;
 pub mod sast;

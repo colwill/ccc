@@ -169,6 +169,12 @@ enum Command {
         base: Option<String>,
         #[arg(long, value_name = "NAME")]
         agent: Option<String>,
+        // restrict to exactly one session id: the caller's own, self-reported
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        // self-reported model name; only takes effect paired with --session
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
         #[arg(long, value_name = "DAYS")]
         since: Option<u64>,
         #[arg(long)]
@@ -177,6 +183,24 @@ enum Command {
         record: bool,
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
+    },
+    // markdown a PR description can be built from 
+    // the same base/agent/session/model filters apply
+    PrSummary {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
+        #[arg(long, value_name = "DAYS")]
+        since: Option<u64>,
+        #[arg(long)]
+        worktree: bool,
     },
     // run the code map over HTTP for AI agents and people: REST endpoints
     // (/find /references /dependencies ...), an MCP endpoint at /mcp, and the
@@ -522,16 +546,15 @@ fn run() -> Result<ExitCode> {
             path,
             base,
             agent,
+            session,
+            model,
             since,
             worktree,
             record,
             format,
         } => {
-            if let Some(a) = agent.as_deref() {
-                if !matches!(a, "claude" | "copilot") {
-                    return Err(anyhow!("--agent wants `claude` or `copilot`, got '{a}'"));
-                }
-            }
+            validate_agent(agent.as_deref())?;
+            validate_model_pairing(&model, &session)?;
             let root = canonical(&path);
             let opts = codecache::PromptsOptions {
                 base,
@@ -539,12 +562,39 @@ fn run() -> Result<ExitCode> {
                 agent,
                 since_days: since,
                 record,
+                session,
+                model,
             };
             let report = codecache::prompts(&root, &path_str(&path), &opts)?;
             match format {
                 OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
                 OutputFormat::Text => print_prompts_text(&report),
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::PrSummary {
+            path,
+            base,
+            agent,
+            session,
+            model,
+            since,
+            worktree,
+        } => {
+            validate_agent(agent.as_deref())?;
+            validate_model_pairing(&model, &session)?;
+            let root = canonical(&path);
+            let opts = codecache::PromptsOptions {
+                base,
+                worktree,
+                agent,
+                since_days: since,
+                record: false,
+                session,
+                model,
+            };
+            let report = codecache::prompts(&root, &path_str(&path), &opts)?;
+            print!("{}", codecache::pr_summary::markdown(&report, None, 0));
             Ok(ExitCode::SUCCESS)
         }
         Command::Run {
@@ -632,6 +682,23 @@ fn run() -> Result<ExitCode> {
         }
         Command::Install { path, dir, force } => run_install(path.or(dir), force),
     }
+}
+
+// shared by `prompts` and `pr-summary`
+fn validate_agent(agent: Option<&str>) -> Result<()> {
+    match agent {
+        Some(a) if !matches!(a, "claude" | "copilot") => {
+            Err(anyhow!("--agent wants `claude` or `copilot`, got '{a}'"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_model_pairing(model: &Option<String>, session: &Option<String>) -> Result<()> {
+    if model.is_some() && session.is_none() {
+        return Err(anyhow!("--model only takes effect paired with --session"));
+    }
+    Ok(())
 }
 
 // `--fail-introduced` shared by `changes` and `deps` when the
@@ -773,7 +840,11 @@ fn print_prompts_text(r: &codecache::PromptsReport) {
             0 => " (changed nothing)".to_string(),
             n => format!(" ({n} edit(s))"),
         };
-        println!("#{} {} {}{edits}: {}", i + 1, t.agent, t.ts, t.prompt);
+        let agent = match &t.model {
+            Some(m) => format!("{} [{m}]", t.agent),
+            None => t.agent.clone(),
+        };
+        println!("#{} {} {}{edits}: {}", i + 1, agent, t.ts, t.prompt);
     }
     for (path, refs) in &r.attributed {
         // the evidence is part of the answer, not a footnote: a temporal match

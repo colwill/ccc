@@ -1,4 +1,4 @@
-name: Release ContextCodeCache
+name: Release CodeCaChe
 
 # Builds the single-binary release assets that install.sh downloads, one per
 # platform, named `ccc-<os>-<arch>` (see install.sh):
