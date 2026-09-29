@@ -34,6 +34,12 @@ const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 // enough that a report full of them still fits an agent's context
 const PROMPT_CAP: usize = 500;
 
+// proposed/agreed text kept per edit
+const EDIT_TEXT_CAP: usize = 2000;
+
+// current state - read alongside a pinned edit
+const MAX_AGREED_LINES: usize = 60;
+
 // how far after a request a file write may still be credited to it. beyond
 // this the request is simply not the explanation, and saying so is the point
 const MAX_TEMPORAL_GAP_SECS: i64 = 4 * 3600;
@@ -53,6 +59,10 @@ pub struct PromptsOptions {
     pub since_days: Option<u64>,
     // append the collected turns to `.ccc/prompts.jsonl`
     pub record: bool,
+    // restrict to exactly one session id
+    pub session: Option<String>,
+    // self-reported model name
+    pub model: Option<String>,
 }
 
 // one file an agent wrote in service of a request
@@ -67,6 +77,9 @@ pub struct TurnEdit {
     // the file as it stands today
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
+    // what the tool actually wrote
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<String>,
 }
 
 // one request sent to a model, and the edits it produced
@@ -77,6 +90,9 @@ pub struct Turn {
     // claude | copilot
     pub agent: String,
     pub session: String,
+    // the model that answered
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     // RFC3339, when the request was sent
     pub ts: String,
     // git branch recorded at the time, where the source knows it
@@ -107,6 +123,11 @@ pub struct PromptRef {
     // can honestly claim
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<[usize; 2]>,
+    // only for `content-match`, where a span is known
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agreed: Option<String>,
 }
 
 impl PromptRef {
@@ -436,7 +457,18 @@ fn anchor_of(text: &str) -> Option<String> {
         .filter(|l| l.chars().count() >= 12)
 }
 
-// the files one `tool_use` block wrote, with an anchor for each
+// one `TurnEdit` for a block of text a tool wrote
+fn edit_of(path: &str, tool: &str, text: Option<&str>) -> TurnEdit {
+    let text = text.filter(|t| !t.trim().is_empty());
+    TurnEdit {
+        path: path.to_string(),
+        tool: tool.to_string(),
+        anchor: text.and_then(anchor_of),
+        proposed: text.map(|t| truncate(t, EDIT_TEXT_CAP)),
+    }
+}
+
+// the files one `tool_use` block wrote
 // ccc:skip
 fn edits_of(block: &Value, root: &Path) -> Vec<TurnEdit> {
     let name = block.get("name").and_then(|n| n.as_str()).unwrap_or_default();
@@ -454,32 +486,27 @@ fn edits_of(block: &Value, root: &Path) -> Vec<TurnEdit> {
         return Vec::new();
     };
     let path = relativise(raw_path, root);
-    let anchor = match name {
-        "Write" => input.get("content").and_then(|c| c.as_str()).and_then(anchor_of),
-        "NotebookEdit" => input
-            .get("new_source")
-            .and_then(|c| c.as_str())
-            .and_then(anchor_of),
-        "MultiEdit" => input
-            .get("edits")
-            .and_then(|e| e.as_array())
-            .and_then(|edits| {
-                edits
-                    .iter()
-                    .filter_map(|e| e.get("new_string").and_then(|s| s.as_str()))
-                    .filter_map(anchor_of)
-                    .max_by_key(|a| a.chars().count())
-            }),
-        _ => input
-            .get("new_string")
-            .and_then(|c| c.as_str())
-            .and_then(anchor_of),
-    };
-    vec![TurnEdit {
-        path,
-        tool: name.to_string(),
-        anchor,
-    }]
+    match name {
+        "Write" => vec![edit_of(&path, name, input.get("content").and_then(|c| c.as_str()))],
+        "NotebookEdit" => vec![edit_of(&path, name, input.get("new_source").and_then(|c| c.as_str()))],
+        "MultiEdit" => {
+            let subs: Vec<TurnEdit> = input
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("new_string").and_then(|s| s.as_str()))
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| edit_of(&path, name, Some(t)))
+                .collect();
+            if subs.is_empty() {
+                vec![edit_of(&path, name, None)]
+            } else {
+                subs
+            }
+        }
+        _ => vec![edit_of(&path, name, input.get("new_string").and_then(|c| c.as_str()))],
+    }
 }
 
 // paths inside the project are reported the way every other ccc report reports
@@ -545,6 +572,7 @@ fn parse_claude(path: &Path, root: &Path) -> Vec<Turn> {
             id: format!("claude:{session}:{uuid}"),
             agent: "claude".into(),
             session: session.clone(),
+            model: None,
             epoch: epoch_of(&ts),
             ts,
             branch: rec
@@ -557,24 +585,30 @@ fn parse_claude(path: &Path, root: &Path) -> Vec<Turn> {
         });
     }
 
-    // then credit each edit to the request that led to it
+    // then credit each edit - and the model that produced it - to the
+    // request that led to it
     for rec in &records {
         if rec.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
-        let Some(blocks) = rec
+        let model = rec
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str());
+        let edits: Vec<TurnEdit> = rec
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_array())
-        else {
-            continue;
-        };
-        let edits: Vec<TurnEdit> = blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-            .flat_map(|b| edits_of(b, root))
-            .collect();
-        if edits.is_empty() {
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                    .flat_map(|b| edits_of(b, root))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // a purely conversational reply still names the model that gave it
+        if edits.is_empty() && model.is_none() {
             continue;
         }
         let Some(idx) = walk_to_prompt(rec, &records, &by_uuid) else {
@@ -582,6 +616,9 @@ fn parse_claude(path: &Path, root: &Path) -> Vec<Turn> {
         };
         if let Some(turn) = at.get(&idx).and_then(|&slot| out.get_mut(slot)) {
             turn.edits.extend(edits);
+            if turn.model.is_none() {
+                turn.model = model.map(str::to_string);
+            }
         }
     }
 
@@ -682,6 +719,8 @@ fn parse_copilot(path: &Path) -> Vec<Turn> {
                 id: format!("copilot:{session}:{id}"),
                 agent: "copilot".into(),
                 session: session.clone(),
+                // copilot has to be different
+                model: None,
                 ts,
                 epoch: ms / 1000,
                 branch: None,
@@ -692,6 +731,21 @@ fn parse_copilot(path: &Path) -> Vec<Turn> {
             })
         })
         .collect()
+}
+
+// narrow to the caller's own session
+fn apply_session(turns: &mut Vec<Turn>, opts: &PromptsOptions) {
+    let Some(session) = opts.session.as_deref() else {
+        return;
+    };
+    turns.retain(|t| t.session == session);
+    if let Some(model) = opts.model.as_deref() {
+        for t in turns.iter_mut() {
+            if t.model.is_none() {
+                t.model = Some(model.to_string());
+            }
+        }
+    }
 }
 
 // collection
@@ -729,6 +783,7 @@ pub fn collect(root: &Path, opts: &PromptsOptions) -> (Vec<Turn>, Vec<SourceStat
         let cutoff = chrono::Utc::now().timestamp() - (days as i64) * 86_400;
         turns.retain(|t| t.epoch >= cutoff);
     }
+    apply_session(&mut turns, opts);
     turns.sort_by(|a, b| (a.epoch, &a.id).cmp(&(b.epoch, &b.id)));
     turns.dedup_by(|a, b| a.id == b.id);
     (turns, sources)
@@ -736,7 +791,13 @@ pub fn collect(root: &Path, opts: &PromptsOptions) -> (Vec<Turn>, Vec<SourceStat
 
 // attribution
 // ccc:skip
-fn as_ref_of(turn: &Turn, evidence: &str, lines: Option<[usize; 2]>) -> PromptRef {
+fn as_ref_of(
+    turn: &Turn,
+    evidence: &str,
+    lines: Option<[usize; 2]>,
+    proposed: Option<String>,
+    agreed: Option<String>,
+) -> PromptRef {
     PromptRef {
         turn: turn.id.clone(),
         agent: turn.agent.clone(),
@@ -744,6 +805,8 @@ fn as_ref_of(turn: &Turn, evidence: &str, lines: Option<[usize; 2]>) -> PromptRe
         prompt: turn.prompt.clone(),
         evidence: evidence.to_string(),
         lines,
+        proposed,
+        agreed,
     }
 }
 
@@ -753,6 +816,19 @@ fn line_of(text: &str, anchor: &str) -> Option<usize> {
     text.lines()
         .position(|l| l.trim() == anchor || l.contains(anchor))
         .map(|i| i + 1)
+}
+
+// what is at `from_line` onward
+// ccc:skip
+fn agreed_text(text: &str, from_line: usize, proposed: Option<&str>) -> Option<String> {
+    let want = proposed
+        .map(|p| p.lines().count().max(1))
+        .unwrap_or(1)
+        .min(MAX_AGREED_LINES);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = from_line.checked_sub(1)?;
+    let end = (start + want).min(lines.len());
+    (start < end).then(|| truncate(&lines[start..end].join("\n"), EDIT_TEXT_CAP))
 }
 
 // Tie each changed file to the requests that produced it.
@@ -776,20 +852,26 @@ pub fn attribute(
                 continue;
             };
             // is what it wrote still there, inside something that changed?
+            // when it is, also read what is at that span today
+            let mut agreed = None;
             let pinned = edit.anchor.as_ref().and_then(|a| {
                 let text = fs::read_to_string(root.join(&edit.path)).ok()?;
                 let line = line_of(&text, a)?;
-                ranges
+                let span = ranges
                     .iter()
                     .find(|&&(s, e)| s <= line && line <= e)
                     // a brand new file is one open-ended range: pinning inside
                     // it would claim a precision the range does not have
                     .filter(|&&(_, e)| e != usize::MAX)
-                    .map(|&(s, e)| [s, e])
+                    .map(|&(s, e)| [s, e]);
+                if span.is_some() {
+                    agreed = agreed_text(&text, line, edit.proposed.as_deref());
+                }
+                span
             });
             let r = match pinned {
-                Some(span) => as_ref_of(turn, "content-match", Some(span)),
-                None => as_ref_of(turn, "tool-edit", None),
+                Some(span) => as_ref_of(turn, "content-match", Some(span), edit.proposed.clone(), agreed),
+                None => as_ref_of(turn, "tool-edit", None, None, None),
             };
             by_file.entry(edit.path.clone()).or_default().push(r);
         }
@@ -808,7 +890,7 @@ pub fn attribute(
             by_file
                 .entry(path.clone())
                 .or_default()
-                .push(as_ref_of(turn, "temporal", None));
+                .push(as_ref_of(turn, "temporal", None, None, None));
         }
     }
 
@@ -997,6 +1079,14 @@ mod tests {
         })
     }
 
+    fn assistant_with_model(uuid: &str, parent: &str, ts: &str, model: &str, blocks: Value) -> Value {
+        serde_json::json!({
+            "type": "assistant", "uuid": uuid, "parentUuid": parent, "timestamp": ts,
+            "cwd": "/proj",
+            "message": {"model": model, "content": blocks},
+        })
+    }
+
     fn tool_use(name: &str, input: Value) -> Value {
         serde_json::json!({"type": "tool_use", "id": "t1", "name": name, "input": input})
     }
@@ -1033,6 +1123,57 @@ mod tests {
         assert_eq!(turns[0].edits[0].path, "src/pay.rs", "paths are repo-relative");
         assert_eq!(turns[0].edits[0].tool, "Edit");
         assert!(turns[0].edits[0].anchor.is_some());
+    }
+
+    #[test]
+    fn a_turn_carries_the_model_that_answered_it_even_with_no_edit() {
+        let dir = tempdir::Dir::new("prompt-model");
+        let file = write(
+            dir.path(),
+            "s1.jsonl",
+            &[
+                user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("what does serve do?")),
+                assistant_with_model(
+                    "a1", "u1", "2026-08-20T10:00:01Z", "claude-sonnet-5",
+                    serde_json::json!([{"type": "text", "text": "it runs the http server"}]),
+                ),
+            ],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].edits.is_empty(), "a question is still an answer");
+        assert_eq!(turns[0].model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn multi_edit_keeps_one_turn_edit_per_sub_edit_rather_than_one_collapsed_anchor() {
+        let dir = tempdir::Dir::new("prompt-multiedit");
+        let file = write(
+            dir.path(),
+            "s1.jsonl",
+            &[
+                user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("rename both helpers")),
+                assistant("a1", "u1", "2026-08-20T10:00:01Z", serde_json::json!([
+                    tool_use("MultiEdit", serde_json::json!({
+                        "file_path": "/proj/src/lib.rs",
+                        "edits": [
+                            {"old_string": "fn old_a() {}", "new_string": "fn renamed_a() { /* first hunk */ }"},
+                            {"old_string": "fn old_b() {}", "new_string": "fn renamed_b() { /* second hunk */ }"},
+                        ],
+                    }))
+                ])),
+            ],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].edits.len(), 2, "one TurnEdit per sub-edit, not one collapsed anchor: {:#?}", turns[0].edits);
+        let anchors: Vec<&str> = turns[0].edits.iter().filter_map(|e| e.anchor.as_deref()).collect();
+        assert!(anchors.iter().any(|a| a.contains("renamed_a")));
+        assert!(anchors.iter().any(|a| a.contains("renamed_b")));
+        assert!(
+            turns[0].edits.iter().all(|e| e.proposed.is_some()),
+            "each sub-edit keeps the text it wrote, not just an anchor"
+        );
     }
 
     #[test]
@@ -1105,11 +1246,47 @@ mod tests {
         assert!(turns[1].epoch > turns[0].epoch);
     }
 
+    #[test]
+    fn session_scopes_to_one_conversation_and_self_reported_model_only_fills_that_ones_gaps() {
+        let dir = tempdir::Dir::new("prompt-session");
+        write(
+            dir.path(),
+            "s1.jsonl",
+            &[user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("first session's question"))],
+        );
+        write(
+            dir.path(),
+            "s2.jsonl",
+            &[user("u2", None, "2026-08-20T10:05:00Z", serde_json::json!("second session's question"))],
+        );
+
+        let mut turns: Vec<Turn> = jsonl_files(dir.path())
+            .iter()
+            .flat_map(|f| parse_claude(f, Path::new("/proj")))
+            .collect();
+        assert_eq!(turns.len(), 2, "both sessions present before filtering");
+
+        let opts = PromptsOptions {
+            session: Some("s1".into()),
+            model: Some("claude-sonnet-5".into()),
+            ..Default::default()
+        };
+        apply_session(&mut turns, &opts);
+        assert_eq!(turns.len(), 1, "only the named session survives");
+        assert_eq!(turns[0].prompt, "first session's question");
+        assert_eq!(
+            turns[0].model.as_deref(),
+            Some("claude-sonnet-5"),
+            "self-reported model fills a turn its own transcript did not name"
+        );
+    }
+
     fn turn(id: &str, epoch: i64, edits: Vec<TurnEdit>) -> Turn {
         Turn {
             id: id.into(),
             agent: "claude".into(),
             session: "s".into(),
+            model: None,
             ts: chrono::DateTime::from_timestamp(epoch, 0).unwrap().to_rfc3339(),
             epoch,
             branch: None,
@@ -1139,6 +1316,7 @@ mod tests {
                     path: "src/pay.rs".into(),
                     tool: "Edit".into(),
                     anchor: Some("let mut attempts = 0; // retry the charge".into()),
+                    proposed: Some("    let mut attempts = 0; // retry the charge".into()),
                 }],
             ),
             // named a file whose text has since moved on
@@ -1149,6 +1327,7 @@ mod tests {
                     path: "src/other.rs".into(),
                     tool: "Write".into(),
                     anchor: Some("a line that is no longer present anywhere".into()),
+                    proposed: Some("a line that is no longer present anywhere".into()),
                 }],
             ),
             // named nothing; only its timing places it
@@ -1180,6 +1359,15 @@ mod tests {
         // function join can tell which part of the file it explains
         assert_eq!(got.by_file["src/pay.rs"][0].lines, Some([1, 3]));
         assert!(got.by_file["src/other.rs"][0].lines.is_none());
+        // content-match carries proposed-vs-agreed; nothing else can honestly
+        let pay = &got.by_file["src/pay.rs"][0];
+        assert_eq!(pay.proposed.as_deref(), Some("    let mut attempts = 0; // retry the charge"));
+        assert_eq!(
+            pay.agreed, pay.proposed,
+            "the file matches what was proposed - no drift to show"
+        );
+        assert!(got.by_file["src/other.rs"][0].proposed.is_none(), "tool-edit cannot pin a span to compare");
+        assert!(got.by_file["src/other.rs"][0].agreed.is_none());
         assert_eq!(
             got.unattributed,
             vec!["src/hand.rs".to_string()],
@@ -1196,6 +1384,8 @@ mod tests {
             prompt: "".into(),
             evidence: "tool-edit".into(),
             lines: None,
+            proposed: None,
+            agreed: None,
         };
         assert!(wide.covers(1, 1) && wide.covers(900, 1000));
         let pinned = PromptRef {

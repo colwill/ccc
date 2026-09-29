@@ -1811,11 +1811,27 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "prompts",
-            "ANSWERS why a change was made, not just what changed: which request sent to claude or copilot produced it. Use when a hunk needs explaining - before reverting something that looks stray, when reviewing work another session did, or to recover the intent behind code you are about to change. Reads the records those agents already keep on this machine: claude's session transcripts, which link a prompt to the exact `Edit`/`Write` it produced, and copilot's chat log, which carries the prompt and its timing. Every attribution names its evidence: `content-match` means the text that request wrote is still in the file inside a changed hunk, `tool-edit` means the request named the file, `temporal` means only its timing places it there - the rung that covers edits made through the shell. A changed file no request explains is listed as unattributed rather than credited to whichever prompt was nearest, so `unattributed` is the honest answer for hand-written code.",
+            "ANSWERS why a change was made, not just what changed: which request sent to claude or copilot produced it. Use when a hunk needs explaining - before reverting something that looks stray, when reviewing work another session did, or to recover the intent behind code you are about to change. Reads the records those agents already keep on this machine: claude's session transcripts, which link a prompt to the exact `Edit`/`Write` it produced, and copilot's chat log, which carries the prompt and its timing. Every attribution names its evidence: `content-match` means the text that request wrote is still in the file inside a changed hunk, `tool-edit` means the request named the file, `temporal` means only its timing places it there - the rung that covers edits made through the shell. A changed file no request explains is listed as unattributed rather than credited to whichever prompt was nearest, so `unattributed` is the honest answer for hand-written code. When asking about your OWN session's changes rather than the whole project's recent history, pass `session` (and, for a plain answer instead of a mixed one, `agent`): claude code's is the `sessionId` on your own transcript records, also the filename stem of `~/.claude/projects/<project>/<session>.jsonl`; copilot's is its own chat session id. Add `model` (e.g. `claude-sonnet-5`, `gpt-6`) to self-report the model answering now - it only fills turns of that session whose own transcript does not already name one, which today means every copilot turn.",
             json!({
                 "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
+                "session": {"type": "string", "description": "restrict to exactly one conversation: the calling agent's own session id, self-reported"},
+                "agent": {"type": "string", "enum": ["claude", "copilot"], "description": "restrict to one agent's records; pass your own identity alongside `session`"},
+                "model": {"type": "string", "description": "self-reported model name for the calling session. Only takes effect together with `session`, and only fills turns that don't already carry one"},
                 "limit": {"type": "integer", "description": "attributed files per page (default 25, max 500)"},
                 "offset": {"type": "integer", "description": "attributed files to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
+            "pr_summary",
+            "ANSWERS what should the pull request description say: the same attribution `prompts` computes, written as prose a reviewer can read start to finish instead of a citation list. Per explained file: the request behind it, and - only where the evidence pins an exact span (`content-match`) - what the model actually wrote there next to what is in the file now, so a reviewer sees the ask reshaped after a look at it rather than a black box of changes from an unnamed model. A file whose evidence is weaker (`tool-edit`, `temporal`) says why there is nothing to compare instead of fabricating one. Same `base`/`session`/`agent`/`model` filters as `prompts` - and the same reason to pass `session`/`agent`/`model`: to scope this to your own conversation rather than every recent one against this project. The underlying data is also available as JSON via `prompts`.",
+            json!({
+                "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
+                "session": {"type": "string", "description": "restrict to exactly one conversation: the calling agent's own session id, self-reported"},
+                "agent": {"type": "string", "enum": ["claude", "copilot"], "description": "restrict to one agent's records; pass your own identity alongside `session`"},
+                "model": {"type": "string", "description": "self-reported model name for the calling session. Only takes effect together with `session`, and only fills turns that don't already carry one"},
+                "limit": {"type": "integer", "description": "explained files per page (default 15, max 500)"},
+                "offset": {"type": "integer", "description": "explained files to skip (default 0)"},
             }),
             &[],
         ),
@@ -1928,7 +1944,12 @@ fn mcp_initialize(params: &Value) -> Value {
             the submodules it declares, `notes` TODO/FIXME markers, `refresh` force a \
             rescan. Analysis: `changes` what this branch touched, `prompts` which \
             request sent to claude or copilot produced each of those changes - and \
-            which of them nothing explains, `test_triggers` the \
+            which of them nothing explains; pass `session` (your own session id), \
+            `agent` (`claude` or `copilot`) and `model` when asking about your own \
+            conversation rather than the project's recent history, `pr_summary` the \
+            same attribution as prose for a pull request description - the ask behind \
+            each explained file next to what was proposed and what is actually there \
+            now, `test_triggers` the \
             tests those changes make necessary, `test_targets` where a missing test \
             would cost most, `lints` syntax-level findings, `hot` call-graph shape, \
             `services` the service map and the calls crossing it, `vulnerabilities` known advisories against the dependencies the lockfiles actually \
@@ -2611,6 +2632,51 @@ fn md_unavailable(what: &str, v: &Value) -> Option<String> {
         jstr(v, "reason"),
         jstr(v, "hint")
     ))
+}
+
+// a `PromptsReport` reshaped to what `md_prompts` and the `/prompts` route
+// already expect from `changes`'s cached
+fn prompts_value(report: &crate::prompts::PromptsReport) -> Value {
+    let changed_files: Vec<Value> = report
+        .attributed
+        .iter()
+        .map(|(path, refs)| json!({"path": path, "prompted_by": refs}))
+        .collect();
+    json!({
+        "base": report.base,
+        "turns": report.turns,
+        "changed_files": changed_files,
+        "unattributed": report.unattributed,
+    })
+}
+
+// `session` / `agent` / `model` narrow the attribution to one caller's own
+// conversation
+fn prompts_filtered(
+    root: &Path,
+    root_label: &str,
+    base: Option<&str>,
+    session: Option<&str>,
+    agent: Option<&str>,
+    model: Option<&str>,
+) -> Value {
+    let opts = crate::prompts::PromptsOptions {
+        base: base.map(str::to_string),
+        agent: agent.map(str::to_string),
+        session: session.map(str::to_string),
+        model: model.map(str::to_string),
+        ..Default::default()
+    };
+    match crate::prompts::prompts(root, root_label, &opts) {
+        Ok(report) => prompts_value(&report),
+        Err(e) => json!({
+            "available": false,
+            "reason": e.to_string(),
+            "hint": "The change set diffs the branch against its base. In CI, fetch history \
+                     (actions/checkout with fetch-depth: 0); locally, make sure the branch \
+                     has an upstream such as origin/main.",
+        }),
+    }
 }
 
 fn md_prompts(v: &Value, page: Page) -> String {
@@ -3401,8 +3467,53 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
             Ok(md_changes(&a["changes"], Page::from(&args, 40)))
         }
         "prompts" => {
-            let a = map.analysis(arg("base").as_deref());
-            Ok(md_prompts(&a["changes"], Page::from(&args, 25)))
+            let session = arg("session");
+            let agent = arg("agent");
+            let model = arg("model");
+            match agent.as_deref() {
+                Some(a) if !matches!(a, "claude" | "copilot") => {
+                    Err(format!("agent wants `claude` or `copilot`, got '{a}'"))
+                }
+                _ => {
+                    let v = if session.is_some() || agent.is_some() || model.is_some() {
+                        prompts_filtered(
+                            &map.root,
+                            &map.root_label,
+                            arg("base").as_deref(),
+                            session.as_deref(),
+                            agent.as_deref(),
+                            model.as_deref(),
+                        )
+                    } else {
+                        map.analysis(arg("base").as_deref())["changes"].clone()
+                    };
+                    Ok(md_prompts(&v, Page::from(&args, 25)))
+                }
+            }
+        }
+        "pr_summary" => {
+            let agent = arg("agent");
+            match agent.as_deref() {
+                Some(a) if !matches!(a, "claude" | "copilot") => {
+                    Err(format!("agent wants `claude` or `copilot`, got '{a}'"))
+                }
+                _ => {
+                    let opts = crate::prompts::PromptsOptions {
+                        base: arg("base"),
+                        agent,
+                        session: arg("session"),
+                        model: arg("model"),
+                        ..Default::default()
+                    };
+                    match crate::prompts::prompts(&map.root, &map.root_label, &opts) {
+                        Ok(report) => {
+                            let page = Page::from(&args, 15);
+                            Ok(crate::pr_summary::markdown(&report, Some(page.limit), page.offset))
+                        }
+                        Err(e) => Ok(crate::pr_summary::unavailable(&e.to_string())),
+                    }
+                }
+            }
         }
         "test_triggers" => {
             let a = map.analysis(arg("base").as_deref());
@@ -3850,11 +3961,20 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
             let map = state.read().expect("map lock poisoned");
             ok(q_notes(&map, get("marker")))
         }
-        // the attribution alone, without the rest of the change set
+        // the attribution - `session` scopes it to one caller's own conversation
         ("GET", "/prompts") => {
             let map = state.read().expect("map lock poisoned");
-            let a = map.analysis(get("base"));
-            let c = &a["changes"];
+            let session = get("session");
+            let agent = get("agent");
+            let model = get("model");
+            if agent.is_some_and(|a| !matches!(a, "claude" | "copilot")) {
+                return bad(400, "agent wants `claude` or `copilot`".to_string());
+            }
+            let c = if session.is_some() || agent.is_some() || model.is_some() {
+                prompts_filtered(&map.root, &map.root_label, get("base"), session, agent, model)
+            } else {
+                map.analysis(get("base"))["changes"].clone()
+            };
             ok(json!({
                 "schema": crate::prompts::SCHEMA,
                 "root": map.root_label,
@@ -5280,6 +5400,7 @@ mod tests {
                 "refresh",
                 "changes",
                 "prompts",
+                "pr_summary",
                 "test_triggers",
                 "test_targets",
                 "lints",
@@ -5328,6 +5449,64 @@ mod tests {
         assert_eq!(nope["error"]["code"], -32601);
     }
 
+
+    #[test]
+    fn the_prompts_tool_validates_agent_and_takes_the_direct_pipeline_when_scoped() {
+        let state = RwLock::new(fixture());
+        let call = |args: Value| -> (bool, String) {
+            let v = mcp_handle(
+                &state,
+                &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                        "params": {"name": "prompts", "arguments": args}}),
+            )
+            .unwrap();
+            (
+                v["result"]["isError"].as_bool().unwrap_or(false),
+                v["result"]["content"][0]["text"].as_str().unwrap().to_string(),
+            )
+        };
+
+        let (err, out) = call(json!({"agent": "chatgpt"}));
+        assert!(err, "an unknown agent must be rejected: {out}");
+        assert!(out.contains("claude") && out.contains("copilot"), "{out}");
+
+        // the fixture has no git repo, so both the cached path (no args) and
+        // the direct pipeline `session` takes must explain themselves the
+        // same way rather than one of them panicking or rendering empty
+        let (err, unscoped) = call(json!({}));
+        assert!(!err, "{unscoped}");
+        assert!(unscoped.contains("unavailable"), "{unscoped}");
+        let (err, scoped) = call(json!({"session": "no-such-session", "agent": "claude"}));
+        assert!(!err, "{scoped}");
+        assert!(scoped.contains("unavailable"), "{scoped}");
+    }
+
+    #[test]
+    fn the_pr_summary_tool_validates_agent_and_reports_when_the_change_set_is_unavailable() {
+        let state = RwLock::new(fixture());
+        let call = |args: Value| -> (bool, String) {
+            let v = mcp_handle(
+                &state,
+                &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                        "params": {"name": "pr_summary", "arguments": args}}),
+            )
+            .unwrap();
+            (
+                v["result"]["isError"].as_bool().unwrap_or(false),
+                v["result"]["content"][0]["text"].as_str().unwrap().to_string(),
+            )
+        };
+
+        let (err, out) = call(json!({"agent": "chatgpt"}));
+        assert!(err, "an unknown agent must be rejected: {out}");
+        assert!(out.contains("claude") && out.contains("copilot"), "{out}");
+
+        // the fixture has no git repo, so this must say so gracefully, the
+        // same as `prompts` - isError is for malformed input only
+        let (err, out) = call(json!({"session": "s", "agent": "claude"}));
+        assert!(!err, "{out}");
+        assert!(out.contains("unavailable"), "{out}");
+    }
 
     // verify all tools dispatch as expected
     #[test]
