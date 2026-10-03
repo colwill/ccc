@@ -1,8 +1,9 @@
-//! CodeCache
+//! Collateral Code Check (ccc)
 
 pub mod audit;
 pub mod coverage;
 pub mod deps;
+pub mod edit;
 pub mod extract;
 pub mod externals;
 pub mod html;
@@ -20,6 +21,7 @@ pub mod changes;
 pub mod contracts;
 pub mod telemetry;
 pub mod tokenize;
+pub mod vis;
 
 // `check` is deprecated but still re-exported: deprecating it is what warns
 // callers, and pulling the re-export would break them instead

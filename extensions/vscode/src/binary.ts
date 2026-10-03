@@ -172,7 +172,7 @@ function missingBinary(cfg: Cfg, searched: string[]): CccBinaryError {
     : 'Automatic install is off (`ccc.autoInstall`).';
   return new CccBinaryError(
     `could not find the \`ccc\` binary. ${hint} Install it with \`./install.sh\` or ` +
-      '`cargo build --release` in the codecache repo, or set `ccc.binaryPath`.',
+      '`cargo build --release` in the ccc repo, or set `ccc.binaryPath`.',
     searched,
   );
 }

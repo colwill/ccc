@@ -468,10 +468,52 @@ fn edit_of(path: &str, tool: &str, text: Option<&str>) -> TurnEdit {
     }
 }
 
+// what ccc's own edit tools wrote - their input is a handle, so the text comes back from the ledger `edit_apply` keeps
+struct CccWrites<'a> {
+    // tool_use id -> the text that call was answered with
+    answers: BTreeMap<&'a str, String>,
+    // changeset id -> (path, text written)
+    ledger: &'a BTreeMap<String, Vec<(String, String)>>,
+}
+
+// ccc's write tools as an MCP client names them - `mcp__<server>__edit_*`
+fn is_ccc_edit(name: &str) -> bool {
+    name.starts_with("mcp__") && name.contains("__edit_")
+}
+
+// the files one ccc edit call wrote, by the changeset its input names or its answer reports applied
+// ccc:skip
+fn ccc_edits_of(block: &Value, name: &str, ccc: &CccWrites) -> Vec<TurnEdit> {
+    let tool = name.rsplit("__").next().unwrap_or(name);
+    // a revert takes code away, it writes nothing a request asked for
+    if tool == "edit_revert" {
+        return Vec::new();
+    }
+    let mut ids: Vec<String> = Vec::new();
+    if tool == "edit_apply" {
+        if let Some(c) = block.get("input").and_then(|i| i.get("changeset")).and_then(|c| c.as_str()) {
+            ids.push(c.trim().to_string());
+        }
+    }
+    if let Some(answer) = block.get("id").and_then(|i| i.as_str()).and_then(|id| ccc.answers.get(id)) {
+        ids.extend(crate::edit::applied_ids(answer));
+    }
+    ids.sort();
+    ids.dedup();
+    ids.iter()
+        .filter_map(|id| ccc.ledger.get(id))
+        .flatten()
+        .map(|(path, written)| edit_of(path, tool, Some(written)))
+        .collect()
+}
+
 // the files one `tool_use` block wrote
 // ccc:skip
-fn edits_of(block: &Value, root: &Path) -> Vec<TurnEdit> {
+fn edits_of(block: &Value, root: &Path, ccc: &CccWrites) -> Vec<TurnEdit> {
     let name = block.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+    if is_ccc_edit(name) {
+        return ccc_edits_of(block, name, ccc);
+    }
     if !EDIT_TOOLS.contains(&name) {
         return Vec::new();
     }
@@ -528,7 +570,13 @@ fn epoch_of(ts: &str) -> i64 {
 }
 
 // one claude transcript -> the requests it contains, each with its edits
+#[cfg(test)]
 fn parse_claude(path: &Path, root: &Path) -> Vec<Turn> {
+    parse_claude_with(path, root, &crate::edit::ledger(root))
+}
+
+// ccc:skip
+fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(String, String)>>) -> Vec<Turn> {
     let Ok(raw) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -585,6 +633,34 @@ fn parse_claude(path: &Path, root: &Path) -> Vec<Turn> {
         });
     }
 
+    // what each tool call was answered with - the only place a ccc edit names the changeset it applied
+    let mut answers: BTreeMap<&str, String> = BTreeMap::new();
+    for rec in &records {
+        let blocks = rec
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array());
+        for b in blocks.into_iter().flatten() {
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            let text = match b.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => continue,
+            };
+            answers.insert(id, text);
+        }
+    }
+    let ccc = CccWrites { answers, ledger };
+
     // then credit each edit - and the model that produced it - to the
     // request that led to it
     for rec in &records {
@@ -603,7 +679,7 @@ fn parse_claude(path: &Path, root: &Path) -> Vec<Turn> {
                 blocks
                     .iter()
                     .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-                    .flat_map(|b| edits_of(b, root))
+                    .flat_map(|b| edits_of(b, root, &ccc))
                     .collect()
             })
             .unwrap_or_default();
@@ -763,8 +839,9 @@ pub fn collect(root: &Path, opts: &PromptsOptions) -> (Vec<Turn>, Vec<SourceStat
             location,
             sessions: files.len(),
         });
+        let ledger = crate::edit::ledger(root);
         for f in files {
-            turns.extend(parse_claude(&f, root));
+            turns.extend(parse_claude_with(&f, root, &ledger));
         }
     }
     if want("copilot") {
@@ -997,12 +1074,20 @@ fn record(root: &Path, turns: &[Turn]) -> Result<()> {
     ignore_ledger(root)
 }
 
-// add to `.gitignore` if it is not already covered
 // ccc:skip
 fn ignore_ledger(root: &Path) -> Result<()> {
+    ignore_path(
+        root,
+        &format!("/.ccc/{LEDGER_NAME}"),
+        "prompt text recorded by `ccc prompts --record`",
+    )
+}
+
+// add `entry` to `.gitignore` under a `# why` line if it is not already covered
+// ccc:skip
+pub(crate) fn ignore_path(root: &Path, entry: &str, why: &str) -> Result<()> {
     use std::io::Write;
 
-    let entry = format!("/.ccc/{LEDGER_NAME}");
     let path = root.join(".gitignore");
     let current = fs::read_to_string(&path).unwrap_or_default();
     if current.lines().any(|l| l.trim() == entry) {
@@ -1018,11 +1103,8 @@ fn ignore_ledger(root: &Path) -> Result<()> {
     } else {
         "\n"
     };
-    writeln!(
-        f,
-        "{lead}\n# prompt text recorded by `ccc prompts --record`\n{entry}"
-    )?;
-    eprintln!("ccc: added {entry} to .gitignore (recorded prompts stay out of git)");
+    writeln!(f, "{lead}\n# {why}\n{entry}")?;
+    eprintln!("ccc: added {entry} to .gitignore so it stays out of git");
     Ok(())
 }
 
@@ -1419,5 +1501,47 @@ mod tests {
         assert!(got.chars().count() <= PROMPT_CAP + 1, "capped: {}", got.chars().count());
         assert!(got.starts_with("line one"), "the opening survives: {got}");
         assert!(got.ends_with('…'), "and the cut is visible: {got}");
+    }
+
+    #[test]
+    fn a_ccc_edit_is_credited_through_the_ledger_of_what_it_applied() {
+        let dir = tempdir::Dir::new("prompt-ccc-edit");
+        let root = dir.path();
+        let ledger = root.join(".ccc").join(crate::edit::LEDGER_NAME);
+        fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let entry = serde_json::json!({
+            "id": "c3-abc", "ts": "2026-08-20T10:00:02Z", "ops": ["rename `charge` -> `settle` (r1)"],
+            "files": [{"path": "src/pay.rs", "written": "pub fn settle(amount: u64) -> u64 {"}],
+        });
+        fs::write(&ledger, format!("{entry}\n")).unwrap();
+        let ts = "2026-08-20T10:00:00Z";
+        let file = write(
+            &root.join("transcripts"),
+            "s1.jsonl",
+            &[
+                user("u1", None, ts, serde_json::json!("rename charge to settle")),
+                // staged and applied in one call - the handle in the input says nothing about the text
+                assistant("a1", "u1", ts, serde_json::json!([{
+                    "type": "tool_use", "id": "t9", "name": "mcp__ccc__edit_rename",
+                    "input": {"result": "r1", "to": "settle", "apply": true},
+                }])),
+                user("r1", Some("a1"), ts, serde_json::json!([{
+                    "type": "tool_result", "tool_use_id": "t9",
+                    "content": [{"type": "text", "text": "# edit_apply - applied changeset `c3-abc`\n1 file(s) written"}],
+                }])),
+            ],
+        );
+        let turns = parse_claude(&file, root);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].edits.len(), 1, "{:?}", turns[0].edits);
+        assert_eq!(turns[0].edits[0].path, "src/pay.rs");
+        assert_eq!(turns[0].edits[0].tool, "edit_rename");
+        assert!(turns[0].edits[0].anchor.is_some(), "the written text pins the edit like an `Edit` would");
+
+        // reverted since - the request no longer explains that file
+        let mut f = fs::OpenOptions::new().append(true).open(&ledger).unwrap();
+        use std::io::Write;
+        writeln!(f, "{}", serde_json::json!({"id": "c3-abc", "reverted": true})).unwrap();
+        assert!(parse_claude(&file, root)[0].edits.is_empty());
     }
 }

@@ -18,6 +18,8 @@ export interface Cfg {
     watchIntervalSec: number;
     startupTimeoutMs: number;
     extraArgs: string[];
+    // read every `ccc:skip` as an ordinary comment
+    ignoreSkip: boolean;
   };
   hints: {
     testTriggers: boolean;
@@ -70,6 +72,7 @@ export function readConfig(scope?: vscode.ConfigurationScope): Cfg {
       watchIntervalSec: clampInt(c.get<number>('server.watchIntervalSec', 0), 0, 3600, 0),
       startupTimeoutMs: clampInt(c.get<number>('server.startupTimeoutMs', 30000), 1000, 600000, 30000),
       extraArgs: c.get<string[]>('server.extraArgs', []).filter((a) => typeof a === 'string'),
+      ignoreSkip: c.get<boolean>('server.ignoreSkip', false),
     },
     hints: {
       testTriggers: c.get<boolean>('hints.testTriggers', true),
@@ -113,6 +116,7 @@ export function needsServerRestart(a: Cfg, b: Cfg): boolean {
     a.server.address !== b.server.address ||
     a.server.port !== b.server.port ||
     a.server.watchIntervalSec !== b.server.watchIntervalSec ||
+    a.server.ignoreSkip !== b.server.ignoreSkip ||
     a.server.extraArgs.join('\u0000') !== b.server.extraArgs.join('\u0000')
   );
 }

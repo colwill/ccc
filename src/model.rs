@@ -196,6 +196,10 @@ pub struct FileCache {
     pub modules: Vec<String>,
     // `ccc:serves` / `ccc:calls` hints written in comments
     pub annotations: Vec<Annotation>,
+    // line spans `ccc:skip` withdrew from this file - unindexed, not absent
+    pub withdrawn: Vec<(usize, usize)>,
+    // where a type is built rather than called: a struct literal, a `new`
+    pub constructs: Vec<CallSite>,
 }
 
 impl FileCache {

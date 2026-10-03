@@ -13,6 +13,10 @@ use std::process::ExitCode;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    // read every `ccc:skip` as an ordinary comment, so the code it marks is
+    // mapped, searched, measured and edited like the rest - any command
+    #[arg(long, global = true)]
+    ignore_skip: bool,
 }
 
 const CACHE_DIR: &str = ".ccc";
@@ -231,6 +235,10 @@ enum Command {
         no_html: bool,
         #[arg(long)]
         deps: bool,
+        // serve the architecture visualiser at /vis - C4-style levels from the
+        // system down to one function's logic - and open it in the browser
+        #[arg(long, conflicts_with = "no_html")]
+        vis: bool,
     },
     // analyse the project and emit the insights payload
     Insights {
@@ -297,6 +305,8 @@ fn main() -> ExitCode {
 // ccc:skip
 fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    // before anything is parsed, so every map this process builds agrees
+    codecache::extract::ignore_skips(cli.ignore_skip);
     match cli.command {
         Command::Scan {
             path,
@@ -606,6 +616,7 @@ fn run() -> Result<ExitCode> {
             html,
             no_html,
             deps,
+            vis,
         } => {
             let watch = if no_watch || watch_interval == 0 {
                 None
@@ -619,6 +630,7 @@ fn run() -> Result<ExitCode> {
                 port,
                 watch,
                 html: !no_html,
+                vis,
             };
             codecache::serve(&canonical(&path), &opts)?;
             Ok(ExitCode::SUCCESS)

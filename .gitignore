@@ -7,3 +7,6 @@ bench/
 # written by the vscode extension on every analyser start, carrying that run's ephemeral port
 /.mcp.json
 /.vscode/mcp.json
+
+# edits applied through ccc's edit tools, read back by `ccc prompts`
+/.ccc/edits.jsonl

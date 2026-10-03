@@ -41,36 +41,36 @@ const MAX_COMPLEXITY_ROWS: usize = 2000;
 // An index one past the end of that slice addresses the file's module scope
 // instead - see `Graph::module_frames`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct NodeId(usize, usize);
+pub(crate) struct NodeId(pub(crate) usize, pub(crate) usize);
 
-struct Graph<'a> {
-    caches: &'a [FileCache],
-    nodes: Vec<NodeId>,
+pub(crate) struct Graph<'a> {
+    pub(crate) caches: &'a [FileCache],
+    pub(crate) nodes: Vec<NodeId>,
     // synthetic frames for code that runs at a file's top level
     module_frames: BTreeMap<usize, Func>,
     // adjacency over positions in `nodes`
-    out: Vec<BTreeSet<usize>>,
-    into: Vec<BTreeSet<usize>>,
+    pub(crate) out: Vec<BTreeSet<usize>>,
+    pub(crate) into: Vec<BTreeSet<usize>>,
     // call sites counted per target, so a function called twice from one place
     // still ranks above one called once
-    call_sites: Vec<usize>,
+    pub(crate) call_sites: Vec<usize>,
 }
 
 impl<'a> Graph<'a> {
-    fn name(&self, i: usize) -> &str {
+    pub(crate) fn name(&self, i: usize) -> &str {
         &self.func(i).name
     }
-    fn file(&self, i: usize) -> String {
+    pub(crate) fn file(&self, i: usize) -> String {
         changes::path_str(&self.caches[self.nodes[i].0].rel_path)
     }
-    fn func(&self, i: usize) -> &Func {
+    pub(crate) fn func(&self, i: usize) -> &Func {
         let NodeId(f, k) = self.nodes[i];
         self.caches[f].funcs.get(k).unwrap_or_else(|| &self.module_frames[&f])
     }
-    fn lang(&self, i: usize) -> Language {
+    pub(crate) fn lang(&self, i: usize) -> Language {
         self.caches[self.nodes[i].0].language
     }
-    fn node_file(&self, i: usize) -> usize {
+    pub(crate) fn node_file(&self, i: usize) -> usize {
         self.nodes[i].0
     }
     // the definition this node addresses, as `coverage` keys them. A module
@@ -81,14 +81,14 @@ impl<'a> Graph<'a> {
         (f, k)
     }
     // nothing but itself calls this: an entry point
-    fn is_root(&self, i: usize) -> bool {
+    pub(crate) fn is_root(&self, i: usize) -> bool {
         self.into[i].iter().all(|&c| c == i)
     }
-    fn is_test(&self, i: usize) -> bool {
+    pub(crate) fn is_test(&self, i: usize) -> bool {
         self.func(i).test_ctx || changes::is_test_path(&self.file(i))
     }
     // a file's module scope rather than a function someone defined
-    fn is_module(&self, i: usize) -> bool {
+    pub(crate) fn is_module(&self, i: usize) -> bool {
         let NodeId(f, k) = self.nodes[i];
         k >= self.caches[f].funcs.len()
     }
@@ -102,7 +102,7 @@ impl<'a> Graph<'a> {
 // the callee is imported from it - but at function granularity rather than
 // file granularity. A call with no evidence, or with evidence for more than
 // one target, produces no edge: an absent edge is better than a wrong one.
-fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex) -> Graph<'a> {
+pub(crate) fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex) -> Graph<'a> {
     let mut nodes = Vec::new();
     // (file, name) -> every node with that name, in definition order. A name
     // is not unique within a file: overloads share one, and so does an
@@ -769,26 +769,26 @@ fn lints(g: &Graph) -> (Vec<Value>, bool) {
 // Which service each file belongs to, plus the declared dependency map. Built
 // once and shared: the flame view needs it to mark service boundaries, and the
 // service tab needs it to group files.
-struct ServiceCtx {
-    source: String,
-    map: BTreeMap<String, Vec<String>>,
+pub(crate) struct ServiceCtx {
+    pub(crate) source: String,
+    pub(crate) map: BTreeMap<String, Vec<String>>,
     // declared relationships from `map.json`: service to service, or service
     // to a peer under `externals`
-    relatives: BTreeMap<String, Vec<String>>,
+    pub(crate) relatives: BTreeMap<String, Vec<String>>,
     // per cache index, the services that own that file
-    of_file: Vec<Vec<String>>,
+    pub(crate) of_file: Vec<Vec<String>>,
     // the grouping degenerated to one unit per file, so "service" means
     // "module" here - not a boundary worth fanning a flame graph out over
-    per_file: bool,
+    pub(crate) per_file: bool,
     // peer repositories from `map.json` `externals`, resolved or not
-    externals: Vec<crate::externals::ExternalService>,
+    pub(crate) externals: Vec<crate::externals::ExternalService>,
     // `ccc:calls` joined to `ccc:serves`, here and across repositories
-    crossings: Vec<crate::externals::Crossing>,
+    pub(crate) crossings: Vec<crate::externals::Crossing>,
 }
 
 impl ServiceCtx {
     // the service owning a graph node, if exactly one does
-    fn of_node(&self, g: &Graph, i: usize) -> Option<&str> {
+    pub(crate) fn of_node(&self, g: &Graph, i: usize) -> Option<&str> {
         self.of_file
             .get(g.node_file(i))
             .and_then(|v| v.first())
@@ -796,7 +796,7 @@ impl ServiceCtx {
     }
 }
 
-fn service_ctx(g: &Graph, root: &Path, contracts: &ContractIndex) -> ServiceCtx {
+pub(crate) fn service_ctx(g: &Graph, root: &Path, contracts: &ContractIndex) -> ServiceCtx {
     let cfg = ChangesConfig::load(root).unwrap_or_default();
     let paths: Vec<String> = g.caches.iter().map(|c| changes::path_str(&c.rel_path)).collect();
     let (mut map, mut source) = if cfg.services.is_empty() {
@@ -868,7 +868,7 @@ fn service_ctx(g: &Graph, root: &Path, contracts: &ContractIndex) -> ServiceCtx 
 }
 
 // Roll the file-level call graph up into the service map.
-fn services(g: &Graph, ctx: &ServiceCtx) -> Value {
+pub(crate) fn services(g: &Graph, ctx: &ServiceCtx) -> Value {
     let (map, service_of) = (&ctx.map, &ctx.of_file);
 
     let mut files: BTreeMap<&String, Vec<String>> = BTreeMap::new();

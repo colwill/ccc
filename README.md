@@ -1,11 +1,11 @@
-<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="CodeCaChe Logo"></a></p>
+<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="Collateral Code Check Logo"></a></p>
 
-[![Release CodeCaChe](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
+[![Release Collateral Code Check](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
 
 
-# CodeCaChe (`ccc`)
+# Collateral Code Check (`ccc`)
 
-CodeCaChe tells you, and your AI agent, what a change touches before you commit it - the functions, tests, services and cross-service contracts it reaches - by:
+Collateral Code Check tells you, and your AI agent, what a change touches before you commit it - the functions, tests, services and cross-service contracts it reaches - by:
 
   - highlighting which tests will be ran with your changes
   
@@ -17,7 +17,9 @@ CodeCaChe tells you, and your AI agent, what a change touches before you commit 
 
   - triggering specific testing tools based on your changes
 
-**ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and generates the **CodeCaChe** in memory. 
+  - making your agent's changes for it - a project-wide rename, a dead-code delete, a new function beside an old one - as one confined, previewed, revertible call that costs a fraction of the tokens read-then-edit does with an extra layer of safety ([how much](#edits-go-through-ccc))
+
+**ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and builds the **ccc** code map in memory. 
 This is a human and machine readable map of the source tree including every source file; its
 constants, functions (with return types and doc summaries), intra-file call
 graph, and marker notes (TODO/FIXME/...). 
@@ -27,14 +29,46 @@ It is designed to give engineers a always-fresh index of a project, the latest c
 Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`, `Odin`, `TypeScript`, `Protobuf`
 & `JavaScript` - see [`LANGUAGES.md`](docs/LANGUAGES.md) for what each one resolves.
 
+## Edits go through ccc
+
+Agents don't only read the map - they change the code through it. A `find` or `references` answer ends with a
+handle, and the `edit_*` MCP tools take that handle. One call renames a symbol across the project, deletes a dead
+function, or adds code beside a definition. The agent never opens each file or edits it line by line.
+
+- **One call per change, not one per site.** `edit_rename` follows a name through every file the map ties to it,
+  including lines the map does not index, such as a `ccc:skip` body. It lists every same-named identifier it left
+  alone, with the reason, so nothing changes silently.
+- **Safe by construction.** Every write stays inside the project root: no `..`, no symlinks, never `.git`. Each
+  change is staged and shown as a diff first. On apply, every file is checked against what it held when staged,
+  and then every file is written or none is. The map is rescanned before the call returns, and `edit_revert`
+  takes the change back.
+- **ccc is the only writer.** The MCP server tells agents to make every change through these tools, never through
+  their own Edit/Write tools or `sed -i`. That way every change is confined, previewed and revertible, and
+  [`ccc prompts`](docs/MCP.md#editing) credits it to the request that asked for it.
+
+Napkin math. Assumptions: 300-line source files at ~12 tokens a line, and an agent that must read a file before it
+edits it, as Claude Code does.
+
+| Task | Agent's own tools | Through ccc | Saving |
+|---|---|---|---|
+| Rename a function used at 20 sites in 8 files | grep + 8 reads + 20 edits ≈ 33k tokens, 29 calls | `references` + `edit_rename` + `edit_apply` ≈ 2.3k tokens, 3 calls | ~14x tokens, ~10x calls |
+| Delete a dead 50-line function | grep + read + edit ≈ 4.4k tokens, 3 calls | `references` + `edit_delete` ≈ 1k tokens, 2 calls | ~4x tokens |
+| Add a 25-line function beside an existing one | grep + read + edit ≈ 4.2k tokens, 3 calls | `find` + `edit_insert` ≈ 0.9k tokens, 2 calls | ~4.5x tokens |
+| Change a few lines inside one function | read + edit | read + `edit_text` | about even |
+
+Every call saved is also a model turn saved, and each turn re-reads the whole conversation. On a 60k-token
+session, the rename's 26 fewer turns skip roughly 1.5M cached input tokens and 26 round trips of latency.
+
 ## Table of content
 
 <details>
 <summary>Expand contents</summary>
 
+- [Edits go through ccc](#edits-go-through-ccc)
 - [Quick-Start](#quick-start)
 - [Usage](#usage)
 - [Insights](#insights)
+- [Architecture Visualiser](#architecture-visualiser)
 - [Extension](#extension)
 - [Dependency Map](#dependencymap)
 - [Cross-Repository Calls](#externals)
@@ -85,6 +119,7 @@ Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`,
 
 ```sh
 ccc run                               # Runs local in-memory map, MCP server and insights UI
+ccc run --vis                         # ...and opens the architecture visualiser at :6767/vis
 ccc init                              # Generate basic `.ccc/map.json` and `.ccc/surface.json` (prev ccc-surface.json)
 ccc changes [PATH] --telemetry        # Changes vs base ref (services to test for CT)
 ccc tokenize                          # Encode in-memory map of project into tokens.bin + tokens.json
@@ -108,6 +143,40 @@ ccc run                               # then open http://127.0.0.1:6767/insights
 curl -s localhost:6767/insights.json  # the same data, for other consumers
 ccc insights                          # same JSON data as above via direct command
 ccc insights --html page.html         # output format is html, as a single page app
+```
+
+## Architecture Visualiser
+
+`ccc run --vis` serves a 2D map of the project at `http://127.0.0.1:6767/vis` and opens it in your
+browser. It follows the C4 model from the whole system down to the code, then goes one level
+further: the logic of a single function, drawn as a node graph in the style of Unreal Engine
+Blueprints.
+
+| level | boxes | arrows |
+|---|---|---|
+| Context | the system; peer repos from `externals` in `.ccc/map.json`; endpoints nothing in the map answers | `ccc:calls` / `ccc:serves` crossings, by transport |
+| Containers | services from `.ccc/map.json`, or top-level directories without one | resolved and declared calls between services |
+| Components | the files in one container; other containers it touches sit outside the boundary | file-to-file calls |
+| Code | the functions in one file, each with an input pin and one output pin per function it calls | resolved calls; functions in other files as stand-ins |
+| Logic | one function: entry, calls, branches, switch/match/try arms, loops, closures, returns and throws | execution order |
+
+Double-click (or Enter) drills down a level, Escape goes back up, and the breadcrumb jumps to any
+level. Every view has its own URL, so the browser's back button works and views can be
+bookmarked. Drag to rearrange; positions are remembered per view. The search box (`/`) finds
+functions and files and opens them directly. The page reloads by itself when the map changes.
+
+Every level is built from the same language-agnostic map the MCP tools read, so all supported
+languages are drawn the same way. Like the rest of ccc it reads syntax, not behaviour: an arrow
+is a call the resolver found evidence for, and a branch is a node in the syntax tree, not a path
+anything was seen to take. Calls that reach nothing in the project (the standard library, a
+dependency) are folded into grey pills, and the toolbar can show them in full or hide them.
+
+The data behind the page is plain JSON, with or without `--vis`:
+
+```sh
+curl -s localhost:6767/vis.json                                  # context, containers, components
+curl -s 'localhost:6767/vis/code?file=src/scan.rs'               # one file's functions and calls
+curl -s 'localhost:6767/vis/flow?file=src/scan.rs&line=76'       # one function's logic
 ```
 
 ## Extension
@@ -180,7 +249,16 @@ language uses. Placement decides the scope:
 // ccc:skip generated - do not analyse
 ```
 
-Trailing prose after the marker is allowed, so a skip can say why.
+Trailing prose after the marker is allowed, so a skip can say why. A marker inside backticks is
+documentation quoting one, not a directive, so a comment that explains `ccc:skip` withdraws
+nothing.
+
+To see everything regardless, pass `--ignore-skip` to any command - `ccc run --ignore-skip`,
+`ccc changes --ignore-skip`, ... - and every `ccc:skip` reads as an ordinary comment: the code it
+marks is mapped, searched, measured and edited like the rest. In the VS Code extension the same
+switch is the `ccc.server.ignoreSkip` setting. Without it, a `find` or `references` that misses
+also searches the skipped code as text and lists what it finds there, marked as not indexed, so
+a miss never hides code you skipped.
 
 ## AGENTS.md
 
@@ -191,20 +269,21 @@ Trailing prose after the marker is allowed, so a skip can say why.
 ```md
 # AGENTS.md
 
-This repo has a CodeCaChe - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
+This repo has a Collateral Code Check (ccc) map - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
 as the entry point for everything you do here.
 
 - no bash, grep or sed usage for exploring the project
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
-- All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, file, notes, changes, test_triggers, test_targets, lints, hot, services refresh)
-- When I ask to *see* the analysis, call `insights` - it opens the insights UI in my browser (needs `ccc serve --html`)
-- Make code changes in the source, never to the in-memory map.
-- After changing tracked source call the `ccc` tool with `refresh` to ensure you have the latest changes in-memory.
+- All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, vulnerabilities, deps, security, file, notes, changes, prompts, pr_summary, test_triggers, test_targets, lints, hot, services, refresh)
+- When I ask to *see* the analysis, call `insights` - it opens the insights UI in my browser (off under `ccc run --no-html`)
+- ccc is the only writer: make every change through its edit tools - `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` or `edit_text`, then `edit_apply` - never your own Edit/Write tools, `sed -i` or shell redirection.
+- `edit_apply` rescans the map before it answers; call `refresh` only after a change made outside ccc.
 
 ```
 
-Because the agent loads `AGENTS.md` at the start of a session, this wires the
-code map into every interaction: reasoning and answers come from `ccc`'s map, whilst edits still apply to the source and trigger a refresh.
+Because the agent loads `AGENTS.md` at the start of a session, this wires the code map into every interaction:
+reasoning and answers come from `ccc`'s map, and every change goes back through `ccc`, so it stays inside the
+project, is previewed before it is written, and can be reverted.
 
 ## Testing
 

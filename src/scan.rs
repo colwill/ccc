@@ -159,7 +159,33 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
         types: ex.types,
         modules: ex.modules,
         annotations: ex.annotations,
+        withdrawn: ex.withdrawn,
+        constructs: ex.constructs,
     })
+}
+
+// Discovered files `ccc:skip` withdrew whole, as paths relative to `root`.
+// They are missing from `caches` the same way a file that would not parse is,
+// so the directive is what tells the two apart.
+pub fn withdrawn_files(root: &Path, files: &[PathBuf], caches: &[FileCache]) -> Vec<String> {
+    // under `--ignore-skip` the directive withdraws nothing, so a missing file
+    // is one that would not parse
+    if extract::skips_ignored() {
+        return Vec::new();
+    }
+    let mapped: BTreeSet<&Path> = caches.iter().map(|c| c.rel_path.as_path()).collect();
+    files
+        .iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(root).unwrap_or(p);
+            if mapped.contains(rel) {
+                return None;
+            }
+            let src = fs::read_to_string(p).ok()?;
+            extract::has_skip_directive(&src)
+                .then(|| rel.to_string_lossy().replace('\\', "/"))
+        })
+        .collect()
 }
 
 // the whole cache as `name -> markdown`, which is what gets written, compared

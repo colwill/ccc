@@ -7,7 +7,7 @@
 
 use crate::contracts::ContractIndex;
 use crate::model::{FileCache, Counts};
-use crate::{audit, deps, insights, render, sast, scan};
+use crate::{audit, deps, edit, insights, render, sast, scan, vis};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +27,8 @@ pub struct ServeOptions {
     pub watch: Option<std::time::Duration>,
     // serve the human-facing `/insights` UI alongside the agent endpoints
     pub html: bool,
+    // serve the architecture visualiser at `/vis` and open it on start
+    pub vis: bool,
 }
 
 impl Default for ServeOptions {
@@ -36,6 +38,7 @@ impl Default for ServeOptions {
             port: 6767,
             watch: Some(std::time::Duration::from_secs(2)),
             html: true,
+            vis: false,
         }
     }
 }
@@ -45,20 +48,28 @@ struct MapState {
     root_label: String,
     ts: String,
     caches: Vec<FileCache>,
+    // files `ccc:skip` withdrew whole: discovered, deliberately not mapped
+    withdrawn: Vec<String>,
     // the rpcs the schemas declare and the code tied to them; rebuilt with `caches`
     contracts: ContractIndex,
     externals: Vec<ExternalDep>,
     facade: Option<String>,
     watch_secs: Option<u64>,
     html: bool,
+    // the `/vis` page is served - `ccc run --vis`
+    vis: bool,
     origin: String,
     analysis: Mutex<Option<Analysis>>,
+    // the visualiser's model of this generation, built on first use
+    vis_model: Mutex<Option<(String, Arc<vis::Model>)>>,
     // the advisory answer for this map generation; asking osv is a network round trip
     audit: Mutex<Option<(String, audit::AuditReport)>>,
     // security findings for this generation, keyed also by whether tests were included
     sast: Mutex<Option<(String, bool, sast::SastReport)>>,
     // the dependency delta per base ref for this generation
     deps: Mutex<DepsCache>,
+    // result handles and changesets for the edit tools - kept across map generations
+    edits: Mutex<edit::Store>,
 }
 
 type DepsCache = (String, BTreeMap<String, (String, Arc<deps::DepsReport>)>);
@@ -74,6 +85,7 @@ impl MapState {
     fn build(root: &Path) -> Result<MapState> {
         let files = scan::collect_files(root)?;
         let caches = scan::build_caches(root, &files);
+        let withdrawn = scan::withdrawn_files(root, &files, &caches);
         let root_label = root
             .file_name()
             .and_then(|s| s.to_str())
@@ -85,19 +97,23 @@ impl MapState {
             ts: render::now_ts(),
             contracts: ContractIndex::for_root(root, &caches),
             caches,
+            withdrawn,
             externals: manifest_deps(root),
             facade: cargo_package_name(root),
             watch_secs: None,
             html: true,
+            vis: false,
             // `--port 0` picks one at runtime
             origin: {
                 let d = ServeOptions::default();
                 format!("http://{}:{}", d.addr, d.port)
             },
             analysis: Mutex::new(None),
+            vis_model: Mutex::new(None),
             audit: Mutex::new(None),
             sast: Mutex::new(None),
             deps: Mutex::new((String::new(), BTreeMap::new())),
+            edits: Mutex::new(edit::Store::new()),
         })
     }
 
@@ -154,6 +170,7 @@ impl MapState {
         let before = self.caches.len();
         let files = scan::collect_files(&self.root)?;
         self.caches = scan::build_caches(&self.root, &files);
+        self.withdrawn = scan::withdrawn_files(&self.root, &files, &self.caches);
         self.contracts = ContractIndex::for_root(&self.root, &self.caches);
         self.externals = manifest_deps(&self.root);
         self.facade = cargo_package_name(&self.root);
@@ -165,6 +182,10 @@ impl MapState {
     // swap in a fresh map (built outside lock by watcher)
     fn swap_in(&mut self, caches: Vec<FileCache>) {
         self.caches = caches;
+        // the watcher hands over caches alone; the walk is cheap next to the parse
+        self.withdrawn = scan::collect_files(&self.root)
+            .map(|files| scan::withdrawn_files(&self.root, &files, &self.caches))
+            .unwrap_or_default();
         self.contracts = ContractIndex::for_root(&self.root, &self.caches);
         self.externals = manifest_deps(&self.root);
         self.facade = cargo_package_name(&self.root);
@@ -184,6 +205,28 @@ impl MapState {
         if let Ok(mut slot) = self.analysis.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.vis_model.lock() {
+            *slot = None;
+        }
+    }
+
+    // The visualiser's model of this map generation, built at most once.
+    fn vis_model(&self) -> Arc<vis::Model> {
+        let mut slot = self.vis_model.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((ts, model)) = slot.as_ref() {
+            if ts == &self.ts {
+                return Arc::clone(model);
+            }
+        }
+        let model = Arc::new(vis::Model::build(
+            &self.caches,
+            &self.root,
+            &self.root_label,
+            &self.ts,
+            &self.contracts,
+        ));
+        *slot = Some((self.ts.clone(), Arc::clone(&model)));
+        model
     }
 
     // The insights analysis for this map, computed at most once per
@@ -238,6 +281,12 @@ impl MapState {
         match matches.len() {
             1 => Ok(matches[0]),
             0 => {
+                if let Some(w) = self.withdrawn.iter().find(|w| w.as_str() == norm || w.ends_with(norm)) {
+                    return Err(format!(
+                        "`{w}` is withdrawn from the map by `ccc:skip`, so the map holds \
+                         nothing for it - read the source directly"
+                    ));
+                }
                 let mut close: Vec<String> = self
                     .caches
                     .iter()
@@ -389,9 +438,18 @@ fn q_index(map: &MapState, prefix: Option<&str>) -> Value {
             "exports": n.reexports,
         }));
     }
+    let withdrawn: Vec<&String> = map
+        .withdrawn
+        .iter()
+        .filter(|p| want.as_ref().map_or(true, |w| *p == w || p.starts_with(&format!("{w}/"))))
+        .collect();
     let mut out = json!({
         "root": map.root_label,
         "generated": map.ts,
+        // discovered but withdrawn by `ccc:skip` - named so a reader of the rows
+        // does not take the file for missing
+        "withdrawn": withdrawn,
+        "ignore_skip": crate::extract::skips_ignored(),
         "totals": {
             "files": files.len(),
             "funcs": totals.funcs,
@@ -615,6 +673,10 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
         };
         out["suggestions"] = Value::Array(nearest_names(map, &probe, 8));
         add_miss_evidence(map, &mut out, qualifier_raw);
+        // the query as written: a qualifier narrows text the way it narrows sites
+        if let Some(w) = withdrawn_matches(map, query.trim(), false) {
+            out["withdrawn"] = w;
+        }
     }
     Ok(out)
 }
@@ -767,7 +829,7 @@ fn nearest_names(map: &MapState, want: &str, limit: usize) -> Vec<Value> {
 
 // the kinds a lookup actually searched
 const SEARCHED_KINDS: &[&str] = &[
-    "func", "const", "type", "call", "use", "import", "reexport",
+    "func", "const", "type", "call", "use", "construct", "import", "reexport",
 ];
 
 // the module name a file's contents are reachable under from outside it
@@ -875,6 +937,100 @@ fn add_miss_evidence(map: &MapState, out: &mut Value, qualifier: Option<&str>) {
     }
 }
 
+// text matches listed for code `ccc:skip` withdrew
+const WITHDRAWN_CAP: usize = 25;
+
+// a file to search as text, and the line spans to keep to - all of it when `None`
+type Region<'a> = (String, Option<&'a [(usize, usize)]>);
+
+// Lines naming `name` inside code `ccc:skip` withdrew - whole files and
+// skipped functions alike. The map holds nothing there, so until those are
+// ruled out a miss is not evidence of absence. They are read off the source as
+// text and never resolved; a line that looks like a definition comes first.
+// `None` when nothing is withdrawn, which is the usual case.
+fn withdrawn_matches(map: &MapState, name: &str, whole_word: bool) -> Option<Value> {
+    let regions: Vec<Region> = map
+        .withdrawn
+        .iter()
+        .map(|f| (f.clone(), None))
+        .chain(
+            map.caches
+                .iter()
+                .filter(|c| !c.withdrawn.is_empty())
+                .map(|c| (map.path_of(c), Some(c.withdrawn.as_slice()))),
+        )
+        .collect();
+    if regions.is_empty() || name.is_empty() {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    let mut hits: Vec<(bool, Value)> = Vec::new();
+    for (path, spans) in &regions {
+        let Ok(src) = std::fs::read_to_string(map.root.join(path)) else { continue };
+        for (i, text) in src.lines().enumerate() {
+            let line = i + 1;
+            if spans.is_some_and(|s| !s.iter().any(|&(a, b)| line >= a && line <= b)) {
+                continue;
+            }
+            let found = if whole_word {
+                names_word(text, name)
+            } else {
+                text.to_ascii_lowercase().contains(&lower)
+            };
+            if found {
+                let shown: String = text.trim().chars().take(160).collect();
+                hits.push((
+                    looks_like_definition(text, name),
+                    json!({"file": path, "line": line, "text": shown}),
+                ));
+            }
+        }
+    }
+    let total = hits.len();
+    // definitions first; the sort is stable, so source order holds within each
+    hits.sort_by_key(|(def, _)| !def);
+    Some(json!({
+        "files": map.withdrawn,
+        "functions": regions
+            .iter()
+            .filter_map(|(p, s)| s.map(|s| json!({"file": p, "spans": s.len()})))
+            .collect::<Vec<_>>(),
+        "match_count": total,
+        "matches": hits.into_iter().take(WITHDRAWN_CAP).map(|(_, v)| v).collect::<Vec<_>>(),
+    }))
+}
+
+// `name` as a whole identifier, not inside a longer one
+fn names_word(text: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(i, _)| {
+        !text[..i].chars().next_back().is_some_and(ident)
+            && !text[i + name.len()..].chars().next().is_some_and(ident)
+    })
+}
+
+// does the identifier `name` sits in follow a definition keyword - `fn`,
+// `def`, `class`, ... - or open an odin `name :: proc` binding
+fn looks_like_definition(text: &str, name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "fn", "def", "func", "function", "class", "struct", "enum", "trait", "interface",
+        "type", "const", "let", "var", "static", "impl", "union", "mod", "namespace", "proc",
+    ];
+    // ascii lowering keeps every byte offset, so `at` indexes `text` as well
+    let Some(at) = text.to_ascii_lowercase().find(&name.to_ascii_lowercase()) else {
+        return false;
+    };
+    let start = text[..at]
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(0, |i| i + 1);
+    let last = text[..start]
+        .trim_end()
+        .rsplit(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    WORDS.contains(&last) || text[start..].split_once(" :: ").is_some_and(|(id, _)| !id.contains(' '))
+}
+
 fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     let symbol = symbol.trim();
     if symbol.is_empty() {
@@ -947,11 +1103,14 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
                 definitions.push(def);
             }
         }
+        // a construction is how a type is used when nothing calls it: a struct
+        // literal or a `new` names the type the way a call names a function
         for (kind, site) in c
             .calls
             .iter()
             .map(|s| ("call", s))
             .chain(c.uses.iter().map(|s| ("use", s)))
+            .chain(c.constructs.iter().map(|s| ("construct", s)))
         {
             let qualifier_ok = match qualifier {
                 None => true,
@@ -1056,9 +1215,15 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     if !rpcs.is_empty() {
         out["rpcs"] = Value::Array(rpcs);
     }
+    let miss = out["counts"]["definitions"] == 0 && total_refs == 0 && out.get("rpcs").is_none();
+    // Withdrawn code is searched on a hit too: `references` is the check before
+    // a rename or a delete, and a caller the map cannot see still breaks.
+    if let Some(w) = withdrawn_matches(map, name, true).filter(|w| miss || jnum(w, "match_count") > 0) {
+        out["withdrawn"] = w;
+    }
     // A miss is an answer, not an error: say what was covered and what to try,
     // so the lookup can be carried on rather than abandoned.
-    if out["counts"]["definitions"] == 0 && total_refs == 0 && out.get("rpcs").is_none() {
+    if miss {
         out["miss"] = json!(true);
         out["suggestions"] = Value::Array(nearest_names(map, name, 8));
         add_miss_evidence(map, &mut out, qualifier);
@@ -1743,7 +1908,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "references",
-            "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions and imports are covered, so a struct used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. An rpc declared in a `.proto` schema (looked up by any spelling - `CreateInvoice`, `create_invoice`, `Billing.CreateInvoice`, `acme.billing.v1.Billing/CreateInvoice`) also lists its handlers and its callers through generated stubs in every language, each with the evidence that tied it. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
+            "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, constructions (a struct literal, a `new`), qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions, constructions and imports are covered, so a struct that is only ever built, or used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. An rpc declared in a `.proto` schema (looked up by any spelling - `CreateInvoice`, `create_invoice`, `Billing.CreateInvoice`, `acme.billing.v1.Billing/CreateInvoice`) also lists its handlers and its callers through generated stubs in every language, each with the evidence that tied it. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
             json!({"symbol": {"type": "string", "description": "exact symbol name, optionally qualified (a::b or a.b)"}}),
             &["symbol"],
         ),
@@ -1795,7 +1960,7 @@ fn mcp_tools() -> Value {
             json!({"marker": {"type": "string", "description": "e.g. TODO (optional)"}}),
             &[],
         ),
-        tool("refresh", "CALL AFTER EDITING source files. Rescans the tree into memory; without it the map lags about three seconds behind your edit, and every other tool answers from that stale map.", json!({}), &[]),
+        tool("refresh", "RESCANS the tree into memory. `edit_apply` and `edit_revert` already do this before they answer; call it after a change made outside ccc - a branch switch, a person editing - when the next answer cannot wait the three seconds the watcher takes to notice.", json!({}), &[]),
 
         // analysis tools. All six are views onto one pass, computed once
         // per (map generation, base), paged.
@@ -1886,6 +2051,90 @@ fn mcp_tools() -> Value {
             &[],
         ),
 
+        // the write tools - the only way this project is changed
+        tool(
+            "edit_rename",
+            "CHANGES A NAME EVERYWHERE IT IS THE SAME SYMBOL, in one call instead of a read and an edit per file. Pass the `result` handle a `find` or `references` answer ends with, and `to`. A `references` handle renames that exact name; a `find` handle swaps the matched substring inside each identifier and keeps its case shape (`hello_all` -> `hi_all`, `HelloWorld` -> `HiWorld`). Renaming only the definitions would strand their callers, so each name is followed through every file the map ties to it - definitions, calls, usages, imports, re-exports, and lines the map does not index such as a `ccc:skip` body - provided it has exactly one definition and the lookup was not qualified. Only identifiers change: never a comment, a string, or the module segment of a path. Every same-named identifier it did NOT change is listed with the reason, under a new handle that pulls them in when passed back; comments and strings that spell the name are listed too, and a new name that collides with an existing definition is flagged. Stages a changeset and returns its diff - nothing is written until `edit_apply` (or apply=true).",
+            json!({
+                "result": {"type": "string", "description": "handle from `find` / `references` (or a follow-up handle an edit tool listed)"},
+                "to": {"type": "string", "description": "the new name; for a `find` handle, what replaces the matched substring"},
+                "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
+                "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
+            }),
+            &["result", "to"],
+        ),
+        tool(
+            "edit_replace",
+            "REPLACES WHAT A HANDLE POINTS AT with the text you pass. `target`: `token` (default) - the identifier at each site, e.g. qualifying calls `charge` -> `billing::charge`; `line` - each site's whole line; `definition` - the whole function, type or constant a definition site names, signature through closing line, while the doc comments and attributes above it stay. Text without leading indentation of its own is laid at the indentation of what it replaces. Nothing beyond the handle's sites is touched; `skip` leaves `path:line` sites out. Stages a changeset and returns its diff.",
+            json!({
+                "result": {"type": "string", "description": "handle from `find` / `references`"},
+                "text": {"type": "string", "description": "the replacement"},
+                "target": {"type": "string", "enum": ["token", "line", "definition"], "description": "what at each site is replaced (default token)"},
+                "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
+                "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
+            }),
+            &["result", "text"],
+        ),
+        tool(
+            "edit_delete",
+            "REMOVES WHAT A HANDLE POINTS AT: a definition together with the doc comments and attributes stacked on it, a call that is a statement on its own, a single-name import, a marker note. Refuses while anything still names a deleted definition - those sites are listed under a handle you can pass straight back to delete them in the same changeset - unless force=true. Refuses per site where removal would break the code around it (a call whose value is used, one name out of an import list) and says so; `edit_replace` or `edit_text` those. Stages a changeset and returns its diff.",
+            json!({
+                "result": {"type": "string", "description": "handle from `find` / `references`"},
+                "force": {"type": "boolean", "description": "delete even though other sites still name it (default false)"},
+                "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
+                "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
+            }),
+            &["result"],
+        ),
+        tool(
+            "edit_insert",
+            "ADDS CODE NEXT TO WHAT A HANDLE POINTS AT, without reading the file first: `position` `after` (default) or `before` the one site the handle names (use `skip` or a narrower lookup when it names more). Beside a definition the text lands after its closing line, or above its doc comments and attributes, with a blank line between; beside any other site it lands on the line after or before. Laid at the anchor's indentation unless the text brings its own. For a new function beside a related one, an import beside an existing one, a test after the last. Stages a changeset and returns its diff.",
+            json!({
+                "result": {"type": "string", "description": "handle from `find` / `references`"},
+                "text": {"type": "string", "description": "the code to add"},
+                "position": {"type": "string", "enum": ["after", "before"], "description": "which side of the site (default after)"},
+                "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
+                "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
+            }),
+            &["result", "text"],
+        ),
+        tool(
+            "edit_text",
+            "EVERY OTHER WRITE TO THIS PROJECT - lines inside a function, a config or doc file, a new file, a removed file. With `old`: replaces that exact text in `path`; it must occur once unless all=true, whitespace and indentation included. Without `old`: writes `new` as the whole file, creating it and its directories if needed. delete=true removes the file. The path stays inside the project root - no `..`, no symlinked directory or file, never `.git`, and under `.ccc` only map.json and surface.json. Stages a changeset and returns its diff; pass apply=true to write it in the same call when the diff would tell you nothing new.",
+            json!({
+                "path": {"type": "string", "description": "project-relative path"},
+                "old": {"type": "string", "description": "exact text to replace (omit to write the whole file)"},
+                "new": {"type": "string", "description": "the replacement, or the whole file"},
+                "all": {"type": "boolean", "description": "replace every occurrence of `old` (default false)"},
+                "delete": {"type": "boolean", "description": "remove the file (default false)"},
+                "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
+            }),
+            &["path"],
+        ),
+        tool(
+            "edit_apply",
+            "WRITES A STAGED CHANGESET - every file or none. Each file is checked against what it held when it was staged (one that changed since is refused, and the changeset stays pending), written through a temp file and an atomic rename, and the map is rescanned before this returns, so there is no `refresh` to call. A rename is verified by counting what in the project still carries the old name. The answer says `applied changeset <id>`; that id is what `edit_revert` takes.",
+            json!({"changeset": {"type": "string", "description": "the id a staging call returned"}}),
+            &["changeset"],
+        ),
+        tool(
+            "edit_discard",
+            "DROPS A STAGED CHANGESET without writing anything - every pending one when `changeset` is left out.",
+            json!({"changeset": {"type": "string", "description": "the id to drop (optional)"}}),
+            &[],
+        ),
+        tool(
+            "edit_revert",
+            "UNDOES AN APPLIED CHANGESET: every file it wrote is put back, files it created are removed and files it removed return - provided none has changed since, otherwise it refuses and names the file. The last 32 changesets applied while this server runs can be reverted.",
+            json!({"changeset": {"type": "string", "description": "the id `edit_apply` reported"}}),
+            &["changeset"],
+        ),
+
         // the one tool aimed at the person rather than the agent
         tool(
             "insights",
@@ -1894,6 +2143,23 @@ fn mcp_tools() -> Value {
             &[],
         ),
     ];
+    // tell a client which tools write, so it can ask before those and not before the rest
+    let tools: Vec<Value> = tools
+        .into_iter()
+        .map(|mut t| {
+            let name = t["name"].as_str().unwrap_or_default().to_string();
+            t["annotations"] = if name.starts_with("edit_") {
+                json!({
+                    "readOnlyHint": false,
+                    "destructiveHint": name != "edit_discard",
+                    "openWorldHint": false,
+                })
+            } else {
+                json!({"readOnlyHint": true})
+            };
+            t
+        })
+        .collect();
     json!({ "tools": tools })
 }
 
@@ -1912,10 +2178,10 @@ fn mcp_initialize(params: &Value) -> Value {
         "capabilities": {"tools": {}, "resources": {}},
         "serverInfo": {
             "name": "ccc",
-            "title": "CodeCaChe",
+            "title": "Collateral Code Check",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Code map of this project (the ccc CodeCaChe), held in \
+        "instructions": "Code map of this project (ccc, Collateral Code Check), held in \
             memory and refreshed automatically about three seconds after source changes.\n\n\
             1. SEARCHING - always start here. For any question about where something is \
             defined, called, imported or changed in this project, call a ccc tool before \
@@ -1924,16 +2190,34 @@ fn mcp_initialize(params: &Value) -> Value {
             (`serde_json::to_string`, `Encoding::O200kBase`) resolve directly. \
             Definitions, call sites, usages, imports and re-exports are all indexed, so \
             no hits is evidence of absence rather than a gap in coverage - a miss names \
-            the kinds it searched and the nearest indexed names. A module root (Rust \
+            the kinds it searched and the nearest indexed names. The one exception is \
+            code a `ccc:skip` comment withdrew: it is unindexed, not absent, so a miss \
+            also searches it as text and lists what it finds there, marked as not \
+            indexed - read those lines before concluding anything. A module root (Rust \
             `lib.rs`/`mod.rs`, a package `__init__.py`) defines nothing and is not \
             empty: it is read as the module graph and published surface it declares, and \
             a crate-facade path resolves through the `pub use` behind it. Use text \
             search only for non-symbol text: string literals, config, prose in \
             comments.\n\n\
-            2. EDITING - do not work from the map. It records where code is and how it \
-            connects, not its exact content: open the real source file before changing a \
-            line, and never hand-edit anything under `.ccc`, which is overwritten on the \
-            next scan. Call `refresh` after editing so later queries see your change.\n\n\
+            2. EDITING - ccc is the only writer in this project. Do not change files here \
+            with your own tools: no Edit, Write, MultiEdit, NotebookEdit or apply_patch, no \
+            `sed -i`, no `>` or `tee` redirection, no script that writes a file. Every change \
+            goes through the `edit_*` tools, which keep each write inside the project root \
+            (no `..`, no symlinks, never `.git`), check every file still holds what was \
+            staged, write all of them or none, rescan the map, and can be undone. For a \
+            symbol, take the `result` handle the last `find` or `references` answer ended \
+            with: `edit_rename` follows a name through every file the map ties to it and \
+            lists any same-named site it left alone, `edit_replace` swaps the token, line or \
+            whole definition at each site, `edit_delete` removes definitions, statement \
+            calls, imports or notes and refuses while anything still names what it removes, \
+            `edit_insert` adds code beside a site. For anything else - lines inside a \
+            function, config, docs, a new or removed file - `edit_text`. Each stages a \
+            changeset and shows its diff: read it, then `edit_apply` it (or pass apply=true \
+            when the diff would tell you nothing new); `edit_discard` drops one, \
+            `edit_revert` undoes an applied one. The map records where code is and how it \
+            connects, not every character of it: read the real source before writing code \
+            that depends on its exact text. Never write under `.ccc` except map.json and \
+            surface.json.\n\n\
             3. TOOLS. Map: `index` project overview - every file named in path order, \
             never collapsed into directory summaries, most projects whole; past ~1000 \
             lines the rest waits behind `offset`, and `path` narrows to a subtree. \
@@ -1956,7 +2240,10 @@ fn mcp_initialize(params: &Value) -> Value {
             resolve to, runtime ones first, `deps` what this branch did to that dependency tree - \
             what entered it, what left, what moved version and which advisories that introduced. \
             `security` syntax-level security findings in this \
-            project's own code - secrets, disabled TLS, injection surfaces. For a person rather \
+            project's own code - secrets, disabled TLS, injection surfaces. Edits: \
+            `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` and `edit_text` \
+            stage a changeset, `edit_apply` writes it, `edit_discard` drops it, \
+            `edit_revert` undoes it. For a person rather \
             than an agent: `insights` opens the UI over that same analysis in their \
             browser - call it when they ask to *see* the code, not to read about it. \
             The analysis tools are \
@@ -2144,6 +2431,15 @@ fn md_index(v: &Value, page: &Page) -> String {
             jnum(v, "project_files"),
         ));
     }
+    if jbool(v, "ignore_skip") {
+        out.push_str("`ccc:skip` is ignored (--ignore-skip): code it marks is mapped like the rest\n");
+    }
+    let withdrawn = jnames(v, "withdrawn");
+    if !withdrawn.is_empty() {
+        out.push_str(&format!(
+            "withdrawn by `ccc:skip`, so not in the rows below: {withdrawn}\n"
+        ));
+    }
     out.push('\n');
     if files.is_empty() {
         out.push_str("no mapped files here\n");
@@ -2300,6 +2596,7 @@ fn md_miss(v: &Value) -> String {
     }
     let suggestions = jarr(v, "suggestions");
     let mut out = format!("\nsearched kinds: {}\n", jnames(v, "searched"));
+    let withdrawn_hits = v.get("withdrawn").map_or(0, |w| jnum(w, "match_count"));
     // the verdict on the qualifier
     if let Some(q) = v.get("qualifier").and_then(|x| x.as_str()) {
         let sites = jnum(v, "qualifier_sites");
@@ -2323,6 +2620,12 @@ fn md_miss(v: &Value) -> String {
                 "`{q}` is {d}, but no call, use or import site in the map names it. \
                  A dependency declared and never referenced is worth checking by hand.\n"
             ));
+        } else if withdrawn_hits > 0 {
+            out.push_str(&format!(
+                "`{q}` is named by no site in the map and declared in no manifest - \
+                 but code `ccc:skip` withdrew names it below, so this is not evidence \
+                 of absence.\n"
+            ));
         } else {
             out.push_str(&format!(
                 "`{q}` is named by no site in the map and declared in no manifest. \
@@ -2338,10 +2641,46 @@ fn md_miss(v: &Value) -> String {
             .collect();
         out.push_str(&format!("nearest indexed names: {}\n", names.join("; ")));
     }
-    out.push_str(
+    out.push_str(&md_withdrawn(v));
+    out.push_str(if withdrawn_hits > 0 {
+        "next: read the withdrawn lines above - real source the map does not index.\n"
+    } else {
         "next: `dependencies` for file-level edges, or text search for string \
-         literals and config.\n",
+         literals and config.\n"
+    });
+    out
+}
+
+// Code `ccc:skip` withdrew is unindexed, not absent: an answer only rules it
+// out once it has been searched as text too, so it shows what that found.
+fn md_withdrawn(v: &Value) -> String {
+    let Some(w) = v.get("withdrawn") else {
+        return String::new();
+    };
+    let files = jnames(w, "files");
+    let funcs: i64 = jarr(w, "functions").iter().map(|f| jnum(f, "spans")).sum();
+    let scope = match (files.is_empty(), funcs) {
+        (true, n) => format!("{n} withdrawn function(s)"),
+        (false, 0) => format!("withdrawn file(s): {files}"),
+        (false, n) => format!("withdrawn file(s): {files}; {n} withdrawn function(s)"),
+    };
+    let matches = jarr(w, "matches");
+    if matches.is_empty() {
+        return format!("not in code `ccc:skip` withdrew either - searched as text ({scope})\n");
+    }
+    let total = jnum(w, "match_count");
+    let mut out = format!(
+        "\n## in code `ccc:skip` withdrew - {total} text match(es)\n\
+         not indexed ({scope}): source lines, not resolved sites - open the file to \
+         confirm each\n"
     );
+    for m in &matches {
+        out.push_str(&format!("{}:{} `{}`\n", jstr(m, "file"), jnum(m, "line"), jstr(m, "text")));
+    }
+    let shown = matches.len() as i64;
+    if total > shown {
+        out.push_str(&format!("... and {} more\n", total - shown));
+    }
     out
 }
 
@@ -2411,6 +2750,10 @@ fn md_references(v: &Value) -> String {
              type - so they are not this symbol.\n{name_only}",
             jstr(v, "qualifier"),
         ));
+    }
+    // a miss renders withdrawn code inside its own verdict
+    if !jbool(v, "miss") {
+        out.push_str(&md_withdrawn(v));
     }
     out.push_str(&md_miss(v));
     out
@@ -3342,6 +3685,15 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         .map_err(|e| format!("{program}: {e}"))
 }
 
+// what `insights` opens the page with - tests dispatch every tool, and must never launch a real browser doing it
+fn launcher() -> fn(&str) -> Result<(), String> {
+    if cfg!(test) {
+        |_| Err("not opened - tests never launch a browser".into())
+    } else {
+        open_in_browser
+    }
+}
+
 // open the insights page
 fn q_insights(map: &MapState, open: impl Fn(&str) -> Result<(), String>) -> Result<String, String> {
     let url = format!("{}/insights", map.origin);
@@ -3384,13 +3736,24 @@ fn q_insights(map: &MapState, open: impl Fn(&str) -> Result<(), String>) -> Resu
     Ok(out)
 }
 
-fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64, String)> {
+// `browser` - the request carried an Origin header, which agents never send and a page always does
+fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(|n| n.as_str())
         .ok_or((-32602, "missing tool name".to_string()))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let arg = |k: &str| args.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    if name.starts_with("edit_") {
+        if browser {
+            return Ok(mcp_md(
+                "error: the edit tools refuse requests from a browser page - only an agent's MCP client may write to this project",
+                true,
+            ));
+        }
+        return Ok(edit_tool_call(state, name, &args));
+    }
 
     if name == "refresh" {
         let mut map = state.write().expect("map lock poisoned");
@@ -3446,13 +3809,16 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
             &q_index(&map, arg("path").as_deref()),
             &Page::from(&args, INDEX_DEFAULT_ROWS),
         )),
-        "find" => q_find(
-            &map,
-            &arg("query").unwrap_or_default(),
-            arg("kind").as_deref().unwrap_or("any"),
-        )
-        .map(|v| md_find(&v)),
-        "references" => q_references(&map, &arg("symbol").unwrap_or_default()).map(|v| md_references(&v)),
+        "find" => {
+            let query = arg("query").unwrap_or_default();
+            q_find(&map, &query, arg("kind").as_deref().unwrap_or("any")).map(|v| {
+                let (qualifier, name) = split_query(&query);
+                let sites = edit::ResultSet::from_find(&v, name, qualifier.is_some());
+                md_find(&v) + &handle_line(&map, sites)
+            })
+        }
+        "references" => q_references(&map, &arg("symbol").unwrap_or_default())
+            .map(|v| md_references(&v) + &handle_line(&map, edit::ResultSet::from_references(&v))),
         "dependencies" => q_dependencies(&map, arg("file").as_deref()).map(|v| md_dependencies(&v)),
         "file" => q_file(&map, &arg("path").unwrap_or_default()).map(|v| {
             if structured {
@@ -3556,7 +3922,7 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
                 Page::from(&args, 25),
             ))
         }
-        "insights" => q_insights(&map, open_in_browser),
+        "insights" => q_insights(&map, launcher()),
         _ => return Err((-32602, format!("unknown tool '{name}'"))),
     };
     Ok(match out {
@@ -3565,12 +3931,98 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value) -> Result<Value, (i64
     })
 }
 
+// the handle an edit tool takes, closing a `find` / `references` answer that has sites
+fn handle_line(map: &MapState, sites: edit::ResultSet) -> String {
+    if sites.sites.is_empty() || sites.pattern.is_empty() {
+        return String::new();
+    }
+    let (n, capped) = (sites.sites.len(), sites.truncated);
+    let id = map.edits.lock().unwrap_or_else(|p| p.into_inner()).record(sites);
+    if capped {
+        format!("\nhandle: `{id}` - capped, so no edit tool takes it; narrow the lookup first\n")
+    } else {
+        format!(
+            "\nhandle: `{id}` ({n} site(s)) - pass result=\"{id}\" to `edit_rename`, `edit_replace`, `edit_delete` or `edit_insert`\n"
+        )
+    }
+}
+
+// the write tools - everything else here only reads
+fn edit_tool_call(state: &RwLock<MapState>, name: &str, args: &Value) -> Value {
+    let s = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let need = |k: &str| s(k).ok_or_else(|| format!("missing `{k}`"));
+    let flag = |k: &str| args.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let stage = edit::Stage {
+        changeset: s("changeset"),
+        apply: flag("apply"),
+        skip: args
+            .get("skip")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+    };
+    let out = {
+        let map = state.read().expect("map lock poisoned");
+        let ctx = edit::Ctx { root: &map.root, caches: &map.caches };
+        let mut store = map.edits.lock().unwrap_or_else(|p| p.into_inner());
+        let store = &mut *store;
+        match name {
+            "edit_rename" => need("result")
+                .and_then(|r| need("to").and_then(|to| edit::rename(&ctx, store, &r, &to, &stage))),
+            "edit_replace" => need("result").and_then(|r| {
+                need("text").and_then(|t| {
+                    let target = s("target").unwrap_or_else(|| "token".into());
+                    edit::replace(&ctx, store, &r, &t, &target, &stage)
+                })
+            }),
+            "edit_delete" => need("result").and_then(|r| edit::delete(&ctx, store, &r, flag("force"), &stage)),
+            "edit_insert" => need("result").and_then(|r| {
+                need("text").and_then(|t| {
+                    let position = s("position").unwrap_or_else(|| "after".into());
+                    edit::insert(&ctx, store, &r, &t, &position, &stage)
+                })
+            }),
+            "edit_text" => need("path").and_then(|p| {
+                edit::text(
+                    &ctx,
+                    store,
+                    &p,
+                    s("old").as_deref(),
+                    s("new").as_deref(),
+                    flag("all"),
+                    flag("delete"),
+                    &stage,
+                )
+            }),
+            "edit_apply" => need("changeset").and_then(|c| edit::apply(&map.root, store, &c)),
+            "edit_discard" => edit::discard(store, s("changeset").as_deref()),
+            "edit_revert" => need("changeset").and_then(|c| edit::revert(&map.root, store, &c)),
+            _ => Err(format!("unknown edit tool '{name}'")),
+        }
+    };
+    match out {
+        Ok(done) => {
+            let mut text = done.text;
+            // a write landed - fold it into the map before anyone asks again
+            if done.wrote {
+                let mut map = state.write().expect("map lock poisoned");
+                match map.rescan() {
+                    Ok((_, after)) => text.push_str(&format!("map rescanned: {after} files (generated {})\n", map.ts)),
+                    Err(e) => text.push_str(&format!("the map did not rescan ({e}) - call `refresh`\n")),
+                }
+            }
+            mcp_md(&text, false)
+        }
+        Err(e) => mcp_md(&format!("error: {e}"), true),
+    }
+}
+
 fn mcp_resources_list(state: &RwLock<MapState>) -> Value {
     let map = state.read().expect("map lock poisoned");
     let mut resources = vec![json!({
         "uri": "ccc://index",
         "name": "CCC.md",
-        "description": "CodeCaChe index for the whole project",
+        "description": "ccc index for the whole project",
         "mimeType": "text/markdown",
     })];
     for c in &map.caches {
@@ -3605,7 +4057,13 @@ fn mcp_resources_read(state: &RwLock<MapState>, params: &Value) -> Result<Value,
     Ok(json!({"contents": [{"uri": uri, "mimeType": "text/markdown", "text": text}]}))
 }
 
+#[cfg(test)]
 fn mcp_handle(state: &RwLock<MapState>, msg: &Value) -> Option<Value> {
+    mcp_handle_from(state, msg, false)
+}
+
+// `browser` - the request came from a page (it carried an Origin), so nothing may be written for it
+fn mcp_handle_from(state: &RwLock<MapState>, msg: &Value, browser: bool) -> Option<Value> {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = msg.get("id").cloned();
     if method.is_empty() || id.is_none() || id == Some(Value::Null) {
@@ -3616,7 +4074,7 @@ fn mcp_handle(state: &RwLock<MapState>, msg: &Value) -> Option<Value> {
         "initialize" => Ok(mcp_initialize(&params)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(mcp_tools()),
-        "tools/call" => mcp_tool_call(state, &params),
+        "tools/call" => mcp_tool_call(state, &params, browser),
         "resources/list" => Ok(mcp_resources_list(state)),
         "resources/read" => mcp_resources_read(state, &params),
         _ => Err((-32601, format!("method not found: {method}"))),
@@ -3894,12 +4352,20 @@ const ENDPOINTS: &[&str] = &[
     "GET /prompts[?base=<ref>] (which claude/copilot request produced each change)",
     "GET /insights.json[?base=<ref>] (the whole analysis payload)",
     "GET /insights (human UI over the same data; off with --no-html)",
+    "GET /vis.json | /vis/code?file=<path> | /vis/flow?file=<path>&line=<n> (architecture levels)",
+    "GET /vis (architecture visualiser; on with --vis)",
     "POST /refresh",
     "POST /mcp (Model Context Protocol, JSON-RPC)",
     "GET /fragment/{find,references,dependencies,health} (HTML for HTMX)",
 ];
 
+#[cfg(test)]
 fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Reply {
+    route_from(state, method, url, body, None)
+}
+
+// `origin` - the request's Origin header; agents send none, pages always do
+fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], origin: Option<&str>) -> Reply {
     let (path, params) = parse_query(url);
     let get = |k: &str| params.get(k).map(|s| s.as_str());
 
@@ -3915,6 +4381,8 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
                 "files": map.caches.len(),
                 "generated": map.ts,
                 "watch_secs": map.watch_secs,
+                // `--ignore-skip`: code `ccc:skip` marks is mapped like the rest
+                "ignore_skip": crate::extract::skips_ignored(),
                 "version": env!("CARGO_PKG_VERSION"),
             }))
         }
@@ -4019,6 +4487,43 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
             }
             html_ok(crate::html::render_insights_html(&map.root_label, None))
         }
+        // the architecture visualiser: the page is on with `ccc run --vis`, the
+        // data behind it always, the way /insights.json outlives --no-html
+        ("GET", "/vis") => {
+            let map = state.read().expect("map lock poisoned");
+            if !map.vis {
+                return bad(
+                    404,
+                    "the visualiser is off; restart as `ccc run --vis` (its data is at \
+                     /vis.json either way)",
+                );
+            }
+            html_ok(vis::page(&map.root_label))
+        }
+        ("GET", "/vis.json") => {
+            let map = state.read().expect("map lock poisoned");
+            ok(map.vis_model().overview().clone())
+        }
+        ("GET", "/vis/code") => {
+            let Some(file) = get("file") else {
+                return bad(400, "missing ?file=<path>");
+            };
+            let map = state.read().expect("map lock poisoned");
+            match map.vis_model().code(&map.caches, file) {
+                Ok(v) => ok(v),
+                Err(e) => bad(404, e),
+            }
+        }
+        ("GET", "/vis/flow") => {
+            let (Some(file), Some(line)) = (get("file"), get("line").and_then(|l| l.parse().ok())) else {
+                return bad(400, "missing ?file=<path>&line=<n>");
+            };
+            let map = state.read().expect("map lock poisoned");
+            match map.vis_model().flow(&map.caches, &map.root, file, line, get("name")) {
+                Ok(v) => ok(v),
+                Err(e) => bad(404, e),
+            }
+        }
         // HTML fragments for the HTMX live-query panel (always 200, errors inline)
         ("GET", "/fragment/health") => {
             let map = state.read().expect("map lock poisoned");
@@ -4076,7 +4581,7 @@ fn route(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8]) -> Repl
                     }
                 }
             };
-            match mcp_handle(state, &msg) {
+            match mcp_handle_from(state, &msg, origin.is_some()) {
                 Some(resp) => ok(resp),
                 // notification: acknowledged, no body
                 None => Reply {
@@ -4102,6 +4607,7 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
         let mut map = state.write().expect("map lock poisoned");
         map.watch_secs = opts.watch.map(|d| d.as_secs());
         map.html = opts.html;
+        map.vis = opts.vis;
         if map.caches.is_empty() {
             eprintln!("warning: no supported source files under {}", root.display());
         }
@@ -4130,6 +4636,13 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     println!("endpoints: {}", ENDPOINTS.join(" | "));
     if opts.html {
         println!("insights UI: http://{addr}/insights");
+    }
+    if opts.vis {
+        let url = format!("{}/vis", state.read().expect("map lock poisoned").origin);
+        println!("visualiser: {url}");
+        if let Err(e) = launcher()(&url) {
+            println!("  (could not open a browser: {e})");
+        }
     }
     println!("dependency delta: http://{addr}/deps.json[?base=<ref>]");
     match opts.watch {
@@ -4180,7 +4693,7 @@ fn handle_request(state: &RwLock<MapState>, mut request: tiny_http::Request) {
         if request.as_reader().read_to_end(&mut body).is_err() {
             bad(400, "could not read request body")
         } else {
-            route(state, &method, &url, &body)
+            route_from(state, &method, &url, &body, origin.as_deref())
         }
     };
 
@@ -5352,7 +5865,11 @@ mod tests {
             .to_string();
         // the two rules a caller has to get right
         assert!(text.contains("SEARCHING - always start here"), "{text}");
-        assert!(text.contains("EDITING - do not work from the map"), "{text}");
+        assert!(text.contains("EDITING - ccc is the only writer in this project"), "{text}");
+        // the agent's own write tools are named, so the rule cannot be read around
+        for own in ["Edit", "Write", "MultiEdit", "NotebookEdit", "sed -i"] {
+            assert!(text.contains(own), "instructions never rule out {own}");
+        }
         for t in mcp_tools()["tools"].as_array().unwrap() {
             let name = t["name"].as_str().unwrap();
             assert!(
@@ -5406,9 +5923,22 @@ mod tests {
                 "lints",
                 "hot",
                 "services",
+                "edit_rename", // the only writers
+                "edit_replace",
+                "edit_delete",
+                "edit_insert",
+                "edit_text",
+                "edit_apply",
+                "edit_discard",
+                "edit_revert",
                 "insights", // for user only
             ]
         );
+        // a client can tell the writers from the readers without knowing the names
+        for t in list["result"]["tools"].as_array().unwrap() {
+            let writes = t["name"].as_str().unwrap().starts_with("edit_");
+            assert_eq!(t["annotations"]["readOnlyHint"], !writes, "{}", t["name"]);
+        }
         // tools/call find
         let call = mcp_handle(
             &state,
@@ -5616,6 +6146,33 @@ mod tests {
         assert_eq!(pre.status, 204);
     }
 
+    // The page is behind `--vis`; the data behind it always answers, the way
+    // /insights.json outlives --no-html.
+    #[test]
+    fn the_visualiser_page_needs_vis_and_its_data_does_not() {
+        let state = RwLock::new(fixture());
+        assert_eq!(route(&state, "GET", "/vis", b"").status, 404);
+        let data = route(&state, "GET", "/vis.json", b"");
+        assert_eq!(data.status, 200);
+        assert_eq!(json_of(&data)["schema"], vis::SCHEMA);
+        assert!(json_of(&data)["components"].as_array().unwrap().iter().any(|c| c["id"] == "lib/money.rs"));
+
+        state.write().unwrap().vis = true;
+        let page = route(&state, "GET", "/vis", b"");
+        assert_eq!(page.status, 200);
+        let html = html_of(&page);
+        assert!(html.contains("ccc vis") && html.contains("layoutFlow"), "the page and its script are inlined");
+        assert!(!html.contains("/*__CCC_VIS_JS__*/"), "every placeholder is filled");
+
+        let code = route(&state, "GET", "/vis/code?file=lib%2Fmoney.rs", b"");
+        assert_eq!(code.status, 200);
+        assert_eq!(json_of(&code)["file"], "lib/money.rs");
+        assert_eq!(route(&state, "GET", "/vis/code", b"").status, 400);
+        assert_eq!(route(&state, "GET", "/vis/code?file=ghost.rs", b"").status, 404);
+        assert_eq!(route(&state, "GET", "/vis/flow?file=lib%2Fmoney.rs", b"").status, 400);
+        assert_eq!(route(&state, "GET", "/vis/flow?file=lib%2Fmoney.rs&line=9999", b"").status, 404);
+    }
+
     // Call every analysis tool the way an agent would, and check the two
     // things that make one usable: it renders as markdown rather than raw
     // JSON, and a list it cannot fit says how to get the rest.
@@ -5793,6 +6350,11 @@ mod tests {
         assert!(headless.contains("give the user the URL"), "{headless}");
         assert!(headless.contains("xdg-open: not found"), "{headless}");
         assert!(headless.contains("http://127.0.0.1:7788/insights"), "{headless}");
+
+        // dispatched the way an agent calls it, a test run still opens nothing
+        let state = RwLock::new(fixture());
+        let (err, out) = tool(&state, "insights", json!({}));
+        assert!(!err && out.contains("tests never launch a browser"), "{out}");
     }
 
     #[test]
@@ -5847,5 +6409,333 @@ mod tests {
         assert!(origin_ok(Some("null")));
         assert!(!origin_ok(Some("https://evil.example.com")));
         assert!(!origin_ok(Some("http://nullable.example.com")));
+    }
+
+    // a project on disk the edit tools can write to - removed on drop
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(tag: &str, files: &[(&str, &str)]) -> (Scratch, RwLock<MapState>) {
+        let dir = std::env::temp_dir().join(format!("ccc-serve-edit-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let p = dir.join(path);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        }
+        let state = RwLock::new(MapState::build(&dir).unwrap());
+        (Scratch(dir), state)
+    }
+
+    fn tool(state: &RwLock<MapState>, name: &str, args: Value) -> (bool, String) {
+        let v = mcp_handle(
+            state,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": args}}),
+        )
+        .unwrap();
+        (
+            v["result"]["isError"].as_bool().unwrap_or(false),
+            v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    // the id that follows `marker` in an answer - a handle or a changeset
+    fn id_after(text: &str, marker: &str) -> String {
+        let at = text.find(marker).unwrap_or_else(|| panic!("no `{marker}` in:\n{text}")) + marker.len();
+        text[at..].split('`').next().unwrap().to_string()
+    }
+
+    fn read(dir: &Scratch, path: &str) -> String {
+        fs::read_to_string(dir.0.join(path)).unwrap()
+    }
+
+    // Code `ccc:skip` withdrew is unindexed, not absent: a lookup that misses
+    // has to say where it could not look, and show what the text there holds.
+    #[test]
+    fn a_miss_searches_the_code_ccc_skip_withdrew() {
+        let (_dir, state) = scratch(
+            "withdrawn",
+            &[
+                // a blank line under the marker: the whole file goes
+                (
+                    "src/hidden.rs",
+                    "//! generated\n// ccc:skip\n\npub fn detect_crossings() -> usize { 1 }\n",
+                ),
+                // directly above a definition: only that function goes
+                (
+                    "src/main.rs",
+                    "use std::fmt;\n// ccc:skip\nfn shadow() { reach_out(); }\n\nfn main() { println!(\"hi\"); }\n",
+                ),
+            ],
+        );
+        let map = state.read().unwrap();
+        assert_eq!(map.withdrawn, vec!["src/hidden.rs".to_string()]);
+
+        let v = q_find(&map, "detect_crossings", "any").unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["withdrawn"]["match_count"], 1, "{v}");
+        assert_eq!(v["withdrawn"]["matches"][0]["file"], "src/hidden.rs");
+        assert_eq!(v["withdrawn"]["matches"][0]["line"], 4);
+        let md = md_find(&v);
+        assert!(md.contains("in code `ccc:skip` withdrew"), "{md}");
+        assert!(md.contains("src/hidden.rs:4"), "{md}");
+
+        // a function withdrawn from a mapped file is searched too - its span only
+        let r = q_references(&map, "reach_out").unwrap();
+        assert_eq!(r["withdrawn"]["match_count"], 1, "{r}");
+        assert_eq!(r["withdrawn"]["matches"][0]["line"], 3);
+
+        // nothing withdrawn names it either, and the answer says it looked
+        let none = q_references(&map, "nowhere_at_all").unwrap();
+        assert_eq!(none["withdrawn"]["match_count"], 0);
+        assert!(md_references(&none).contains("not in code `ccc:skip` withdrew either"));
+
+        // the index names the withdrawn file, and `file` explains a lookup of it
+        assert!(idx_md(&q_index(&map, None)).contains("withdrawn by `ccc:skip`"));
+        let err = q_file(&map, "src/hidden.rs").unwrap_err();
+        assert!(err.contains("ccc:skip"), "{err}");
+    }
+
+    #[test]
+    fn a_find_handle_renames_the_definitions_and_follows_them_to_their_callers() {
+        let (dir, state) = scratch(
+            "rename",
+            &[
+                (
+                    "src/greet.rs",
+                    "pub fn hello_all() -> Result<(), String> { Ok(()) }\npub fn hello_world() -> Result<(), String> {\n    Ok(())\n}\n",
+                ),
+                (
+                    "src/main.rs",
+                    "mod greet;\nfn main() {\n    greet::hello_all().unwrap();\n    // hello_world is the second greeting\n    greet::hello_world().unwrap();\n    let _s = \"hello_world\";\n}\n",
+                ),
+            ],
+        );
+        let (err, found) = tool(&state, "find", json!({"query": "hello"}));
+        assert!(!err, "{found}");
+        let handle = id_after(&found, "handle: `");
+
+        let (err, staged) = tool(&state, "edit_rename", json!({"result": handle, "to": "hi"}));
+        assert!(!err, "{staged}");
+        assert!(staged.contains("`hello_all` -> `hi_all`") && staged.contains("`hello_world` -> `hi_world`"), "{staged}");
+        assert!(staged.contains("+pub fn hi_all()"), "the diff is shown before anything is written: {staged}");
+        // the comment and the string spell a name and are listed, not changed
+        assert!(staged.contains("comments and strings that spell an old name"), "{staged}");
+        assert!(read(&dir, "src/greet.rs").contains("hello_all"), "staging writes nothing");
+
+        let cs = id_after(&staged, "changeset `");
+        let (err, applied) = tool(&state, "edit_apply", json!({"changeset": cs}));
+        assert!(!err, "{applied}");
+        assert!(applied.contains(&format!("applied changeset `{cs}`")), "{applied}");
+        assert_eq!(
+            read(&dir, "src/greet.rs"),
+            "pub fn hi_all() -> Result<(), String> { Ok(()) }\npub fn hi_world() -> Result<(), String> {\n    Ok(())\n}\n"
+        );
+        let main = read(&dir, "src/main.rs");
+        assert!(main.contains("greet::hi_all().unwrap();") && main.contains("greet::hi_world().unwrap();"), "{main}");
+        assert!(main.contains("// hello_world is the second greeting") && main.contains("\"hello_world\""), "{main}");
+        // the map already sees the change - no `refresh` needed
+        let (_, after) = tool(&state, "find", json!({"query": "hi_all"}));
+        assert!(after.contains("src/greet.rs"), "{after}");
+
+        // and it can be taken back
+        let (err, reverted) = tool(&state, "edit_revert", json!({"changeset": cs}));
+        assert!(!err, "{reverted}");
+        assert!(read(&dir, "src/greet.rs").contains("pub fn hello_all()"));
+        assert!(read(&dir, "src/main.rs").contains("greet::hello_all()"));
+    }
+
+    #[test]
+    fn a_rename_reaches_code_the_map_skips() {
+        let (dir, state) = scratch(
+            "skip",
+            &[(
+                "src/lib.rs",
+                "fn condense(t: &str) -> String { t.to_string() }\n\n// ccc:skip\nfn hidden(t: &str) -> String {\n    condense(t)\n}\n\npub fn shown(t: &str) -> String { condense(t) }\n",
+            )],
+        );
+        let (_, refs) = tool(&state, "references", json!({"symbol": "condense"}));
+        // the skipped body is no indexed site - it shows only as withdrawn text
+        let indexed = refs.split("## in code `ccc:skip` withdrew").next().unwrap_or_default();
+        assert!(!indexed.contains(":5 "), "the skipped body is not in the map: {refs}");
+        assert!(refs.contains("src/lib.rs:5 `condense(t)`"), "{refs}");
+        let handle = id_after(&refs, "handle: `");
+        let (err, out) = tool(&state, "edit_rename", json!({"result": handle, "to": "summarise", "apply": true}));
+        assert!(!err, "{out}");
+        assert!(out.contains("1 followed"), "{out}");
+        let lib = read(&dir, "src/lib.rs");
+        assert!(!lib.contains("condense"), "{lib}");
+        assert!(lib.contains("    summarise(t)\n"), "{lib}");
+    }
+
+    // A type that is built and never called - a struct literal, a `new` - is still
+    // found where it is constructed, without compiling anything, and a rename
+    // that starts from `references` reaches those sites too.
+    #[test]
+    fn references_find_where_a_type_is_constructed() {
+        let (dir, state) = scratch(
+            "construct",
+            &[
+                ("src/model.rs", "pub struct Point { pub x: i32 }\n\npub fn origin() -> Point {\n    Point { x: 0 }\n}\n"),
+                (
+                    "src/main.rs",
+                    "mod model;\nuse model::Point;\n\nfn main() {\n    let p = Point { x: 1 };\n    let _q = model::Point { x: p.x };\n}\n",
+                ),
+                ("web/app.js", "class Widget {}\nfunction make() { return new Widget(); }\n"),
+            ],
+        );
+        {
+            let map = state.read().unwrap();
+            let r = q_references(&map, "Point").unwrap();
+            let built: Vec<(String, u64, Option<String>)> = r["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|x| x["kind"] == "construct")
+                .map(|x| (
+                    x["file"].as_str().unwrap().to_string(),
+                    x["line"].as_u64().unwrap(),
+                    x["qualifier"].as_str().map(str::to_string),
+                ))
+                .collect();
+            assert_eq!(
+                built,
+                [
+                    ("src/main.rs".to_string(), 5, None),
+                    ("src/main.rs".to_string(), 6, Some("model".to_string())),
+                    ("src/model.rs".to_string(), 4, None),
+                ],
+                "{r:#}"
+            );
+            // a qualifier narrows constructions the way it narrows calls
+            let narrowed = q_references(&map, "model::Point").unwrap();
+            assert_eq!(narrowed["references"].as_array().unwrap().iter().filter(|x| x["kind"] == "construct").count(), 1);
+            let js = q_references(&map, "Widget").unwrap();
+            assert!(js["references"].as_array().unwrap().iter().any(|x| x["kind"] == "construct" && x["line"] == 2));
+            assert!(md_references(&r).contains("construct"));
+        }
+
+        let (_, refs) = tool(&state, "references", json!({"symbol": "Point"}));
+        let handle = id_after(&refs, "handle: `");
+        let (err, out) = tool(&state, "edit_rename", json!({"result": handle, "to": "Spot", "apply": true}));
+        assert!(!err, "{out}");
+        let main = read(&dir, "src/main.rs");
+        assert!(main.contains("Spot { x: 1 }") && main.contains("model::Spot { x: p.x }"), "{main}");
+        assert!(read(&dir, "src/model.rs").contains("    Spot { x: 0 }"));
+    }
+
+    #[test]
+    fn a_shared_name_is_not_followed_but_handed_back() {
+        let (dir, state) = scratch(
+            "shared",
+            &[
+                ("a.rs", "pub fn helper() -> u32 { 1 }\npub fn use_a() -> u32 { helper() }\n"),
+                ("b.rs", "pub fn helper() -> u32 { 2 }\npub fn use_b() -> u32 { helper() }\n"),
+            ],
+        );
+        let (_, found) = tool(&state, "find", json!({"query": "helper", "kind": "func"}));
+        let (err, staged) = tool(&state, "edit_rename", json!({"result": id_after(&found, "handle: `"), "to": "aid"}));
+        assert!(!err, "{staged}");
+        assert!(staged.contains("2 definitions share the name"), "{staged}");
+        let cs = id_after(&staged, "changeset `");
+        // the follow-up handle pulls the callers into the same changeset
+        let rest = id_after(&staged, "handle `");
+        let (err, more) = tool(&state, "edit_rename", json!({"result": rest, "to": "aid", "changeset": cs}));
+        assert!(!err, "{more}");
+        let (err, applied) = tool(&state, "edit_apply", json!({"changeset": cs}));
+        assert!(!err, "{applied}");
+        assert!(applied.contains("verified: no identifier in the project is still named `helper`"), "{applied}");
+        assert_eq!(read(&dir, "a.rs"), "pub fn aid() -> u32 { 1 }\npub fn use_a() -> u32 { aid() }\n");
+    }
+
+    #[test]
+    fn a_delete_refuses_while_callers_remain_and_takes_them_when_handed_back() {
+        let (dir, state) = scratch(
+            "delete",
+            &[(
+                "src/lib.rs",
+                "/// tidy the input\n#[inline]\nfn tidy(x: u32) -> u32 { x }\n\nfn keep() -> u32 {\n    tidy(1);\n    2\n}\n",
+            )],
+        );
+        let (_, found) = tool(&state, "find", json!({"query": "tidy", "kind": "func"}));
+        let (err, refused) = tool(&state, "edit_delete", json!({"result": id_after(&found, "handle: `")}));
+        assert!(err, "a definition with a live caller is not deleted: {refused}");
+        assert!(refused.contains("src/lib.rs:6"), "{refused}");
+
+        let (_, refs) = tool(&state, "references", json!({"symbol": "tidy"}));
+        let (err, out) = tool(&state, "edit_delete", json!({"result": id_after(&refs, "handle: `"), "apply": true}));
+        assert!(!err, "{out}");
+        assert_eq!(read(&dir, "src/lib.rs"), "fn keep() -> u32 {\n    2\n}\n");
+    }
+
+    #[test]
+    fn an_insert_lands_beside_a_definition_at_its_indentation() {
+        let (dir, state) = scratch("insert", &[("src/lib.rs", "fn keep() -> u32 {\n    2\n}\n")]);
+        let (_, found) = tool(&state, "find", json!({"query": "keep", "kind": "func"}));
+        let (err, out) = tool(
+            &state,
+            "edit_insert",
+            json!({"result": id_after(&found, "handle: `"), "text": "fn added() -> u32 {\n    3\n}", "apply": true}),
+        );
+        assert!(!err, "{out}");
+        assert_eq!(read(&dir, "src/lib.rs"), "fn keep() -> u32 {\n    2\n}\n\nfn added() -> u32 {\n    3\n}\n");
+    }
+
+    #[test]
+    fn a_staged_write_is_refused_once_the_file_moves_under_it() {
+        let (dir, state) = scratch("stale", &[("notes.md", "one\ntwo\n")]);
+        let (err, staged) = tool(&state, "edit_text", json!({"path": "notes.md", "old": "two", "new": "2"}));
+        assert!(!err, "{staged}");
+        fs::write(dir.0.join("notes.md"), "one\ntwo\nthree\n").unwrap();
+        let cs = id_after(&staged, "changeset `");
+        let (err, out) = tool(&state, "edit_apply", json!({"changeset": cs}));
+        assert!(err && out.contains("changed on disk since it was staged"), "{out}");
+        assert_eq!(read(&dir, "notes.md"), "one\ntwo\nthree\n", "nothing was written");
+        let (err, out) = tool(&state, "edit_discard", json!({"changeset": cs}));
+        assert!(!err, "the refused changeset is still pending: {out}");
+    }
+
+    #[test]
+    fn edit_text_creates_rewrites_removes_and_stays_in_the_root() {
+        let (dir, state) = scratch("text", &[("a.txt", "x x\n")]);
+        let (err, out) = tool(&state, "edit_text", json!({"path": "a.txt", "old": "x", "new": "y"}));
+        assert!(err && out.contains("2 times"), "an ambiguous `old` is refused: {out}");
+        let (err, out) = tool(&state, "edit_text", json!({"path": "docs/new.md", "new": "# new\n", "apply": true}));
+        assert!(!err, "{out}");
+        assert_eq!(read(&dir, "docs/new.md"), "# new\n");
+        let (err, out) = tool(&state, "edit_text", json!({"path": "docs/new.md", "delete": true, "apply": true}));
+        assert!(!err, "{out}");
+        assert!(!dir.0.join("docs/new.md").exists());
+        for bad in ["../escape.txt", ".git/config", ".ccc/edits.jsonl"] {
+            let (err, out) = tool(&state, "edit_text", json!({"path": bad, "new": "x", "apply": true}));
+            assert!(err, "{bad} was written: {out}");
+        }
+        // the ledger `prompts` reads back holds what was applied, and stays out of git
+        assert!(fs::read_to_string(dir.0.join(".ccc").join(edit::LEDGER_NAME)).unwrap().contains("docs/new.md"));
+        assert!(read(&dir, ".gitignore").contains(&format!("/.ccc/{}", edit::LEDGER_NAME)));
+    }
+
+    #[test]
+    fn the_edit_tools_refuse_a_browser_page() {
+        let (dir, state) = scratch("origin", &[("a.txt", "x\n")]);
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "edit_text", "arguments": {"path": "a.txt", "new": "pwned", "apply": true}}});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        // `null` is what a file:// page or a sandboxed frame sends - fine for reading, never for writing
+        let r = route_from(&state, "POST", "/mcp", &bytes, Some("null"));
+        let v = json_of(&r);
+        assert_eq!(v["result"]["isError"], true, "{v}");
+        assert_eq!(read(&dir, "a.txt"), "x\n");
+        // the read tools still answer the same page
+        let find = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                          "params": {"name": "index", "arguments": {}}});
+        let r = route_from(&state, "POST", "/mcp", &serde_json::to_vec(&find).unwrap(), Some("null"));
+        assert_eq!(json_of(&r)["result"]["isError"], false);
     }
 }
