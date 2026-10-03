@@ -833,7 +833,7 @@ fn tied(caches: &[FileCache], name: &str) -> BTreeSet<String> {
             c.funcs.iter().any(|f| f.name == name)
                 || c.consts.iter().any(|k| k.name == name)
                 || c.types.iter().any(|t| t.name == name)
-                || c.calls.iter().chain(&c.uses).any(|s| s.name == name)
+                || c.calls.iter().chain(&c.uses).chain(&c.constructs).any(|s| s.name == name)
                 || c.imports.iter().any(|i| {
                     i.names.iter().any(|n| n == name)
                         || i.module.rsplit([':', '.', '/']).next() == Some(name)
@@ -856,6 +856,8 @@ fn kind_at(caches: &[FileCache], path: &str, line: usize, name: &str) -> &'stati
         "type"
     } else if c.calls.iter().any(|s| s.line == line && s.name == name) {
         "call"
+    } else if c.constructs.iter().any(|s| s.line == line && s.name == name) {
+        "construct"
     } else if c.imports.iter().any(|i| i.line == line) {
         "import"
     } else {

@@ -1,6 +1,6 @@
 {
   "name": "ccc-codecache",
-  "displayName": "CodeCaChe (ccc)",
+  "displayName": "Collateral Code Check (ccc)",
   "description": "Test-coverage, untested-changes and cross-service hints from the ccc static analyser, inline in your editor.",
   "version": "1.6.0",
   "publisher": "colwill",
@@ -374,6 +374,11 @@
           "default": [],
           "description": "Extra arguments appended to the `ccc serve` command line."
         },
+        "ccc.server.ignoreSkip": {
+          "type": "boolean",
+          "default": false,
+          "description": "Read every `ccc:skip` comment as an ordinary comment (`--ignore-skip`), so the code it marks is mapped, searched and edited like the rest."
+        },
         "ccc.hints.testTriggers": {
           "type": "boolean",
           "default": true,
@@ -511,7 +516,7 @@
       "activitybar": [
         {
           "id": "ccc",
-          "title": "CodeCaChe",
+          "title": "Collateral Code Check",
           "icon": "media/icon.png"
         }
       ]

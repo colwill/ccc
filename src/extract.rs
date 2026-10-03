@@ -5,10 +5,24 @@ use crate::model::{
     Annotation, Boundary, CallSite, Const, Func, FuncMetrics, Import, LoopInfo, Note, Ref, ResourceOp, TypeDef,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tree_sitter::{Node, Parser};
 
 // `CallSite::caller` for a call that sits outside any function
 pub(crate) const TOP_LEVEL: &str = "<top>";
+
+// `--ignore-skip`: every `ccc:skip` reads as an ordinary comment and the code
+// it marks is mapped like the rest. One switch for the process, set before the
+// first parse, so every command, every rescan and every edit agree on it.
+static IGNORE_SKIP: AtomicBool = AtomicBool::new(false);
+
+pub fn ignore_skips(on: bool) {
+    IGNORE_SKIP.store(on, Ordering::Relaxed);
+}
+
+pub fn skips_ignored() -> bool {
+    IGNORE_SKIP.load(Ordering::Relaxed)
+}
 
 pub struct Extracted {
     pub consts: Vec<Const>,
@@ -28,6 +42,12 @@ pub struct Extracted {
     pub modules: Vec<String>,
     // `ccc:serves` / `ccc:calls` boundary hints written in comments
     pub annotations: Vec<Annotation>,
+    // line spans a `ccc:skip` withdrew: nothing in them is indexed, so a
+    // lookup that misses has to say so rather than report absence
+    pub withdrawn: Vec<(usize, usize)>,
+    // where a type is built without a call - a struct literal, a `new` - so a
+    // type that is never called is still found where it is constructed
+    pub constructs: Vec<CallSite>,
 }
 
 enum CallKind {
@@ -60,6 +80,8 @@ struct Ctx<'a> {
     loose_calls: Vec<CallSite>,
     // qualified non-call usages, same loose form
     uses: Vec<CallSite>,
+    // struct literals and `new` expressions, same loose form
+    constructs: Vec<CallSite>,
     // import/use/include statements
     imports: Vec<Import>,
     types: Vec<TypeDef>,
@@ -67,6 +89,8 @@ struct Ctx<'a> {
     annotations: Vec<Annotation>,
     // 1-based lines of `ccc:skip` directives, resolved after the walk
     skips: Vec<usize>,
+    // the function spans those directives withdrew
+    withdrawn: Vec<(usize, usize)>,
     // variable name -> declared type, one frame per lexical scope. Lets a
     // method call be attributed to its receiver's type instead of guessed at
     // from the method name alone.
@@ -131,8 +155,14 @@ impl Ctx<'_> {
 }
 
 // parse `src` as `lang` and extract its symbols returns `None` if the source
-// cannot be parsed at all
+// cannot be parsed at all, or a `ccc:skip` withdraws the whole file
 pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
+    extract_with(lang, src, !skips_ignored())
+}
+
+// `extract` with the `ccc:skip` decision made by the caller rather than the
+// process switch - a marker is honoured or read as a plain comment
+pub(crate) fn extract_with(lang: Language, src: &str, honour_skips: bool) -> Option<Extracted> {
     let mut parser = Parser::new();
     parser.set_language(&lang.ts_language()).ok()?;
     let tree = parser.parse(src, None)?;
@@ -146,6 +176,7 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         calls: Vec::new(),
         loose_calls: Vec::new(),
         uses: Vec::new(),
+        constructs: Vec::new(),
         imports: Vec::new(),
         types: Vec::new(),
         modules: Vec::new(),
@@ -154,6 +185,7 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         method_index: HashMap::new(),
         annotations: Vec::new(),
         skips: Vec::new(),
+        withdrawn: Vec::new(),
         scope_stack: Vec::new(),
         test_mod_depth: 0,
         import_depth: 0,
@@ -165,7 +197,7 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
     // a function removes that function, any other placement withdraws the
     // whole file - which reports the same `None` as an unparseable file, so
     // every consumer already handles it.
-    if !apply_skips(&mut ctx) {
+    if honour_skips && !apply_skips(&mut ctx) {
         return None;
     }
 
@@ -216,6 +248,8 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         .sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
     ctx.uses
         .sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
+    ctx.constructs
+        .sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
     ctx.imports.sort_by_key(|i| i.line);
     // after `funcs` is final: a directive is bound to a definition by position
     ctx.annotations.sort_by_key(|a| a.line);
@@ -232,6 +266,8 @@ pub fn extract(lang: Language, src: &str) -> Option<Extracted> {
         uses: ctx.uses,
         imports: ctx.imports,
         annotations: ctx.annotations,
+        withdrawn: ctx.withdrawn,
+        constructs: ctx.constructs,
     })
 }
 
@@ -384,6 +420,10 @@ fn visit(node: Node, ctx: &mut Ctx) {
         // classifier declines) - `changes` matches these across services
         if let Some(site) = loose_call(node, ctx) {
             ctx.loose_calls.push(site);
+        }
+    } else if let Some(&(_, field)) = lang.construct_kinds().iter().find(|(k, _)| *k == kind) {
+        if let Some(site) = construct_site(node, field, ctx) {
+            ctx.constructs.push(site);
         }
     } else if lang.comment_kinds().contains(&kind) {
         maybe_note(node, ctx);
@@ -966,7 +1006,7 @@ fn callee_name(call: Node, ctx: &Ctx) -> Option<String> {
     loose_name(callee, ctx).map(|(_, name)| name).filter(|n| !n.is_empty())
 }
 
-fn loop_label(kind: &str) -> String {
+pub(crate) fn loop_label(kind: &str) -> String {
     if kind.contains("comprehension") || kind.contains("generator") {
         "comprehension".into()
     } else if kind.starts_with("do_") {
@@ -1558,6 +1598,40 @@ fn loose_call(node: Node, ctx: &Ctx) -> Option<CallSite> {
     })
 }
 
+// A value built from a named type: `field` names the type, or the first child
+// does where the grammar labels nothing (zig, odin).
+fn construct_site(node: Node, field: &str, ctx: &Ctx) -> Option<CallSite> {
+    let named = if field.is_empty() { node.named_child(0) } else { node.child_by_field_name(field) };
+    let ty = constructed_name(named?)?;
+    let (qualifier, name) = loose_name(ty, ctx)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(CallSite {
+        caller: ctx.caller(),
+        line: pos(ty).0,
+        name,
+        qualifier,
+        recv_type: None,
+        test_ctx: ctx.test_mod_depth > 0,
+    })
+}
+
+// The name inside a constructed type: through generic arguments and a c
+// `(struct foo){..}` descriptor to the identifier. A slice, map, array or
+// anonymous type names nothing a lookup could ask for.
+fn constructed_name(n: Node) -> Option<Node> {
+    match n.kind() {
+        "generic_type" | "generic_type_with_turbofish" | "type_descriptor" | "struct_specifier" | "union_specifier" => n
+            .child_by_field_name("type")
+            .or_else(|| n.child_by_field_name("name"))
+            .and_then(constructed_name),
+        "identifier" | "type_identifier" | "scoped_type_identifier" | "scoped_identifier" | "qualified_identifier"
+        | "qualified_type" | "member_expression" | "field_expression" => Some(n),
+        _ => None,
+    }
+}
+
 // Declared type of a method call's receiver. `c.charge()` looks `c` up in the
 // scope's type environment; `self.charge()` uses the enclosing type; a
 // qualifier that is itself a known type name (`Client::new`) is that type.
@@ -2095,6 +2169,11 @@ fn loose_name(node: Node, ctx: &Ctx) -> Option<(Option<String>, String)> {
             node.child_by_field_name("operand"),
             node.child_by_field_name("field")?,
         ),
+        // go `pkg.Type` in type position - a composite literal's type
+        "qualified_type" => named(
+            node.child_by_field_name("package"),
+            node.child_by_field_name("name")?,
+        ),
         // rs `foo::<T>` / cpp `foo<T>`
         "generic_function" | "template_function" => node
             .child_by_field_name("function")
@@ -2274,16 +2353,8 @@ fn maybe_annotations(node: Node, ctx: &mut Ctx) {
 
 // One directive, already stripped of its comment delimiters.
 fn parse_annotation(line: &str) -> Option<(Boundary, String, String)> {
-    let at = line.find(ANNOTATION_PREFIX)?;
-    // must open the comment or follow whitespace, so `// see ccc:serves` and a
-    // URL like `http://x/ccc:serves` are not directives
-    if !line[..at]
-        .chars()
-        .next_back()
-        .map_or(true, |c| c.is_whitespace())
-    {
-        return None;
-    }
+    // not `// see ccc:serves`, a URL like `http://x/ccc:serves`, or a quoted one
+    let at = directive_at(line)?;
     let rest = &line[at + ANNOTATION_PREFIX.len()..];
     let mut words = rest.split_whitespace();
     let boundary = match words.next()?.to_ascii_lowercase().as_str() {
@@ -2321,7 +2392,8 @@ fn parse_annotation(line: &str) -> Option<(Boundary, String, String)> {
 // `ccc:skip`, in whatever comment syntax the language uses: the delimiters
 // are already gone by the time the body is examined, so `// ccc:skip`,
 // `# ccc:skip`, `/* ccc:skip */` and `-- ccc:skip` all read the same. Trailing
-// prose is allowed - `// ccc:skip generated` - so an author can say why.
+// prose is allowed - `// ccc:skip generated` - so an author can say why. Each
+// of those is quoted here, which is what keeps this comment from being one.
 fn maybe_skips(node: Node, ctx: &mut Ctx) {
     let raw = text(node, ctx.src);
     if !raw.contains(ANNOTATION_PREFIX) {
@@ -2336,19 +2408,21 @@ fn maybe_skips(node: Node, ctx: &mut Ctx) {
     }
 }
 
-// Same guard as `parse_annotation`: the marker must open the comment or follow
-// whitespace, so prose like `see ccc:skip` in a URL is not a directive.
+// Where a `ccc:` directive starts on a comment line, if one does. It must open
+// the comment or follow whitespace, so a marker inside a URL is prose, and it
+// must not sit inside backticks: that is how documentation quotes one, and the
+// comment explaining `ccc:skip` must not withdraw the code it describes.
+fn directive_at(line: &str) -> Option<usize> {
+    line.match_indices(ANNOTATION_PREFIX).map(|(at, _)| at).find(|&at| {
+        let before = &line[..at];
+        before.chars().next_back().map_or(true, char::is_whitespace) && before.matches('`').count() % 2 == 0
+    })
+}
+
 fn is_skip_directive(line: &str) -> bool {
-    let Some(at) = line.find(ANNOTATION_PREFIX) else {
+    let Some(at) = directive_at(line) else {
         return false;
     };
-    if !line[..at]
-        .chars()
-        .next_back()
-        .map_or(true, |c| c.is_whitespace())
-    {
-        return false;
-    }
     let rest = &line[at + ANNOTATION_PREFIX.len()..];
     rest.split_whitespace()
         .next()
@@ -2416,11 +2490,21 @@ fn apply_skips(ctx: &mut Ctx) -> bool {
     ctx.calls.retain(|c| !hit(c.call_line));
     ctx.loose_calls.retain(|c| !hit(c.line));
     ctx.uses.retain(|u| !hit(u.line));
+    ctx.constructs.retain(|u| !hit(u.line));
     ctx.imports.retain(|i| !hit(i.line));
     ctx.annotations.retain(|a| !hit(a.line));
     ctx.free_index.retain(|_, &mut (l, _, _)| !hit(l));
     ctx.method_index.retain(|_, &mut (l, _, _)| !hit(l));
+    spans.sort_unstable();
+    spans.dedup();
+    ctx.withdrawn = spans;
     true
+}
+
+// does any line carry a `ccc:skip` directive - how a file missing from the map
+// is told apart from one that would not parse
+pub fn has_skip_directive(src: &str) -> bool {
+    src.lines().any(is_skip_directive)
 }
 
 // Bind each directive to a function.
@@ -3936,4 +4020,89 @@ mod tests {
         let names: Vec<&str> = ex.funcs.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["kept"]);
     }
+
+    // Documentation quotes a directive in backticks. A quoted one is prose, or
+    // the comment explaining `ccc:skip` would withdraw the very code it sits on.
+    #[test]
+    fn a_quoted_directive_is_prose() {
+        let src = "fn first() {}\n// prose is allowed - `// ccc:skip generated` - so say why\nfn kept() { reached(); }\n// see `ccc:calls http billing.charge`\nfn also_kept() {}\n";
+        let ex = extract_with(Language::Rust, src, true).unwrap();
+        let names: Vec<&str> = ex.funcs.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["first", "kept", "also_kept"]);
+        assert!(ex.withdrawn.is_empty());
+        assert!(ex.annotations.is_empty(), "a quoted ccc:calls is no crossing");
+        // the same words unquoted are still directives
+        assert!(extract_with(Language::Rust, "// ccc:skip generated\nfn gone() {}\n", true).is_none());
+        let hint = extract_with(Language::Rust, "// ccc:calls http billing.charge\nfn pay() {}\n", true).unwrap();
+        assert_eq!(hint.annotations.len(), 1);
+    }
+
+    // `--ignore-skip` reads every marker as an ordinary comment: what it would
+    // withdraw - a whole file, one function - is mapped like the rest.
+    #[test]
+    fn ignoring_skips_maps_what_they_would_withdraw() {
+        let whole = "// ccc:skip\nfn hidden() {}\n";
+        assert!(extract_with(Language::Rust, whole, true).is_none());
+        assert_eq!(extract_with(Language::Rust, whole, false).unwrap().funcs[0].name, "hidden");
+
+        let one = "fn a() {}\n// ccc:skip\nfn b() { c(); }\n";
+        let honoured = extract_with(Language::Rust, one, true).unwrap();
+        assert_eq!(honoured.funcs.len(), 1);
+        assert_eq!(honoured.withdrawn, vec![(3, 3)]);
+        let ignored = extract_with(Language::Rust, one, false).unwrap();
+        assert_eq!(ignored.funcs.len(), 2);
+        assert!(ignored.withdrawn.is_empty());
+        assert!(ignored.calls.iter().any(|c| c.name == "c"));
+    }
+
+    // A type built rather than called - a struct literal, a `new` - is a site of
+    // its own in every language that has one, qualifier and all. A slice or map
+    // literal builds no named type, so it names nothing to find.
+    #[test]
+    fn constructions_are_sites_in_every_language() {
+        // a language, a source, and the (name, qualifier) of each construction in it
+        type Case<'a> = (Language, &'a str, &'a [(&'a str, Option<&'a str>)]);
+        let cases: &[Case] = &[
+            (
+                Language::Rust,
+                "fn f() { let a = Foo { x: 1 }; let b = m::Bar { y: 2 }; let c = Baz::<u8> { z: 3 }; }",
+                &[("Foo", None), ("Bar", Some("m")), ("Baz", None)],
+            ),
+            (
+                Language::Go,
+                "package p\nfunc f() { a := Foo{X: 1}; b := pkg.Bar{}; c := &Baz{}; d := []int{1} }",
+                &[("Foo", None), ("Bar", Some("pkg")), ("Baz", None)],
+            ),
+            (Language::C, "void f() { struct foo b = (struct foo){1, 2}; }", &[("foo", None)]),
+            (
+                Language::Cpp,
+                "void f() { auto a = new Foo(1); auto b = Bar{1, 2}; auto c = ns::Baz{}; }",
+                &[("Foo", None), ("Bar", None), ("Baz", Some("ns"))],
+            ),
+            (
+                Language::JavaScript,
+                "function f() { const a = new Foo(1); const b = new ns.Bar(); }",
+                &[("Foo", None), ("Bar", Some("ns"))],
+            ),
+            (Language::TypeScript, "function f() { const a = new Foo<number>(1); }", &[("Foo", None)]),
+            (
+                Language::Zig,
+                "fn f() void { const a = Foo{ .x = 1 }; const b = pkg.Bar{}; }",
+                &[("Foo", None), ("Bar", Some("pkg"))],
+            ),
+            (Language::Odin, "package p\nf :: proc() { a := Foo{x = 1} }", &[("Foo", None)]),
+        ];
+        for (lang, src, want) in cases {
+            let ex = extract_with(*lang, src, true).unwrap();
+            // sites sort by line then name, and each sample is one line
+            let mut got: Vec<(&str, Option<&str>)> =
+                ex.constructs.iter().map(|c| (c.name.as_str(), c.qualifier.as_deref())).collect();
+            let mut want = want.to_vec();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "{}", lang.as_str());
+            assert!(ex.constructs.iter().all(|c| c.caller == "f"), "{}: {:?}", lang.as_str(), ex.constructs);
+        }
+    }
+
 }

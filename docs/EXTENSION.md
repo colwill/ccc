@@ -43,7 +43,7 @@ you only want to see the functions worth a second look, and `ccc.complexity.enab
 the ten colours are contributed theme colours, so a theme or a `workbench.colorCustomizations` entry
 can restyle any of them.
 
-Click the **CodeCaChe** mark in the activity bar to open the panel, and again to close it. It has
+Click the **Collateral Code Check** mark in the activity bar to open the panel, and again to close it. It has
 two views. **Triggers** is the tests your changes invoke: a triggered test usually lives in a
 different file from the change that triggered it, so this is the only place that shows the whole set
 - **Run these** (click to open; the tooltip carries how many call hops it sits from the change and

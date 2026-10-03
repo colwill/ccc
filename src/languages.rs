@@ -417,6 +417,74 @@ impl Language {
         }
     }
 
+    // kinds that leave the enclosing body early: return, throw, break, continue
+    pub fn exit_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust | Language::Zig => {
+                &["return_expression", "break_expression", "continue_expression"]
+            }
+            Language::Python => &[
+                "return_statement",
+                "raise_statement",
+                "break_statement",
+                "continue_statement",
+            ],
+            Language::JavaScript
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::Cpp
+            | Language::CSharp => &[
+                "return_statement",
+                "throw_statement",
+                "break_statement",
+                "continue_statement",
+            ],
+            Language::Go | Language::C | Language::Odin => {
+                &["return_statement", "break_statement", "continue_statement"]
+            }
+            Language::Proto => &[],
+        }
+    }
+
+    // anonymous bodies written inline - closures and lambdas. Named nested
+    // definitions are already `func_kinds`
+    pub fn closure_kinds(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust => &["closure_expression"],
+            Language::Python => &["lambda"],
+            Language::Go => &["func_literal"],
+            Language::Cpp => &["lambda_expression"],
+            Language::CSharp => &["lambda_expression", "anonymous_method_expression"],
+            Language::JavaScript
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::C
+            | Language::Zig
+            | Language::Odin
+            | Language::Proto => &[],
+        }
+    }
+
+    // kinds that build a value of a named type without a call the map would
+    // see - a struct literal, a `new` expression - each with the field naming
+    // the type, or "" for the first child where the grammar labels none. A
+    // constructor that already reads as a call - python's `Foo(..)`, c#'s
+    // `new Foo()` with the type as its callee - is a call site as it is.
+    pub fn construct_kinds(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Language::Rust => &[("struct_expression", "name")],
+            Language::Go => &[("composite_literal", "type")],
+            Language::C => &[("compound_literal_expression", "type")],
+            Language::Cpp => &[("new_expression", "type"), ("compound_literal_expression", "type")],
+            Language::JavaScript | Language::TypeScript | Language::Tsx => {
+                &[("new_expression", "constructor")]
+            }
+            Language::Zig => &[("struct_initializer", "")],
+            Language::Odin => &[("struct", "")],
+            Language::Python | Language::CSharp | Language::Proto => &[],
+        }
+    }
+
     // node kinds holding a function's parameter list
     pub fn param_list_kinds(self) -> &'static [&'static str] {
         match self {
@@ -563,6 +631,22 @@ impl Language {
         matches!(self, Language::Cpp | Language::CSharp | Language::Zig)
     }
 
+    // does `break` inside a switch case end the case - the c family and go -
+    // rather than leave the loop around it, as in rust, python and zig
+    pub fn break_ends_case(self) -> bool {
+        matches!(
+            self,
+            Language::C
+                | Language::Cpp
+                | Language::CSharp
+                | Language::JavaScript
+                | Language::TypeScript
+                | Language::Tsx
+                | Language::Go
+                | Language::Odin
+        )
+    }
+
     // field name holding a function's return type (if the grammar has one)
     pub fn return_field(self) -> Option<&'static str> {
         match self {
@@ -616,12 +700,22 @@ mod tests {
             check("module_kinds", lang.module_kinds());
             check("loop_kinds", lang.loop_kinds());
             check("branch_kinds", lang.branch_kinds());
+            check("exit_kinds", lang.exit_kinds());
+            check("closure_kinds", lang.closure_kinds());
             check("param_list_kinds", lang.param_list_kinds());
             check("guard_kinds", lang.guard_kinds());
             check("doc_wrapper_kinds", lang.doc_wrapper_kinds());
             check("annotation_kinds", lang.annotation_kinds());
             let types: Vec<&str> = lang.type_kinds().iter().map(|(k, _)| *k).collect();
             check("type_kinds", &types);
+            let constructs: Vec<&str> = lang.construct_kinds().iter().map(|(k, _)| *k).collect();
+            check("construct_kinds", &constructs);
+            // the field a construction names its type by has to exist too
+            for (kind, field) in lang.construct_kinds() {
+                if !field.is_empty() && ts.field_id_for_name(field).is_none() {
+                    missing.push(format!("{}: construct_kinds names field `{field}` for `{kind}`", lang.as_str()));
+                }
+            }
         }
         assert!(missing.is_empty(), "node kinds no grammar has:\n{}", missing.join("\n"));
     }

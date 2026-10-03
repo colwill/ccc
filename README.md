@@ -1,11 +1,11 @@
-<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="CodeCaChe Logo"></a></p>
+<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="ccc.png" alt="Collateral Code Check Logo"></a></p>
 
-[![Release CodeCaChe](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
+[![Release Collateral Code Check](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
 
 
-# CodeCaChe (`ccc`)
+# Collateral Code Check (`ccc`)
 
-CodeCaChe tells you, and your AI agent, what a change touches before you commit it - the functions, tests, services and cross-service contracts it reaches - by:
+Collateral Code Check tells you, and your AI agent, what a change touches before you commit it - the functions, tests, services and cross-service contracts it reaches - by:
 
   - highlighting which tests will be ran with your changes
   
@@ -19,7 +19,7 @@ CodeCaChe tells you, and your AI agent, what a change touches before you commit 
 
   - making your agent's changes for it - a project-wide rename, a dead-code delete, a new function beside an old one - as one confined, previewed, revertible call that costs a fraction of the tokens read-then-edit does with an extra layer of safety ([how much](#edits-go-through-ccc))
 
-**ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and generates the **CodeCaChe** in memory. 
+**ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and builds the **ccc** code map in memory. 
 This is a human and machine readable map of the source tree including every source file; its
 constants, functions (with return types and doc summaries), intra-file call
 graph, and marker notes (TODO/FIXME/...). 
@@ -68,6 +68,7 @@ session, the rename's 26 fewer turns skip roughly 1.5M cached input tokens and 2
 - [Quick-Start](#quick-start)
 - [Usage](#usage)
 - [Insights](#insights)
+- [Architecture Visualiser](#architecture-visualiser)
 - [Extension](#extension)
 - [Dependency Map](#dependencymap)
 - [Cross-Repository Calls](#externals)
@@ -118,6 +119,7 @@ session, the rename's 26 fewer turns skip roughly 1.5M cached input tokens and 2
 
 ```sh
 ccc run                               # Runs local in-memory map, MCP server and insights UI
+ccc run --vis                         # ...and opens the architecture visualiser at :6767/vis
 ccc init                              # Generate basic `.ccc/map.json` and `.ccc/surface.json` (prev ccc-surface.json)
 ccc changes [PATH] --telemetry        # Changes vs base ref (services to test for CT)
 ccc tokenize                          # Encode in-memory map of project into tokens.bin + tokens.json
@@ -141,6 +143,40 @@ ccc run                               # then open http://127.0.0.1:6767/insights
 curl -s localhost:6767/insights.json  # the same data, for other consumers
 ccc insights                          # same JSON data as above via direct command
 ccc insights --html page.html         # output format is html, as a single page app
+```
+
+## Architecture Visualiser
+
+`ccc run --vis` serves a 2D map of the project at `http://127.0.0.1:6767/vis` and opens it in your
+browser. It follows the C4 model from the whole system down to the code, then goes one level
+further: the logic of a single function, drawn as a node graph in the style of Unreal Engine
+Blueprints.
+
+| level | boxes | arrows |
+|---|---|---|
+| Context | the system; peer repos from `externals` in `.ccc/map.json`; endpoints nothing in the map answers | `ccc:calls` / `ccc:serves` crossings, by transport |
+| Containers | services from `.ccc/map.json`, or top-level directories without one | resolved and declared calls between services |
+| Components | the files in one container; other containers it touches sit outside the boundary | file-to-file calls |
+| Code | the functions in one file, each with an input pin and one output pin per function it calls | resolved calls; functions in other files as stand-ins |
+| Logic | one function: entry, calls, branches, switch/match/try arms, loops, closures, returns and throws | execution order |
+
+Double-click (or Enter) drills down a level, Escape goes back up, and the breadcrumb jumps to any
+level. Every view has its own URL, so the browser's back button works and views can be
+bookmarked. Drag to rearrange; positions are remembered per view. The search box (`/`) finds
+functions and files and opens them directly. The page reloads by itself when the map changes.
+
+Every level is built from the same language-agnostic map the MCP tools read, so all supported
+languages are drawn the same way. Like the rest of ccc it reads syntax, not behaviour: an arrow
+is a call the resolver found evidence for, and a branch is a node in the syntax tree, not a path
+anything was seen to take. Calls that reach nothing in the project (the standard library, a
+dependency) are folded into grey pills, and the toolbar can show them in full or hide them.
+
+The data behind the page is plain JSON, with or without `--vis`:
+
+```sh
+curl -s localhost:6767/vis.json                                  # context, containers, components
+curl -s 'localhost:6767/vis/code?file=src/scan.rs'               # one file's functions and calls
+curl -s 'localhost:6767/vis/flow?file=src/scan.rs&line=76'       # one function's logic
 ```
 
 ## Extension
@@ -213,7 +249,16 @@ language uses. Placement decides the scope:
 // ccc:skip generated - do not analyse
 ```
 
-Trailing prose after the marker is allowed, so a skip can say why.
+Trailing prose after the marker is allowed, so a skip can say why. A marker inside backticks is
+documentation quoting one, not a directive, so a comment that explains `ccc:skip` withdraws
+nothing.
+
+To see everything regardless, pass `--ignore-skip` to any command - `ccc run --ignore-skip`,
+`ccc changes --ignore-skip`, ... - and every `ccc:skip` reads as an ordinary comment: the code it
+marks is mapped, searched, measured and edited like the rest. In the VS Code extension the same
+switch is the `ccc.server.ignoreSkip` setting. Without it, a `find` or `references` that misses
+also searches the skipped code as text and lists what it finds there, marked as not indexed, so
+a miss never hides code you skipped.
 
 ## AGENTS.md
 
@@ -224,7 +269,7 @@ Trailing prose after the marker is allowed, so a skip can say why.
 ```md
 # AGENTS.md
 
-This repo has a CodeCaChe - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
+This repo has a Collateral Code Check (ccc) map - a generated in-memory code map served over MCP at `http://127.0.0.1:6767/mcp`. Use it
 as the entry point for everything you do here.
 
 - no bash, grep or sed usage for exploring the project

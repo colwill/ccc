@@ -2060,6 +2060,8 @@ diff --git a/gone.rs b/gone.rs
             types: ex.types,
             modules: ex.modules,
             annotations: ex.annotations,
+            withdrawn: ex.withdrawn,
+            constructs: ex.constructs,
         }
     }
 

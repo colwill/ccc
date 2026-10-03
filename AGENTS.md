@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repo ships a CodeCaChe - an in-memory code map served over MCP. Use it as the entry point for
+This repo ships Collateral Code Check (ccc) - an in-memory code map served over MCP. Use it as the entry point for
 everything you do here.
 
 `ccc run` listens on `http://127.0.0.1:6767/mcp` by default, but the VS Code extension starts its own

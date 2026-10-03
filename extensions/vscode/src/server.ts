@@ -119,6 +119,7 @@ export class ServerProcess implements vscode.Disposable {
       ...(this.cfg.server.watchIntervalSec === 0
         ? ['--no-watch']
         : ['--watch-interval', String(this.cfg.server.watchIntervalSec)]),
+      ...(this.cfg.server.ignoreSkip ? ['--ignore-skip'] : []),
       ...this.cfg.server.extraArgs,
     ];
     this.log.info(`[${this.label}] spawning: ${bin} serve ${args.join(' ')}`);

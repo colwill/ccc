@@ -7,7 +7,7 @@
 
 use crate::contracts::ContractIndex;
 use crate::model::{FileCache, Counts};
-use crate::{audit, deps, edit, insights, render, sast, scan};
+use crate::{audit, deps, edit, insights, render, sast, scan, vis};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,6 +27,8 @@ pub struct ServeOptions {
     pub watch: Option<std::time::Duration>,
     // serve the human-facing `/insights` UI alongside the agent endpoints
     pub html: bool,
+    // serve the architecture visualiser at `/vis` and open it on start
+    pub vis: bool,
 }
 
 impl Default for ServeOptions {
@@ -36,6 +38,7 @@ impl Default for ServeOptions {
             port: 6767,
             watch: Some(std::time::Duration::from_secs(2)),
             html: true,
+            vis: false,
         }
     }
 }
@@ -45,14 +48,20 @@ struct MapState {
     root_label: String,
     ts: String,
     caches: Vec<FileCache>,
+    // files `ccc:skip` withdrew whole: discovered, deliberately not mapped
+    withdrawn: Vec<String>,
     // the rpcs the schemas declare and the code tied to them; rebuilt with `caches`
     contracts: ContractIndex,
     externals: Vec<ExternalDep>,
     facade: Option<String>,
     watch_secs: Option<u64>,
     html: bool,
+    // the `/vis` page is served - `ccc run --vis`
+    vis: bool,
     origin: String,
     analysis: Mutex<Option<Analysis>>,
+    // the visualiser's model of this generation, built on first use
+    vis_model: Mutex<Option<(String, Arc<vis::Model>)>>,
     // the advisory answer for this map generation; asking osv is a network round trip
     audit: Mutex<Option<(String, audit::AuditReport)>>,
     // security findings for this generation, keyed also by whether tests were included
@@ -76,6 +85,7 @@ impl MapState {
     fn build(root: &Path) -> Result<MapState> {
         let files = scan::collect_files(root)?;
         let caches = scan::build_caches(root, &files);
+        let withdrawn = scan::withdrawn_files(root, &files, &caches);
         let root_label = root
             .file_name()
             .and_then(|s| s.to_str())
@@ -87,16 +97,19 @@ impl MapState {
             ts: render::now_ts(),
             contracts: ContractIndex::for_root(root, &caches),
             caches,
+            withdrawn,
             externals: manifest_deps(root),
             facade: cargo_package_name(root),
             watch_secs: None,
             html: true,
+            vis: false,
             // `--port 0` picks one at runtime
             origin: {
                 let d = ServeOptions::default();
                 format!("http://{}:{}", d.addr, d.port)
             },
             analysis: Mutex::new(None),
+            vis_model: Mutex::new(None),
             audit: Mutex::new(None),
             sast: Mutex::new(None),
             deps: Mutex::new((String::new(), BTreeMap::new())),
@@ -157,6 +170,7 @@ impl MapState {
         let before = self.caches.len();
         let files = scan::collect_files(&self.root)?;
         self.caches = scan::build_caches(&self.root, &files);
+        self.withdrawn = scan::withdrawn_files(&self.root, &files, &self.caches);
         self.contracts = ContractIndex::for_root(&self.root, &self.caches);
         self.externals = manifest_deps(&self.root);
         self.facade = cargo_package_name(&self.root);
@@ -168,6 +182,10 @@ impl MapState {
     // swap in a fresh map (built outside lock by watcher)
     fn swap_in(&mut self, caches: Vec<FileCache>) {
         self.caches = caches;
+        // the watcher hands over caches alone; the walk is cheap next to the parse
+        self.withdrawn = scan::collect_files(&self.root)
+            .map(|files| scan::withdrawn_files(&self.root, &files, &self.caches))
+            .unwrap_or_default();
         self.contracts = ContractIndex::for_root(&self.root, &self.caches);
         self.externals = manifest_deps(&self.root);
         self.facade = cargo_package_name(&self.root);
@@ -187,6 +205,28 @@ impl MapState {
         if let Ok(mut slot) = self.analysis.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.vis_model.lock() {
+            *slot = None;
+        }
+    }
+
+    // The visualiser's model of this map generation, built at most once.
+    fn vis_model(&self) -> Arc<vis::Model> {
+        let mut slot = self.vis_model.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((ts, model)) = slot.as_ref() {
+            if ts == &self.ts {
+                return Arc::clone(model);
+            }
+        }
+        let model = Arc::new(vis::Model::build(
+            &self.caches,
+            &self.root,
+            &self.root_label,
+            &self.ts,
+            &self.contracts,
+        ));
+        *slot = Some((self.ts.clone(), Arc::clone(&model)));
+        model
     }
 
     // The insights analysis for this map, computed at most once per
@@ -241,6 +281,12 @@ impl MapState {
         match matches.len() {
             1 => Ok(matches[0]),
             0 => {
+                if let Some(w) = self.withdrawn.iter().find(|w| w.as_str() == norm || w.ends_with(norm)) {
+                    return Err(format!(
+                        "`{w}` is withdrawn from the map by `ccc:skip`, so the map holds \
+                         nothing for it - read the source directly"
+                    ));
+                }
                 let mut close: Vec<String> = self
                     .caches
                     .iter()
@@ -392,9 +438,18 @@ fn q_index(map: &MapState, prefix: Option<&str>) -> Value {
             "exports": n.reexports,
         }));
     }
+    let withdrawn: Vec<&String> = map
+        .withdrawn
+        .iter()
+        .filter(|p| want.as_ref().map_or(true, |w| *p == w || p.starts_with(&format!("{w}/"))))
+        .collect();
     let mut out = json!({
         "root": map.root_label,
         "generated": map.ts,
+        // discovered but withdrawn by `ccc:skip` - named so a reader of the rows
+        // does not take the file for missing
+        "withdrawn": withdrawn,
+        "ignore_skip": crate::extract::skips_ignored(),
         "totals": {
             "files": files.len(),
             "funcs": totals.funcs,
@@ -618,6 +673,10 @@ fn q_find(map: &MapState, query: &str, kind: &str) -> Result<Value, String> {
         };
         out["suggestions"] = Value::Array(nearest_names(map, &probe, 8));
         add_miss_evidence(map, &mut out, qualifier_raw);
+        // the query as written: a qualifier narrows text the way it narrows sites
+        if let Some(w) = withdrawn_matches(map, query.trim(), false) {
+            out["withdrawn"] = w;
+        }
     }
     Ok(out)
 }
@@ -770,7 +829,7 @@ fn nearest_names(map: &MapState, want: &str, limit: usize) -> Vec<Value> {
 
 // the kinds a lookup actually searched
 const SEARCHED_KINDS: &[&str] = &[
-    "func", "const", "type", "call", "use", "import", "reexport",
+    "func", "const", "type", "call", "use", "construct", "import", "reexport",
 ];
 
 // the module name a file's contents are reachable under from outside it
@@ -878,6 +937,100 @@ fn add_miss_evidence(map: &MapState, out: &mut Value, qualifier: Option<&str>) {
     }
 }
 
+// text matches listed for code `ccc:skip` withdrew
+const WITHDRAWN_CAP: usize = 25;
+
+// a file to search as text, and the line spans to keep to - all of it when `None`
+type Region<'a> = (String, Option<&'a [(usize, usize)]>);
+
+// Lines naming `name` inside code `ccc:skip` withdrew - whole files and
+// skipped functions alike. The map holds nothing there, so until those are
+// ruled out a miss is not evidence of absence. They are read off the source as
+// text and never resolved; a line that looks like a definition comes first.
+// `None` when nothing is withdrawn, which is the usual case.
+fn withdrawn_matches(map: &MapState, name: &str, whole_word: bool) -> Option<Value> {
+    let regions: Vec<Region> = map
+        .withdrawn
+        .iter()
+        .map(|f| (f.clone(), None))
+        .chain(
+            map.caches
+                .iter()
+                .filter(|c| !c.withdrawn.is_empty())
+                .map(|c| (map.path_of(c), Some(c.withdrawn.as_slice()))),
+        )
+        .collect();
+    if regions.is_empty() || name.is_empty() {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    let mut hits: Vec<(bool, Value)> = Vec::new();
+    for (path, spans) in &regions {
+        let Ok(src) = std::fs::read_to_string(map.root.join(path)) else { continue };
+        for (i, text) in src.lines().enumerate() {
+            let line = i + 1;
+            if spans.is_some_and(|s| !s.iter().any(|&(a, b)| line >= a && line <= b)) {
+                continue;
+            }
+            let found = if whole_word {
+                names_word(text, name)
+            } else {
+                text.to_ascii_lowercase().contains(&lower)
+            };
+            if found {
+                let shown: String = text.trim().chars().take(160).collect();
+                hits.push((
+                    looks_like_definition(text, name),
+                    json!({"file": path, "line": line, "text": shown}),
+                ));
+            }
+        }
+    }
+    let total = hits.len();
+    // definitions first; the sort is stable, so source order holds within each
+    hits.sort_by_key(|(def, _)| !def);
+    Some(json!({
+        "files": map.withdrawn,
+        "functions": regions
+            .iter()
+            .filter_map(|(p, s)| s.map(|s| json!({"file": p, "spans": s.len()})))
+            .collect::<Vec<_>>(),
+        "match_count": total,
+        "matches": hits.into_iter().take(WITHDRAWN_CAP).map(|(_, v)| v).collect::<Vec<_>>(),
+    }))
+}
+
+// `name` as a whole identifier, not inside a longer one
+fn names_word(text: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(i, _)| {
+        !text[..i].chars().next_back().is_some_and(ident)
+            && !text[i + name.len()..].chars().next().is_some_and(ident)
+    })
+}
+
+// does the identifier `name` sits in follow a definition keyword - `fn`,
+// `def`, `class`, ... - or open an odin `name :: proc` binding
+fn looks_like_definition(text: &str, name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "fn", "def", "func", "function", "class", "struct", "enum", "trait", "interface",
+        "type", "const", "let", "var", "static", "impl", "union", "mod", "namespace", "proc",
+    ];
+    // ascii lowering keeps every byte offset, so `at` indexes `text` as well
+    let Some(at) = text.to_ascii_lowercase().find(&name.to_ascii_lowercase()) else {
+        return false;
+    };
+    let start = text[..at]
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(0, |i| i + 1);
+    let last = text[..start]
+        .trim_end()
+        .rsplit(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    WORDS.contains(&last) || text[start..].split_once(" :: ").is_some_and(|(id, _)| !id.contains(' '))
+}
+
 fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     let symbol = symbol.trim();
     if symbol.is_empty() {
@@ -950,11 +1103,14 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
                 definitions.push(def);
             }
         }
+        // a construction is how a type is used when nothing calls it: a struct
+        // literal or a `new` names the type the way a call names a function
         for (kind, site) in c
             .calls
             .iter()
             .map(|s| ("call", s))
             .chain(c.uses.iter().map(|s| ("use", s)))
+            .chain(c.constructs.iter().map(|s| ("construct", s)))
         {
             let qualifier_ok = match qualifier {
                 None => true,
@@ -1059,9 +1215,15 @@ fn q_references(map: &MapState, symbol: &str) -> Result<Value, String> {
     if !rpcs.is_empty() {
         out["rpcs"] = Value::Array(rpcs);
     }
+    let miss = out["counts"]["definitions"] == 0 && total_refs == 0 && out.get("rpcs").is_none();
+    // Withdrawn code is searched on a hit too: `references` is the check before
+    // a rename or a delete, and a caller the map cannot see still breaks.
+    if let Some(w) = withdrawn_matches(map, name, true).filter(|w| miss || jnum(w, "match_count") > 0) {
+        out["withdrawn"] = w;
+    }
     // A miss is an answer, not an error: say what was covered and what to try,
     // so the lookup can be carried on rather than abandoned.
-    if out["counts"]["definitions"] == 0 && total_refs == 0 && out.get("rpcs").is_none() {
+    if miss {
         out["miss"] = json!(true);
         out["suggestions"] = Value::Array(nearest_names(map, name, 8));
         add_miss_evidence(map, &mut out, qualifier);
@@ -1746,7 +1908,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "references",
-            "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions and imports are covered, so a struct used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. An rpc declared in a `.proto` schema (looked up by any spelling - `CreateInvoice`, `create_invoice`, `Billing.CreateInvoice`, `acme.billing.v1.Billing/CreateInvoice`) also lists its handlers and its callers through generated stubs in every language, each with the evidence that tied it. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
+            "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, constructions (a struct literal, a `new`), qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions, constructions and imports are covered, so a struct that is only ever built, or used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. An rpc declared in a `.proto` schema (looked up by any spelling - `CreateInvoice`, `create_invoice`, `Billing.CreateInvoice`, `acme.billing.v1.Billing/CreateInvoice`) also lists its handlers and its callers through generated stubs in every language, each with the evidence that tied it. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
             json!({"symbol": {"type": "string", "description": "exact symbol name, optionally qualified (a::b or a.b)"}}),
             &["symbol"],
         ),
@@ -2016,10 +2178,10 @@ fn mcp_initialize(params: &Value) -> Value {
         "capabilities": {"tools": {}, "resources": {}},
         "serverInfo": {
             "name": "ccc",
-            "title": "CodeCaChe",
+            "title": "Collateral Code Check",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Code map of this project (the ccc CodeCaChe), held in \
+        "instructions": "Code map of this project (ccc, Collateral Code Check), held in \
             memory and refreshed automatically about three seconds after source changes.\n\n\
             1. SEARCHING - always start here. For any question about where something is \
             defined, called, imported or changed in this project, call a ccc tool before \
@@ -2028,7 +2190,10 @@ fn mcp_initialize(params: &Value) -> Value {
             (`serde_json::to_string`, `Encoding::O200kBase`) resolve directly. \
             Definitions, call sites, usages, imports and re-exports are all indexed, so \
             no hits is evidence of absence rather than a gap in coverage - a miss names \
-            the kinds it searched and the nearest indexed names. A module root (Rust \
+            the kinds it searched and the nearest indexed names. The one exception is \
+            code a `ccc:skip` comment withdrew: it is unindexed, not absent, so a miss \
+            also searches it as text and lists what it finds there, marked as not \
+            indexed - read those lines before concluding anything. A module root (Rust \
             `lib.rs`/`mod.rs`, a package `__init__.py`) defines nothing and is not \
             empty: it is read as the module graph and published surface it declares, and \
             a crate-facade path resolves through the `pub use` behind it. Use text \
@@ -2266,6 +2431,15 @@ fn md_index(v: &Value, page: &Page) -> String {
             jnum(v, "project_files"),
         ));
     }
+    if jbool(v, "ignore_skip") {
+        out.push_str("`ccc:skip` is ignored (--ignore-skip): code it marks is mapped like the rest\n");
+    }
+    let withdrawn = jnames(v, "withdrawn");
+    if !withdrawn.is_empty() {
+        out.push_str(&format!(
+            "withdrawn by `ccc:skip`, so not in the rows below: {withdrawn}\n"
+        ));
+    }
     out.push('\n');
     if files.is_empty() {
         out.push_str("no mapped files here\n");
@@ -2422,6 +2596,7 @@ fn md_miss(v: &Value) -> String {
     }
     let suggestions = jarr(v, "suggestions");
     let mut out = format!("\nsearched kinds: {}\n", jnames(v, "searched"));
+    let withdrawn_hits = v.get("withdrawn").map_or(0, |w| jnum(w, "match_count"));
     // the verdict on the qualifier
     if let Some(q) = v.get("qualifier").and_then(|x| x.as_str()) {
         let sites = jnum(v, "qualifier_sites");
@@ -2445,6 +2620,12 @@ fn md_miss(v: &Value) -> String {
                 "`{q}` is {d}, but no call, use or import site in the map names it. \
                  A dependency declared and never referenced is worth checking by hand.\n"
             ));
+        } else if withdrawn_hits > 0 {
+            out.push_str(&format!(
+                "`{q}` is named by no site in the map and declared in no manifest - \
+                 but code `ccc:skip` withdrew names it below, so this is not evidence \
+                 of absence.\n"
+            ));
         } else {
             out.push_str(&format!(
                 "`{q}` is named by no site in the map and declared in no manifest. \
@@ -2460,10 +2641,46 @@ fn md_miss(v: &Value) -> String {
             .collect();
         out.push_str(&format!("nearest indexed names: {}\n", names.join("; ")));
     }
-    out.push_str(
+    out.push_str(&md_withdrawn(v));
+    out.push_str(if withdrawn_hits > 0 {
+        "next: read the withdrawn lines above - real source the map does not index.\n"
+    } else {
         "next: `dependencies` for file-level edges, or text search for string \
-         literals and config.\n",
+         literals and config.\n"
+    });
+    out
+}
+
+// Code `ccc:skip` withdrew is unindexed, not absent: an answer only rules it
+// out once it has been searched as text too, so it shows what that found.
+fn md_withdrawn(v: &Value) -> String {
+    let Some(w) = v.get("withdrawn") else {
+        return String::new();
+    };
+    let files = jnames(w, "files");
+    let funcs: i64 = jarr(w, "functions").iter().map(|f| jnum(f, "spans")).sum();
+    let scope = match (files.is_empty(), funcs) {
+        (true, n) => format!("{n} withdrawn function(s)"),
+        (false, 0) => format!("withdrawn file(s): {files}"),
+        (false, n) => format!("withdrawn file(s): {files}; {n} withdrawn function(s)"),
+    };
+    let matches = jarr(w, "matches");
+    if matches.is_empty() {
+        return format!("not in code `ccc:skip` withdrew either - searched as text ({scope})\n");
+    }
+    let total = jnum(w, "match_count");
+    let mut out = format!(
+        "\n## in code `ccc:skip` withdrew - {total} text match(es)\n\
+         not indexed ({scope}): source lines, not resolved sites - open the file to \
+         confirm each\n"
     );
+    for m in &matches {
+        out.push_str(&format!("{}:{} `{}`\n", jstr(m, "file"), jnum(m, "line"), jstr(m, "text")));
+    }
+    let shown = matches.len() as i64;
+    if total > shown {
+        out.push_str(&format!("... and {} more\n", total - shown));
+    }
     out
 }
 
@@ -2533,6 +2750,10 @@ fn md_references(v: &Value) -> String {
              type - so they are not this symbol.\n{name_only}",
             jstr(v, "qualifier"),
         ));
+    }
+    // a miss renders withdrawn code inside its own verdict
+    if !jbool(v, "miss") {
+        out.push_str(&md_withdrawn(v));
     }
     out.push_str(&md_miss(v));
     out
@@ -3801,7 +4022,7 @@ fn mcp_resources_list(state: &RwLock<MapState>) -> Value {
     let mut resources = vec![json!({
         "uri": "ccc://index",
         "name": "CCC.md",
-        "description": "CodeCaChe index for the whole project",
+        "description": "ccc index for the whole project",
         "mimeType": "text/markdown",
     })];
     for c in &map.caches {
@@ -4131,6 +4352,8 @@ const ENDPOINTS: &[&str] = &[
     "GET /prompts[?base=<ref>] (which claude/copilot request produced each change)",
     "GET /insights.json[?base=<ref>] (the whole analysis payload)",
     "GET /insights (human UI over the same data; off with --no-html)",
+    "GET /vis.json | /vis/code?file=<path> | /vis/flow?file=<path>&line=<n> (architecture levels)",
+    "GET /vis (architecture visualiser; on with --vis)",
     "POST /refresh",
     "POST /mcp (Model Context Protocol, JSON-RPC)",
     "GET /fragment/{find,references,dependencies,health} (HTML for HTMX)",
@@ -4158,6 +4381,8 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
                 "files": map.caches.len(),
                 "generated": map.ts,
                 "watch_secs": map.watch_secs,
+                // `--ignore-skip`: code `ccc:skip` marks is mapped like the rest
+                "ignore_skip": crate::extract::skips_ignored(),
                 "version": env!("CARGO_PKG_VERSION"),
             }))
         }
@@ -4262,6 +4487,43 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
             }
             html_ok(crate::html::render_insights_html(&map.root_label, None))
         }
+        // the architecture visualiser: the page is on with `ccc run --vis`, the
+        // data behind it always, the way /insights.json outlives --no-html
+        ("GET", "/vis") => {
+            let map = state.read().expect("map lock poisoned");
+            if !map.vis {
+                return bad(
+                    404,
+                    "the visualiser is off; restart as `ccc run --vis` (its data is at \
+                     /vis.json either way)",
+                );
+            }
+            html_ok(vis::page(&map.root_label))
+        }
+        ("GET", "/vis.json") => {
+            let map = state.read().expect("map lock poisoned");
+            ok(map.vis_model().overview().clone())
+        }
+        ("GET", "/vis/code") => {
+            let Some(file) = get("file") else {
+                return bad(400, "missing ?file=<path>");
+            };
+            let map = state.read().expect("map lock poisoned");
+            match map.vis_model().code(&map.caches, file) {
+                Ok(v) => ok(v),
+                Err(e) => bad(404, e),
+            }
+        }
+        ("GET", "/vis/flow") => {
+            let (Some(file), Some(line)) = (get("file"), get("line").and_then(|l| l.parse().ok())) else {
+                return bad(400, "missing ?file=<path>&line=<n>");
+            };
+            let map = state.read().expect("map lock poisoned");
+            match map.vis_model().flow(&map.caches, &map.root, file, line, get("name")) {
+                Ok(v) => ok(v),
+                Err(e) => bad(404, e),
+            }
+        }
         // HTML fragments for the HTMX live-query panel (always 200, errors inline)
         ("GET", "/fragment/health") => {
             let map = state.read().expect("map lock poisoned");
@@ -4345,6 +4607,7 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
         let mut map = state.write().expect("map lock poisoned");
         map.watch_secs = opts.watch.map(|d| d.as_secs());
         map.html = opts.html;
+        map.vis = opts.vis;
         if map.caches.is_empty() {
             eprintln!("warning: no supported source files under {}", root.display());
         }
@@ -4373,6 +4636,13 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     println!("endpoints: {}", ENDPOINTS.join(" | "));
     if opts.html {
         println!("insights UI: http://{addr}/insights");
+    }
+    if opts.vis {
+        let url = format!("{}/vis", state.read().expect("map lock poisoned").origin);
+        println!("visualiser: {url}");
+        if let Err(e) = launcher()(&url) {
+            println!("  (could not open a browser: {e})");
+        }
     }
     println!("dependency delta: http://{addr}/deps.json[?base=<ref>]");
     match opts.watch {
@@ -5876,6 +6146,33 @@ mod tests {
         assert_eq!(pre.status, 204);
     }
 
+    // The page is behind `--vis`; the data behind it always answers, the way
+    // /insights.json outlives --no-html.
+    #[test]
+    fn the_visualiser_page_needs_vis_and_its_data_does_not() {
+        let state = RwLock::new(fixture());
+        assert_eq!(route(&state, "GET", "/vis", b"").status, 404);
+        let data = route(&state, "GET", "/vis.json", b"");
+        assert_eq!(data.status, 200);
+        assert_eq!(json_of(&data)["schema"], vis::SCHEMA);
+        assert!(json_of(&data)["components"].as_array().unwrap().iter().any(|c| c["id"] == "lib/money.rs"));
+
+        state.write().unwrap().vis = true;
+        let page = route(&state, "GET", "/vis", b"");
+        assert_eq!(page.status, 200);
+        let html = html_of(&page);
+        assert!(html.contains("ccc vis") && html.contains("layoutFlow"), "the page and its script are inlined");
+        assert!(!html.contains("/*__CCC_VIS_JS__*/"), "every placeholder is filled");
+
+        let code = route(&state, "GET", "/vis/code?file=lib%2Fmoney.rs", b"");
+        assert_eq!(code.status, 200);
+        assert_eq!(json_of(&code)["file"], "lib/money.rs");
+        assert_eq!(route(&state, "GET", "/vis/code", b"").status, 400);
+        assert_eq!(route(&state, "GET", "/vis/code?file=ghost.rs", b"").status, 404);
+        assert_eq!(route(&state, "GET", "/vis/flow?file=lib%2Fmoney.rs", b"").status, 400);
+        assert_eq!(route(&state, "GET", "/vis/flow?file=lib%2Fmoney.rs&line=9999", b"").status, 404);
+    }
+
     // Call every analysis tool the way an agent would, and check the two
     // things that make one usable: it renders as markdown rather than raw
     // JSON, and a list it cannot fit says how to get the rest.
@@ -6158,6 +6455,53 @@ mod tests {
         fs::read_to_string(dir.0.join(path)).unwrap()
     }
 
+    // Code `ccc:skip` withdrew is unindexed, not absent: a lookup that misses
+    // has to say where it could not look, and show what the text there holds.
+    #[test]
+    fn a_miss_searches_the_code_ccc_skip_withdrew() {
+        let (_dir, state) = scratch(
+            "withdrawn",
+            &[
+                // a blank line under the marker: the whole file goes
+                (
+                    "src/hidden.rs",
+                    "//! generated\n// ccc:skip\n\npub fn detect_crossings() -> usize { 1 }\n",
+                ),
+                // directly above a definition: only that function goes
+                (
+                    "src/main.rs",
+                    "use std::fmt;\n// ccc:skip\nfn shadow() { reach_out(); }\n\nfn main() { println!(\"hi\"); }\n",
+                ),
+            ],
+        );
+        let map = state.read().unwrap();
+        assert_eq!(map.withdrawn, vec!["src/hidden.rs".to_string()]);
+
+        let v = q_find(&map, "detect_crossings", "any").unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["withdrawn"]["match_count"], 1, "{v}");
+        assert_eq!(v["withdrawn"]["matches"][0]["file"], "src/hidden.rs");
+        assert_eq!(v["withdrawn"]["matches"][0]["line"], 4);
+        let md = md_find(&v);
+        assert!(md.contains("in code `ccc:skip` withdrew"), "{md}");
+        assert!(md.contains("src/hidden.rs:4"), "{md}");
+
+        // a function withdrawn from a mapped file is searched too - its span only
+        let r = q_references(&map, "reach_out").unwrap();
+        assert_eq!(r["withdrawn"]["match_count"], 1, "{r}");
+        assert_eq!(r["withdrawn"]["matches"][0]["line"], 3);
+
+        // nothing withdrawn names it either, and the answer says it looked
+        let none = q_references(&map, "nowhere_at_all").unwrap();
+        assert_eq!(none["withdrawn"]["match_count"], 0);
+        assert!(md_references(&none).contains("not in code `ccc:skip` withdrew either"));
+
+        // the index names the withdrawn file, and `file` explains a lookup of it
+        assert!(idx_md(&q_index(&map, None)).contains("withdrawn by `ccc:skip`"));
+        let err = q_file(&map, "src/hidden.rs").unwrap_err();
+        assert!(err.contains("ccc:skip"), "{err}");
+    }
+
     #[test]
     fn a_find_handle_renames_the_definitions_and_follows_them_to_their_callers() {
         let (dir, state) = scratch(
@@ -6217,7 +6561,10 @@ mod tests {
             )],
         );
         let (_, refs) = tool(&state, "references", json!({"symbol": "condense"}));
-        assert!(!refs.contains(":5 "), "the skipped body is not in the map: {refs}");
+        // the skipped body is no indexed site - it shows only as withdrawn text
+        let indexed = refs.split("## in code `ccc:skip` withdrew").next().unwrap_or_default();
+        assert!(!indexed.contains(":5 "), "the skipped body is not in the map: {refs}");
+        assert!(refs.contains("src/lib.rs:5 `condense(t)`"), "{refs}");
         let handle = id_after(&refs, "handle: `");
         let (err, out) = tool(&state, "edit_rename", json!({"result": handle, "to": "summarise", "apply": true}));
         assert!(!err, "{out}");
@@ -6225,6 +6572,62 @@ mod tests {
         let lib = read(&dir, "src/lib.rs");
         assert!(!lib.contains("condense"), "{lib}");
         assert!(lib.contains("    summarise(t)\n"), "{lib}");
+    }
+
+    // A type that is built and never called - a struct literal, a `new` - is still
+    // found where it is constructed, without compiling anything, and a rename
+    // that starts from `references` reaches those sites too.
+    #[test]
+    fn references_find_where_a_type_is_constructed() {
+        let (dir, state) = scratch(
+            "construct",
+            &[
+                ("src/model.rs", "pub struct Point { pub x: i32 }\n\npub fn origin() -> Point {\n    Point { x: 0 }\n}\n"),
+                (
+                    "src/main.rs",
+                    "mod model;\nuse model::Point;\n\nfn main() {\n    let p = Point { x: 1 };\n    let _q = model::Point { x: p.x };\n}\n",
+                ),
+                ("web/app.js", "class Widget {}\nfunction make() { return new Widget(); }\n"),
+            ],
+        );
+        {
+            let map = state.read().unwrap();
+            let r = q_references(&map, "Point").unwrap();
+            let built: Vec<(String, u64, Option<String>)> = r["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|x| x["kind"] == "construct")
+                .map(|x| (
+                    x["file"].as_str().unwrap().to_string(),
+                    x["line"].as_u64().unwrap(),
+                    x["qualifier"].as_str().map(str::to_string),
+                ))
+                .collect();
+            assert_eq!(
+                built,
+                [
+                    ("src/main.rs".to_string(), 5, None),
+                    ("src/main.rs".to_string(), 6, Some("model".to_string())),
+                    ("src/model.rs".to_string(), 4, None),
+                ],
+                "{r:#}"
+            );
+            // a qualifier narrows constructions the way it narrows calls
+            let narrowed = q_references(&map, "model::Point").unwrap();
+            assert_eq!(narrowed["references"].as_array().unwrap().iter().filter(|x| x["kind"] == "construct").count(), 1);
+            let js = q_references(&map, "Widget").unwrap();
+            assert!(js["references"].as_array().unwrap().iter().any(|x| x["kind"] == "construct" && x["line"] == 2));
+            assert!(md_references(&r).contains("construct"));
+        }
+
+        let (_, refs) = tool(&state, "references", json!({"symbol": "Point"}));
+        let handle = id_after(&refs, "handle: `");
+        let (err, out) = tool(&state, "edit_rename", json!({"result": handle, "to": "Spot", "apply": true}));
+        assert!(!err, "{out}");
+        let main = read(&dir, "src/main.rs");
+        assert!(main.contains("Spot { x: 1 }") && main.contains("model::Spot { x: p.x }"), "{main}");
+        assert!(read(&dir, "src/model.rs").contains("    Spot { x: 0 }"));
     }
 
     #[test]
