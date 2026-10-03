@@ -6,6 +6,14 @@
 // every level arrives language-agnostic from /vis.json, /vis/code and
 // /vis/flow - and keeps nothing the server does not, beyond where you dragged
 // things and which toggles you left on.
+//
+// Below the canvas runs a timeline of every step ccc's edit tools take. It
+// follows them as they land - the canvas flies to the change and marks it -
+// and replays any of them on either side, scrubbed like a video.
+//
+// The same page runs inside the VS Code extension as a webview: there it
+// asks the extension for data instead of fetching it, and asks it to open
+// files instead of following vscode:// links.
 
 (() => {
   'use strict';
@@ -27,10 +35,18 @@
     return e;
   }
 
-  // browser storage can be missing or refuse writes; nothing depends on it
+  // set inside the VS Code extension's webview, where the extension is the host
+  const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
+
+  // the webview's own state inside VS Code, browser storage elsewhere; either
+  // can be missing or refuse writes, and nothing depends on it
   const store = {
     get(key, fallback) {
       try {
+        if (vscode) {
+          const all = vscode.getState() || {};
+          return key in all ? all[key] : fallback;
+        }
         const v = localStorage.getItem('ccc-vis:' + key);
         return v == null ? fallback : JSON.parse(v);
       } catch {
@@ -39,7 +55,8 @@
     },
     set(key, value) {
       try {
-        localStorage.setItem('ccc-vis:' + key, JSON.stringify(value));
+        if (vscode) vscode.setState({ ...(vscode.getState() || {}), [key]: value });
+        else localStorage.setItem('ccc-vis:' + key, JSON.stringify(value));
       } catch {
         // not kept - the page still works
       }
@@ -95,15 +112,58 @@
     return PIN_COLOURS[x % PIN_COLOURS.length];
   }
 
+  // in a webview every request goes through the extension, which reaches the
+  // server wherever it runs - over ssh, in a container - where the page cannot
+  const waiting = new Map();
+  let asked = 0;
+
+  if (vscode) {
+    window.addEventListener('message', e => {
+      const m = e.data || {};
+      if (m.type === 'res' && waiting.has(m.id)) {
+        waiting.get(m.id)(m);
+        waiting.delete(m.id);
+      }
+    });
+  }
+
+  function viaHost(url) {
+    return new Promise((resolve, reject) => {
+      const id = ++asked;
+      const timer = setTimeout(() => {
+        waiting.delete(id);
+        reject(new Error('the extension did not answer'));
+      }, 30000);
+      waiting.set(id, m => {
+        clearTimeout(timer);
+        resolve(m);
+      });
+      vscode.postMessage({ type: 'get', id, url });
+    });
+  }
+
   async function getJSON(url) {
-    const r = await fetch(url, { cache: 'no-store' });
+    let status;
+    let reason = '';
+    let text;
+    if (vscode) {
+      const m = await viaHost(url);
+      if (m.error) throw new Error(m.error);
+      status = m.status;
+      text = m.body;
+    } else {
+      const r = await fetch(url, { cache: 'no-store' });
+      status = r.status;
+      reason = r.statusText;
+      text = await r.text();
+    }
     let body = null;
     try {
-      body = await r.json();
+      body = JSON.parse(text);
     } catch {
       // not json - the status says enough
     }
-    if (!r.ok) throw new Error((body && body.error) || `${r.status} ${r.statusText}`);
+    if (status < 200 || status >= 300) throw new Error((body && body.error) || `${status} ${reason}`.trim());
     return body;
   }
 
@@ -124,6 +184,16 @@
     tests: store.get('tests', false),
     // light unless the viewer chose otherwise; `auto` follows the system
     theme: store.get('theme', 'light'),
+    // the edit step whose changes are marked on the canvas, and which side of it
+    marks: null,
+    // the next mount glides the camera onto what it marks
+    fly: false,
+    // the overview on show is a past step's snapshot, not the live map
+    overviewReplay: false,
+    // the panel holds an edit step, so a replay keeps it open on the next one
+    stepPanel: false,
+    // the step on show is seen alone - see `fade`
+    focusing: false,
   };
 
   const LEVELS = {
@@ -193,16 +263,24 @@
 
   let renderSeq = 0;
 
+  async function ensureOverview() {
+    if (!S.overview) {
+      S.overview = await getJSON('/vis.json');
+      S.generated = S.overview.generated;
+    }
+  }
+
+  // the live map at the route in the address - any replay ends here
   async function render(keepView) {
     const seq = ++renderSeq;
+    endReplay();
     const route = parseRoute();
     const same = S.route && href(S.route) === href(route);
     S.route = route;
+    // a webview forgets its address when it is reloaded
+    if (vscode) store.set('hash', location.hash);
     try {
-      if (!S.overview) {
-        S.overview = await getJSON('/vis.json');
-        S.generated = S.overview.generated;
-      }
+      await ensureOverview();
       let scene;
       if (route.level === 'containers') scene = sceneContainers();
       else if (route.level === 'components') scene = sceneComponents(route.container);
@@ -210,7 +288,15 @@
         scene = sceneCode(await getJSON('/vis/code?file=' + encodeURIComponent(route.file)));
       } else if (route.level === 'flow') {
         const q = `file=${encodeURIComponent(route.file)}&line=${route.line}` + (route.name ? '&name=' + encodeURIComponent(route.name) : '');
-        scene = sceneFlow(await getJSON('/vis/flow?' + q));
+        const flow = await getJSON('/vis/flow?' + q);
+        if (seq !== renderSeq) return;
+        // the function moved since this address was written - follow it there
+        if (flow.function.line !== route.line) {
+          route.line = flow.function.line;
+          history.replaceState(null, '', href(route));
+          if (vscode) store.set('hash', location.hash);
+        }
+        scene = sceneFlow(flow);
       } else scene = sceneSystem();
       if (seq !== renderSeq) return; // a later navigation won
       mount(scene, keepView && same);
@@ -1063,10 +1149,14 @@
 
   function mount(scene, keepView) {
     clearCanvas();
-    hidePanel();
+    // the list of asks belongs to no one level, so it stays while they are walked
+    if (!S.asksPanel) hidePanel();
     hideMessage();
     S.scene = scene;
     S.selected = null;
+    // a step arriving or replayed is seen alone - see `fade`
+    S.focusing = S.fly && T.focus && !!S.marks;
+    if (S.focusing) S.scene = scene = narrowed(scene);
     const l = layers();
     for (const n of scene.nodes) {
       n.el.dataset.id = n.id;
@@ -1099,6 +1189,35 @@
     legend(scene.legend || []);
     if (keepView) applyView();
     else fit();
+    const changed = applyMarks();
+    if (S.fly && changed.length) flyTo(changed);
+    S.fly = false;
+  }
+
+  // a step's scene past this many nodes keeps only what it touched and what
+  // is wired straight to it
+  const FOCUS_KEEP = 12;
+
+  // A scene cut down to the step on show and its neighbours, laid out afresh
+  // so they sit together and fit the screen. A function's logic and the
+  // context level keep every node - their shape is the point of them.
+  function narrowed(scene) {
+    if (scene.layout === 'flow' || scene.layout === 'context' || scene.nodes.length <= FOCUS_KEEP) return scene;
+    const hit = new Set(scene.nodes.filter(n => changeOf(n, S.marks.ev, S.marks.side)).map(n => n.id));
+    if (!hit.size) return scene;
+    const near = new Set(hit);
+    for (const e of scene.edges) {
+      if (hit.has(e.from)) near.add(e.to);
+      if (hit.has(e.to)) near.add(e.from);
+    }
+    if (near.size >= scene.nodes.length) return scene;
+    return {
+      ...scene,
+      nodes: scene.nodes.filter(n => near.has(n.id)),
+      edges: scene.edges.filter(e => near.has(e.from) && near.has(e.to)),
+      persist: false,
+      pruned: true,
+    };
   }
 
   function place(n) {
@@ -1277,6 +1396,8 @@
     vp.style.setProperty('--zoom', S.zoom);
     vp.style.setProperty('--pan-x', S.panX);
     vp.style.setProperty('--pan-y', S.panY);
+    // at 30% and below the grid goes - see `.viewport.far`
+    vp.classList.toggle('far', S.zoom <= 0.3);
     $('zoom-level').textContent = Math.round(S.zoom * 100) + '%';
   }
 
@@ -1369,9 +1490,13 @@
 
   function hidePanel() {
     $('panel').hidden = true;
+    S.stepPanel = false;
+    S.asksPanel = false;
   }
 
   function panel(what, title, fill) {
+    S.stepPanel = false;
+    S.asksPanel = false;
     $('panel-what').textContent = what;
     $('panel-title').textContent = title;
     const body = $('panel-body');
@@ -1398,15 +1523,25 @@
     return `vscode://file${root.startsWith('/') ? '' : '/'}${root}/${file}${line ? ':' + line : ''}`;
   }
 
+  // a link that opens the file at the line - a vscode:// link in a browser, a
+  // request to the extension inside it
+  function editorLink(text, file, line) {
+    const a = h('a', null, text);
+    a.href = editorHref(file, line);
+    a.addEventListener('click', e => {
+      if (!vscode) return;
+      e.preventDefault();
+      vscode.postMessage({ type: 'open', file, line });
+    });
+    return a;
+  }
+
   function actions(list) {
     const box = h('div', 'actions');
     for (const a of list) {
       if (!a) continue;
-      if (a.href) {
-        const link = h('a', null, a.label);
-        link.href = a.href;
-        box.append(link);
-      } else {
+      if (a.open) box.append(editorLink(a.label, ...a.open));
+      else {
         const b = h('button', null, a.label);
         b.addEventListener('click', a.run);
         box.append(b);
@@ -1465,7 +1600,7 @@
           const inE = o.component_edges.filter(e => e.to === d.id).sort((a, b) => b.count - a.count);
           if (outE.length) section(body, 'Calls into', list(outE.slice(0, 20).map(e => goBtn(`${e.to} ×${e.count}`, { level: 'code', file: e.to }, e.symbols.join(', ')))));
           if (inE.length) section(body, 'Called from', list(inE.slice(0, 20).map(e => goBtn(`${e.from} ×${e.count}`, { level: 'code', file: e.from }, e.symbols.join(', ')))));
-          body.append(actions([{ label: 'Open code', run: () => drill(n) }, { label: 'Open in editor', href: editorHref(d.id, 1) }]));
+          body.append(actions([{ label: 'Open code', run: () => drill(n) }, { label: 'Open in editor', open: [d.id, 1] }]));
         });
       case 'outer':
         return panel('Container', d.name, body => {
@@ -1504,7 +1639,7 @@
       const route = x => ({ level: 'flow', file: x.file, line: x.line, name: x.name });
       if (f.calls && f.calls.length) section(body, `Calls (${f.calls_total})`, list(f.calls.map(c => all.get(c.to)).filter(Boolean).map(x => goBtn(`${x.owner ? x.owner + '::' : ''}${x.name}  ${x.file === f.file ? '' : x.file}`, route(x)))));
       if (f.callers && f.callers.length) section(body, `Called by (${f.callers_total})`, list(f.callers.map(c => all.get(c)).filter(Boolean).map(x => goBtn(`${x.owner ? x.owner + '::' : ''}${x.name}  ${x.file === f.file ? '' : x.file}`, route(x)))));
-      body.append(actions([{ label: 'Open logic', run: () => drill(n) }, n.kind === 'proxy' && { label: 'Open its file', run: () => go({ level: 'code', file: f.file }) }, { label: 'Open in editor', href: editorHref(f.file, f.line) }]));
+      body.append(actions([{ label: 'Open logic', run: () => drill(n) }, n.kind === 'proxy' && { label: 'Open its file', run: () => go({ level: 'code', file: f.file }) }, { label: 'Open in editor', open: [f.file, f.line] }]));
       body.append(h('p', 'hint', 'Double-click a function to open its logic. Drag to move; positions are remembered.'));
     });
   }
@@ -1519,14 +1654,14 @@
         if (f.doc) body.append(h('p', 'doc', f.doc));
         if (st.params.length) section(body, 'Parameters', list(st.params.map(p => h('code', null, p))));
         if (st.callers.length) section(body, `Called by (${st.callers_total})`, list(st.callers.map(c => goBtn(`${c.owner ? c.owner + '::' : ''}${c.name}  ${c.file}`, { level: 'flow', file: c.file, line: c.line, name: c.name }))));
-        body.append(actions([{ label: 'Open its file', run: () => go({ level: 'code', file: f.file }) }, { label: 'Open in editor', href: editorHref(f.file, f.line) }]));
+        body.append(actions([{ label: 'Open its file', run: () => go({ level: 'code', file: f.file }) }, { label: 'Open in editor', open: [f.file, f.line] }]));
       });
     }
     if (n.kind === 'calls') {
       return panel('Library calls', `${st.calls.length} call${st.calls.length === 1 ? '' : 's'}`, body => {
         body.append(h('p', 'doc', 'Calls that reach no function in this project - the standard library, a dependency, or a name the resolver found no evidence for.'));
         section(body, 'In order', list(st.calls.map(c => h('code', null, `${c.qual ? c.qual + '.' : ''}${c.name}(${c.args.join(', ')})  :${c.line}`))));
-        body.append(actions([{ label: 'Open in editor', href: editorHref(file, st.line) }]));
+        body.append(actions([{ label: 'Open in editor', open: [file, st.line] }]));
       });
     }
     const title = st.t === 'call' ? st.name : st.label || st.kind;
@@ -1535,7 +1670,7 @@
       if (st.arms) section(body, 'Arms', list(st.arms.map(a => `${a.label}: ${a.steps.length ? plural(a.steps.length, 'step') : a.implicit ? 'nothing written - carries on' : 'nothing'}`)));
       if (st.target) section(body, 'Reaches', goBtn(`${st.target.owner ? st.target.owner + '::' : ''}${st.target.name}  ${st.target.file}:${st.target.line}`, n.drill));
       else if (st.t === 'call') body.append(h('p', 'doc', 'No function in this project - a library call, or one the resolver had no evidence for.'));
-      body.append(actions([n.drill && { label: 'Open its logic', run: () => drill(n) }, st.line && { label: 'Open in editor', href: editorHref(file, st.line) }]));
+      body.append(actions([n.drill && { label: 'Open its logic', run: () => drill(n) }, st.line && { label: 'Open in editor', open: [file, st.line] }]));
     });
   }
 
@@ -1550,11 +1685,7 @@
           body,
           'Call sites',
           list(
-            d.sites.map(s => {
-              const a = h('a', null, `${s.caller} ${s.caller_file}:${s.caller_line} → ${s.symbol}`);
-              a.href = editorHref(s.caller_file, s.caller_line);
-              return a;
-            })
+            d.sites.map(s => editorLink(`${s.caller} ${s.caller_file}:${s.caller_line} → ${s.symbol}`, s.caller_file, s.caller_line))
           )
         );
       }
@@ -1748,8 +1879,14 @@
         d.n.el.classList.remove('dragging');
         if (d.moved) {
           if (S.scene.persist) savePos(d.n);
-        } else select(d.n.id);
-      } else if (!d.moved) select(null);
+        } else {
+          unfocus(false);
+          select(d.n.id);
+        }
+      } else if (!d.moved) {
+        unfocus(true);
+        select(null);
+      }
     };
     vp.addEventListener('pointerup', finish);
     vp.addEventListener('pointercancel', finish);
@@ -1845,32 +1982,881 @@
       else if (e.key === '+' || e.key === '=') zoomBy(1.2);
       else if (e.key === '-' || e.key === '_') zoomBy(1 / 1.2);
       else if (e.key === 'Enter' && S.selected) drill(S.byId.get(S.selected));
+      else if (e.key === ',' || e.key === '<') stepBy(-1);
+      else if (e.key === '.' || e.key === '>') stepBy(1);
+      else if (e.key === 'l' || e.key === 'L') followLive();
+      else if (e.key === '[') groupBy(-1);
+      else if (e.key === ']') groupBy(1);
     });
 
     window.addEventListener('hashchange', () => render(false));
   }
 
-  // ------------------------------------------------------------- refresh
+  // ------------------------------------------------------------- timeline
 
-  // the server rescans a few seconds after a save; when the generation moves,
-  // redraw the same view without losing the zoom
-  async function poll() {
+  // Every step ccc's edit tools took, and every change made by hand, oldest
+  // first, as the server logged it.
+  // Following, each new one is shown where it landed and as the map holds it
+  // now; scrubbing replays any of them from the snapshots the server drew on
+  // each side of it while this page was open.
+  // replay speeds, as a share of real time
+  const SPEEDS = [1, 0.5, 0.25, 0.125, 0.1];
+  const SPEED_LABEL = { 1: 'Live', 0.5: '½×', 0.25: '¼×', 0.125: '⅛×', 0.1: '⅒×' };
+  // at live speed a step stays on show at least this long - parts that
+  // landed together still take their turn each - and never waits longer
+  // than this for the next, however long the agent paused
+  const STEP_MS = 1200;
+  const GAP_MS = 4000;
+
+  const T = {
+    boot: null,
+    seq: 0,
+    steps: [],
+    // the step on show, as an index into `steps`
+    at: null,
+    follow: true,
+    side: 'after',
+    // a past step drawn from its snapshot rather than the live map
+    replay: null,
+    // per step, the answer of /vis/event: the step and both its snapshots
+    full: new Map(),
+    playing: false,
+    // the first answer is history, not news - nothing flies for it
+    primed: false,
+    // show a change that only moves whitespace or wraps lines
+    ws: store.get('ws', false),
+    // how fast steps play, following or replaying - 1 keeps the time between them
+    speed: SPEEDS.includes(store.get('speed', 1)) ? store.get('speed', 1) : 1,
+    // steps landed while following, waiting their turn at that speed
+    queue: [],
+    pumping: false,
+    // the step shown last while following, and when
+    shown: null,
+    // each step on show is seen alone: what it touched in full, the rest faded
+    focus: store.get('focus', true),
+    // the agent session on show - one at a time, and undefined for the latest
+    session: undefined,
+  };
+  const MAX_TIMELINE = 200;
+  const STATUS = {
+    staged: 'staged - not written yet',
+    applied: 'applied - written',
+    reverted: 'reverted - put back',
+    discarded: 'discarded - dropped unwritten',
+    edited: 'edited by hand - saved outside ccc’s edit tools',
+    read: 'read - an agent looked at it through ccc’s tools',
+  };
+
+  const sameFn = (t, f) => t.file === f.file && t.name === f.name && (t.owner || null) === (f.owner || null);
+  const within = (line, ranges) => line != null && ranges.some(([a, b]) => line >= a && line <= b);
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  const byHand = ev => ev.by === 'human';
+  // a step, file or function only its layout moved, while such changes are hidden
+  const layoutOnly = x => !T.ws && !!x && !!x.whitespace;
+  // the latest reason the agent gave for the step, if it gave one
+  const why = ev => (ev.intent && ev.intent[ev.intent.length - 1]) || null;
+
+  // The timeline's steps grouped by the ask behind them - the request an
+  // agent was answering, read from its transcript - or by a run of changes
+  // made by hand, as /vis/asks answers.
+  const A = { groups: [], of: new Map(), timer: 0 };
+  const groupOf = ev => (ev ? A.groups[A.of.get(ev.seq)] : null);
+
+  // what a group of steps is put down to, in a line
+  function groupText(g) {
+    if (g.kind === 'hand') return 'Changed by hand';
+    if (g.kind === 'agent') return 'An agent - no transcript names its ask';
+    return g.ask.prompt;
+  }
+
+  // a speech bubble, beside an ask an agent was answering
+  function bubble() {
+    const s = sv('svg', { class: 'glyph', viewBox: '0 0 16 16', 'aria-hidden': 'true' });
+    s.append(sv('path', { d: 'M2 2.5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7l-3.5 3v-3H2a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z' }));
+    return s;
+  }
+  const groupIcon = g => (g.kind === 'hand' ? person() : bubble());
+
+  // which ask each step answers - read again a moment after steps land, once
+  // the agent's transcript has caught up with them
+  function asksSoon(ms) {
+    clearTimeout(A.timer);
+    A.timer = setTimeout(loadAsks, ms);
+  }
+
+  async function loadAsks() {
+    let r;
     try {
-      const health = await getJSON('/health');
-      if (S.generated && health.generated !== S.generated) {
+      r = await getJSON('/vis/asks');
+    } catch {
+      return;
+    }
+    A.groups = r.groups || [];
+    A.of = new Map();
+    A.groups.forEach((g, i) => g.steps.forEach(seq => A.of.set(seq, i)));
+    drawTimeline();
+    if (S.asksPanel) panelAsks();
+  }
+
+  // a person, beside a change made by hand rather than by an agent
+  function person() {
+    const s = sv('svg', { class: 'person', viewBox: '0 0 16 16', 'aria-hidden': 'true' });
+    s.append(sv('circle', { cx: 8, cy: 4.5, r: 3 }), sv('path', { d: 'M2 15c0-3.6 2.7-6 6-6s6 2.4 6 6z' }));
+    return s;
+  }
+
+  function summary(ev) {
+    const fn = ev.focus && ev.focus.level === 'flow' ? ev.focus.name : null;
+    const files = ev.files.length === 1 ? base(ev.files[0].path) : plural(ev.files_total, 'file');
+    if (ev.status === 'read') return `looked at ${fn || files}`;
+    const added = ev.files.reduce((n, f) => n + f.added, 0);
+    const removed = ev.files.reduce((n, f) => n + f.removed, 0);
+    // one part of a step: the definition it is about, and which part of how many
+    const p = ev.part;
+    const what = (p && p.name ? `${p.owner ? p.owner + '::' : ''}${p.name}` : fn) || files;
+    const part = p ? ` · ${p.kind === 'file' ? 'file' : p.kind} ${p.change} · ${p.index + 1}/${p.of}` : '';
+    return `${what} +${added} −${removed}${part}`;
+  }
+
+  // one part of a step in a line: what it is about, and which of how many
+  function partOf(ev) {
+    const p = ev.part;
+    if (!p) return null;
+    const name = p.name ? ` ${p.owner ? p.owner + '::' : ''}${p.name}` : '';
+    return `${p.kind}${name} ${p.change} ${p.index + 1}/${p.of}`;
+  }
+
+  // where on the canvas a step is seen, on one side of it
+  function focusRoute(ev, side) {
+    const f = ev.focus;
+    if (!f) return null;
+    const mapped = file => !!containerOf(file);
+    if (f.level === 'flow') {
+      const pos = f[side];
+      if (!mapped(f.file)) return null;
+      return pos ? { level: 'flow', file: f.file, line: pos.line, name: f.name } : { level: 'code', file: f.file };
+    }
+    if (f.level === 'code') return mapped(f.file) ? { level: 'code', file: f.file } : null;
+    const containers = [...new Set(ev.files.map(x => containerOf(x.path)).filter(Boolean))];
+    if (containers.length === 1) return { level: 'components', container: containers[0] };
+    return containers.length ? { level: 'containers' } : null;
+  }
+
+  // how a node took part in the marked step - added, modified, removed - if at all
+  function changeOf(n, ev, side) {
+    const d = n.data || {};
+    switch (S.route && S.route.level) {
+      case 'flow': {
+        const fn = S.scene.entry && S.scene.entry.data.function;
+        const t = fn && ev.functions.find(x => sameFn(x, fn));
+        if (!t || layoutOnly(t)) return null;
+        if (n.kind === 'entry') return t.change === 'modified' ? null : t.change;
+        const lines = t['lines_' + side] || [];
+        const hit = n.kind === 'calls' ? d.calls.some(c => within(c.line, lines)) : within(d.line, lines);
+        return hit ? (t.change === 'added' || t.change === 'read' ? t.change : 'modified') : null;
+      }
+      case 'code': {
+        if (n.kind !== 'function' && n.kind !== 'proxy') return null;
+        const t = ev.functions.find(x => sameFn(x, d));
+        return t && !layoutOnly(t) ? t.change : null;
+      }
+      case 'components': {
+        const f = n.kind === 'component' && ev.files.find(x => x.path === d.id);
+        return f && !layoutOnly(f) ? f.change : null;
+      }
+      case 'containers':
+        return n.kind === 'container' && ev.files.some(x => containerOf(x.path) === d.id && !layoutOnly(x)) ? touched(ev) : null;
+      case 'system':
+        return n.kind === 'system' && ev.files.some(x => !layoutOnly(x)) ? touched(ev) : null;
+      default:
+        return null;
+    }
+  }
+
+  // how a level above the code took part: looked at, or changed
+  const touched = ev => (ev.status === 'read' ? 'read' : 'modified');
+
+  // A change with no step of its own - lines removed, a statement that calls
+  // nothing - is marked on the step it lands after, or on the entry.
+  function landing(ev, side) {
+    const fn = S.scene.entry && S.scene.entry.data.function;
+    const t = fn && ev.functions.find(x => sameFn(x, fn));
+    const ranges = t && t['lines_' + side];
+    if (!ranges || !ranges.length || t.change !== 'modified' || layoutOnly(t)) return null;
+    const at = ranges[0][0];
+    let best = null;
+    for (const n of S.scene.nodes) {
+      const line = n.kind === 'entry' || !n.data ? null : n.data.line;
+      if (line != null && line <= at && (!best || line >= best.line)) best = { n, line };
+    }
+    return best ? best.n : S.scene.entry;
+  }
+
+  // mark what the step on show changed, and return the nodes marked
+  function applyMarks() {
+    const hit = [];
+    if (!S.scene) return hit;
+    const m = S.marks;
+    const mark = (n, how) => {
+      // read layout between the two so the pulse starts again
+      void n.el.offsetWidth;
+      n.el.classList.add('chg', 'chg-' + how);
+      if (m.ev.status === 'staged') n.el.classList.add('chg-pending');
+      hit.push(n);
+    };
+    for (const n of S.scene.nodes) {
+      n.el.classList.remove('chg', 'chg-added', 'chg-modified', 'chg-removed', 'chg-pending', 'chg-read');
+      const how = m ? changeOf(n, m.ev, m.side) : null;
+      if (how) mark(n, how);
+    }
+    if (m && !hit.length && S.route && S.route.level === 'flow') {
+      const near = landing(m.ev, m.side);
+      if (near) mark(near, 'modified');
+    }
+    fade(hit);
+    return hit;
+  }
+
+  // The step on show seen alone: what it touched in full, every other node
+  // and wire faded back - while it is on show, and until the viewer reaches
+  // into the canvas.
+  function fade(hit) {
+    const on = !!(S.scene && S.focusing && hit.length);
+    const keep = new Set(hit.map(n => n.id));
+    for (const n of S.scene ? S.scene.nodes : []) n.el.classList.toggle('faded', on && !keep.has(n.id));
+    for (const e of S.scene ? S.scene.edges : []) {
+      const lit = keep.has(e.from) || keep.has(e.to);
+      if (e.path) e.path.classList.toggle('faded', on && !lit);
+      if (e.labelEl) e.labelEl.classList.toggle('faded', on && !lit);
+    }
+    $('frames').classList.toggle('faded', on);
+  }
+
+  // the canvas whole again - `whole` brings back what a big scene left out
+  function unfocus(whole) {
+    if (!S.focusing) return;
+    S.focusing = false;
+    fade([]);
+    if (whole && S.scene && S.scene.pruned && !T.replay) render(true);
+  }
+
+  // glide the camera onto the marked nodes, near enough to read them
+  function flyTo(nodes) {
+    const vp = $('viewport');
+    const bar = $('timeline');
+    const x0 = Math.min(...nodes.map(n => n.x));
+    const y0 = Math.min(...nodes.map(n => n.y));
+    const x1 = Math.max(...nodes.map(n => n.x + n.w));
+    const y1 = Math.max(...nodes.map(n => n.y + n.h));
+    const vw = vp.clientWidth - ($('panel').hidden ? 0 : 352);
+    const vh = vp.clientHeight - (bar.hidden ? 0 : bar.offsetHeight + 12);
+    const floor = S.route && S.route.level === 'flow' ? 0.6 : 0.3;
+    S.zoom = clamp(Math.min((vw - 120) / Math.max(1, x1 - x0), (vh - 120) / Math.max(1, y1 - y0)), floor, 1.1);
+    S.panX = vw / 2 - ((x0 + x1) / 2) * S.zoom;
+    S.panY = vh / 2 - ((y0 + y1) / 2) * S.zoom;
+    glide();
+    applyView();
+  }
+
+  let glideTimer = 0;
+  function glide() {
+    const vp = $('viewport');
+    vp.classList.add('glide');
+    clearTimeout(glideTimer);
+    glideTimer = setTimeout(() => vp.classList.remove('glide'), 700);
+  }
+
+  // a step just landed: show it where it happened, as the map holds it now
+  async function arrive(ev) {
+    const i = T.steps.indexOf(ev);
+    T.at = i < 0 ? T.steps.length - 1 : i;
+    T.side = ev.on_disk;
+    drawTimeline();
+    if (ev.status === 'discarded') {
+      // nothing moved; the marks of what it dropped go with it, and so does
+      // a preview of what it would have written
+      if (!S.marks || S.marks.ev.changeset !== ev.changeset) return;
+      S.marks = null;
+      if (!(T.replay && T.replay.live)) return applyMarks();
+      const route = focusRoute(ev, 'before');
+      return route ? go(route) : render(true);
+    }
+    // only its layout moved: nothing to show, though what is on screen may have shifted
+    if (layoutOnly(ev)) {
+      S.marks = null;
+      if (ev.status === 'staged') return applyMarks();
+      S.overview = null;
+      return render(true);
+    }
+    // a step not written yet: draw the map as it would leave it, to look over
+    if (ev.status === 'staged' && ev.snapshot && ev.focus) return replay(T.at, 'after', true);
+    // a look moved nothing, so the overview on show still holds
+    if (ev.status !== 'staged' && ev.status !== 'read') S.overview = null;
+    try {
+      await ensureOverview();
+    } catch {
+      return;
+    }
+    S.marks = { ev, side: ev.on_disk };
+    S.fly = true;
+    const route = focusRoute(ev, ev.on_disk);
+    if (route) go(route);
+    else render(true);
+  }
+
+  // the live map again, the newest step shown as if it had just landed, and
+  // each step after it followed
+  function followLive() {
+    stopPlay();
+    T.follow = true;
+    // live is now, whatever was still waiting its turn, in the latest session
+    T.queue = [];
+    T.shown = null;
+    T.session = undefined;
+    endReplay();
+    const last = T.steps[T.steps.length - 1];
+    if (!last || last.status === 'discarded') {
+      S.marks = null;
+      T.at = last ? T.steps.length - 1 : null;
+      drawTimeline();
+      return render(true);
+    }
+    return arrive(last);
+  }
+
+  // how long a step stays on show before the next, at the chosen speed
+  const pace = (ev, next) => clamp(next && ev ? next.at - ev.at : 0, STEP_MS, GAP_MS) / T.speed;
+
+  // Steps landed while following, shown one after another: live keeps the
+  // time between them, a slower speed stretches it, and parts that landed
+  // together still take their turn each.
+  async function pump() {
+    if (T.pumping) return;
+    T.pumping = true;
+    try {
+      let drawn = -1;
+      while (T.queue.length && T.follow && !T.playing) {
+        const ev = T.queue[0];
+        const wait = T.shown ? T.shown.at + pace(T.shown.ev, ev) - Date.now() : 0;
+        if (wait > 0) {
+          // waiting, only the count behind moves
+          if (drawn !== T.queue.length) {
+            drawn = T.queue.length;
+            drawTimeline();
+          }
+          await sleep(Math.min(wait, 250));
+          continue;
+        }
+        T.queue.shift();
+        if (!T.steps.includes(ev)) continue;
+        T.shown = { ev, at: Date.now() };
+        // following is the latest session
+        T.session = undefined;
+        await arrive(ev);
+      }
+    } finally {
+      T.pumping = false;
+      drawTimeline();
+    }
+  }
+
+  // how steps play: a speed from SPEEDS, and whether each is seen alone
+  function setReplay(speed, focus) {
+    if (SPEEDS.includes(speed)) {
+      T.speed = speed;
+      store.set('speed', speed);
+    }
+    if (typeof focus === 'boolean') {
+      T.focus = focus;
+      store.set('focus', focus);
+      if (!focus) unfocus(true);
+    }
+    drawTimeline();
+  }
+
+  let replaySeq = 0;
+
+  // A past step drawn from the snapshot the server took of it, on one side.
+  // `live` is the newest step drawn while following - a preview of what a
+  // staged step would write - so following carries on past it.
+  async function replay(i, side, live) {
+    const ev = T.steps[i];
+    if (!ev) return;
+    const mine = ++replaySeq;
+    if (!live) T.follow = false;
+    T.at = i;
+    drawTimeline();
+    let full = T.full.get(ev.seq);
+    if (!full && ev.snapshot) {
+      try {
+        full = await getJSON('/vis/event?seq=' + ev.seq);
+        T.full.set(ev.seq, full);
+      } catch {
+        full = null;
+      }
+      if (mine !== replaySeq) return;
+    }
+    const has = s => !!(full && full[s]);
+    side = side || T.side;
+    if (!has(side)) side = has('after') ? 'after' : has('before') ? 'before' : side;
+    T.side = side;
+    const keepPanel = S.stepPanel;
+    S.marks = { ev, side };
+    S.fly = true;
+    if (!has(side)) {
+      // nothing was drawn of it - no visualiser was open, or it is older than
+      // the snapshots kept - so show where it happened in the map as it is
+      try {
+        await ensureOverview();
+      } catch {
+        return;
+      }
+      const route = focusRoute(ev, ev.on_disk);
+      if (route) go(route);
+      else drawTimeline();
+      return;
+    }
+    const snap = full[side];
+    const f = ev.focus;
+    if (f.level !== 'overview' && S.overviewReplay) {
+      S.overview = S.liveOverview;
+      S.overviewReplay = false;
+    }
+    let scene;
+    try {
+      if (f.level === 'flow') {
+        S.route = { level: 'flow', file: f.file, line: snap.function.line, name: f.name };
+        scene = sceneFlow(snap);
+      } else if (f.level === 'code') {
+        S.route = { level: 'code', file: f.file };
+        scene = sceneCode(snap);
+      } else {
+        if (!S.overviewReplay) S.liveOverview = S.overview;
+        S.overview = snap;
+        S.overviewReplay = true;
+        const r = focusRoute(ev, side);
+        S.route = r && r.level === 'components' ? r : { level: 'containers' };
+        scene = S.route.level === 'components' ? sceneComponents(S.route.container) : sceneContainers();
+      }
+    } catch (e) {
+      showMessage('Could not draw this step', e.message);
+      return;
+    }
+    T.replay = { seq: ev.seq, side, live: !!live };
+    // a live render still in flight must not draw over the replay
+    renderSeq++;
+    mount(scene, false);
+    crumbs();
+    if (keepPanel) panelEvent(ev);
+    drawTimeline();
+  }
+
+  function endReplay() {
+    if (!T.replay && !S.overviewReplay) return;
+    T.replay = null;
+    if (S.overviewReplay) {
+      // the live map has likely moved on since; fetch it again
+      S.overview = null;
+      S.overviewReplay = false;
+    }
+    drawTimeline();
+  }
+
+  // the step before or after the one on show, within the session on show
+  function stepBy(d) {
+    const shown = shownSteps();
+    if (!shown.length) return;
+    stopPlay();
+    const k = shown.indexOf(T.at);
+    const from = k < 0 ? (d > 0 ? -1 : shown.length) : k;
+    const i = shown[clamp(from + d, 0, shown.length - 1)];
+    if (i !== T.at || !T.replay) replay(i, T.side);
+  }
+
+  // replay step after step - those given, or every one from the playhead on -
+  // then follow again at the end
+  async function play(list) {
+    if (T.playing) return stopPlay();
+    if (!T.steps.length) return;
+    T.playing = true;
+    const shown = shownSteps();
+    const k = shown.indexOf(T.at);
+    const queue = list || shown.slice(k < 0 || k >= shown.length - 1 ? 0 : k + 1);
+    drawTimeline();
+    for (const [k, i] of queue.entries()) {
+      if (!T.playing) break;
+      await replay(i, 'after');
+      await sleep(pace(T.steps[i], T.steps[queue[k + 1]]));
+    }
+    if (T.playing) {
+      T.playing = false;
+      followLive();
+    }
+  }
+
+  function stopPlay() {
+    if (!T.playing) return;
+    T.playing = false;
+    drawTimeline();
+  }
+
+  // Runs of asks by the agent session they came from. Changes made by hand,
+  // and steps no transcript explains, go with the session they fall in.
+  function sessionSpans() {
+    const spans = [];
+    for (const [gi, g] of A.groups.entries()) {
+      const s = g.ask ? g.ask.session : null;
+      let cur = spans[spans.length - 1];
+      if (!cur || (s && cur.session && cur.session !== s)) spans.push((cur = { session: s, groups: new Set() }));
+      else if (s && !cur.session) cur.session = s;
+      cur.groups.add(gi);
+    }
+    return spans;
+  }
+
+  // The steps of the session on show, as indices into `steps` - the latest
+  // unless one was picked. A step no ask is known for yet is the newest, so
+  // it goes with the latest.
+  function shownSteps() {
+    const spans = sessionSpans();
+    if (spans.length < 2) return T.steps.map((_, i) => i);
+    const latest = spans[spans.length - 1];
+    const want = (T.session !== undefined && spans.find(s => s.session === T.session)) || latest;
+    const out = [];
+    T.steps.forEach((ev, i) => {
+      const gi = A.of.get(ev.seq);
+      if (gi === undefined ? want === latest : want.groups.has(gi)) out.push(i);
+    });
+    return out;
+  }
+
+  // the session a group of steps belongs to
+  const sessionOf = gi => (sessionSpans().find(s => s.groups.has(gi)) || {}).session;
+
+  function drawTimeline() {
+    const bar = $('timeline');
+    const n = T.steps.length;
+    // with no edits yet there is no timeline, only the switches for what comes
+    bar.hidden = false;
+    bar.classList.toggle('empty', !n);
+    document.body.classList.toggle('with-timeline', n > 0);
+    document.body.classList.toggle('with-tl-switches', !n);
+    const ticks = $('tl-ticks');
+    ticks.textContent = '';
+    let run;
+    // one session at a time - a long history drawn whole is what lags
+    const shown = shownSteps();
+    shown.forEach((i, k) => {
+      const ev = T.steps[i];
+      const gi = A.of.get(ev.seq);
+      // each ask's steps sit together, set off from the next
+      if (k > 0 && gi !== run) ticks.append(h('b', 'tl-sep'));
+      run = gi;
+      const g = A.groups[gi];
+      const t = h('i', `tick ${ev.status}${byHand(ev) ? ' human' : ''}${layoutOnly(ev) ? ' ws' : ''}${i === T.at ? ' at' : ''}`);
+      t.title = `${g ? groupText(g) + '\n' : ''}#${ev.seq} ${ev.status} · ${ev.tool} · ${summary(ev)}${why(ev) ? ' · ' + why(ev) : ''}`;
+      t.dataset.i = i;
+      ticks.append(t);
+    });
+    const ev = T.at != null ? T.steps[T.at] : null;
+    const label = $('tl-step');
+    const who = ev && byHand(ev) ? [person()] : [];
+    // a part says what it is about before why its step was taken
+    const text = ev && `#${ev.seq} ${ev.status} · ${[partOf(ev), why(ev)].filter(Boolean).join(' · ') || summary(ev)}${ev.whitespace ? ' · layout only' : ''}`;
+    label.replaceChildren(...who, text || 'No edits yet - every change lands here, by ccc’s edit tools or by hand');
+    label.title = ev ? `${STATUS[ev.status]} · ${ev.tool} · ${summary(ev)}${ev.changeset ? ' · changeset ' + ev.changeset : ''} - click for its diff` : '';
+    label.disabled = !ev;
+    const g = groupOf(ev);
+    const chip = $('tl-ask');
+    chip.hidden = !A.groups.length;
+    chip.replaceChildren(...(g ? [groupIcon(g)] : []), h('span', 'ask-label', g ? groupText(g) : 'Asks'));
+    chip.title = `${g ? groupText(g) + '\n\n' : ''}Every ask and what it changed - [ and ] step between them`;
+    const cur = ev ? A.of.get(ev.seq) : undefined;
+    for (const row of document.querySelectorAll('#panel .ask-row')) row.classList.toggle('at', +row.dataset.g === cur);
+    const k = shown.indexOf(T.at);
+    $('tl-prev').disabled = !shown.length || k === 0;
+    $('tl-next').disabled = !shown.length || T.at == null || k >= shown.length - 1;
+    $('tl-play').disabled = !n;
+    $('tl-play').textContent = T.playing ? '❚❚' : '▶';
+    $('tl-play').title = T.playing ? 'Pause' : 'Replay the steps from here';
+    const full = ev && T.full.get(ev.seq);
+    $('tl-side').hidden = !T.replay;
+    for (const b of $('tl-side').children) {
+      b.setAttribute('aria-pressed', String(T.side === b.dataset.side));
+      b.disabled = !(full && full[b.dataset.side]);
+    }
+    const live = T.follow && (!T.replay || T.replay.live);
+    $('tl-follow').setAttribute('aria-pressed', String(live));
+    // slowed, following runs behind by the steps still waiting their turn
+    $('tl-follow').textContent = live ? (T.queue.length ? `Following · ${T.queue.length} behind` : 'Following') : 'Follow';
+    $('tl-ws').setAttribute('aria-pressed', String(T.ws));
+    $('tl-speed').textContent = SPEED_LABEL[T.speed];
+    $('tl-focus').setAttribute('aria-pressed', String(T.focus));
+    const badge = $('replay-badge');
+    badge.hidden = !T.replay || !ev;
+    if (!badge.hidden) {
+      badge.replaceChildren(
+        ...(byHand(ev) ? [person()] : []),
+        T.replay.live
+          ? `Proposed · step #${ev.seq}${why(ev) ? ' · ' + why(ev) : ' - staged, not written yet'}`
+          : `Replay · step #${ev.seq} ${ev.status} · ${T.side} it${why(ev) ? ' · ' + why(ev) : ''}`,
+      );
+      badge.title = (ev.intent || []).join('\n');
+    }
+  }
+
+  function diffView(ev) {
+    const box = h('div', 'diff');
+    for (const f of ev.files) {
+      const head = h('div', 'diff-file');
+      head.append(h('b', null, f.path), h('span', null, ` +${f.added} −${f.removed}`));
+      const pre = h('pre');
+      for (const line of f.diff) {
+        const cls = /^(\+\+\+|---)/.test(line) ? 'meta' : line.startsWith('@@') ? 'hunk' : line[0] === '+' ? 'add' : line[0] === '-' ? 'del' : null;
+        pre.append(h('span', cls, line + '\n'));
+      }
+      if (f.diff_truncated) pre.append(h('span', 'meta', '… cut short\n'));
+      box.append(head, pre);
+    }
+    if (ev.files_total > ev.files.length) box.append(h('p', 'hint', `and ${plural(ev.files_total - ev.files.length, 'more file')}`));
+    return box;
+  }
+
+  function panelEvent(ev) {
+    select(null);
+    const look = ev.status === 'read';
+    panel((look ? 'Look #' : 'Edit step #') + ev.seq, `${ev.status} · ${ev.tool}`, body => {
+      const by = byHand(ev) ? 'a person, by hand' : look ? 'an agent, through ccc’s read tools' : 'an agent, through ccc’s edit tools';
+      const rows = [['status', STATUS[ev.status]], ['by', by]];
+      if (ev.intent && ev.intent.length) rows.push([look ? 'asked' : 'why', ev.intent.join(' · ')]);
+      if (ev.part) rows.push(['part', `${ev.part.index + 1} of ${ev.part.of} - ${ev.part.kind} ${ev.part.change}`]);
+      const g = groupOf(ev);
+      if (g && g.ask) rows.push(['ask', g.ask.prompt]);
+      if (ev.changeset) rows.push(['changeset', ev.changeset]);
+      rows.push(['at', new Date(ev.at).toLocaleTimeString()], ['files', ev.files_total]);
+      body.append(dl(rows));
+      if (ev.functions.length) {
+        const rows = ev.functions.map(t => {
+          const pos = t[ev.on_disk];
+          const route = pos ? { level: 'flow', file: t.file, line: pos.line, name: t.name } : { level: 'code', file: t.file };
+          const row = h('span', 'chg-row');
+          row.append(h('span', 'chg-tag ' + (t.whitespace ? 'ws' : t.change), t.whitespace ? 'layout' : t.change), goBtn(`${t.owner ? t.owner + '::' : ''}${t.name}  ${base(t.file)}`, route));
+          return row;
+        });
+        section(body, look ? 'Looked at' : 'Functions', list(rows));
+      }
+      if (ev.ops.length) section(body, 'Operations', list(ev.ops.map(o => h('code', null, o))));
+      if (look) section(body, 'Files', list(ev.files.map(f => goBtn(f.path, { level: 'code', file: f.path }))));
+      else section(body, 'Diff', diffView(ev));
+    });
+    S.stepPanel = true;
+  }
+
+  // Every ask the timeline holds, in order, under the session it was made in:
+  // pick one to walk through its steps, or play a whole session through.
+  function panelAsks() {
+    const keep = S.asksPanel ? $('panel-body').scrollTop : 0;
+    select(null);
+    const asks = new Set(A.groups.filter(g => g.ask).map(g => g.ask.id)).size;
+    panel('Asks', `${plural(asks, 'ask')} · ${plural(T.steps.length, 'step')}`, body => {
+      if (!A.groups.length) body.append(h('p', 'hint', 'No steps yet - each ask an agent works on lands here, and every change made by hand'));
+      const cur = A.of.get(T.steps[T.at]?.seq);
+      let session;
+      A.groups.forEach((g, gi) => {
+        if (g.ask && g.ask.session !== session) {
+          session = g.ask.session;
+          const s = session;
+          const head = h('div', 'ask-session');
+          head.append(h('span', null, `${g.ask.agent} session · ${new Date(g.ask.at).toLocaleString()}`));
+          const all = h('button', null, '▶ Play session');
+          all.title = 'Replay every step from this session’s first ask to its last';
+          all.addEventListener('click', () => playSession(s));
+          head.append(all);
+          body.append(head);
+        }
+        const row = h('div', 'ask-row' + (gi === cur ? ' at' : ''));
+        row.dataset.g = gi;
+        const go = h('button', 'ask-go');
+        go.append(groupIcon(g), h('span', 'ask-text', groupText(g)), h('span', 'ask-n', plural(g.steps.length, 'step')));
+        go.title = groupText(g);
+        go.addEventListener('click', () => goGroup(gi));
+        const one = h('button', 'ask-play', '▶');
+        one.title = 'Replay this ask’s steps';
+        one.addEventListener('click', () => play(indicesOf(g.steps)));
+        row.append(go, one);
+        body.append(row);
+      });
+    });
+    S.asksPanel = true;
+    $('panel-body').scrollTop = keep;
+  }
+
+  // where steps sit on the timeline, by their numbers
+  const indicesOf = seqs => seqs.map(seq => T.steps.findIndex(e => e.seq === seq)).filter(i => i >= 0);
+
+  // a group, from its first step
+  function goGroup(gi) {
+    const g = A.groups[gi];
+    const [i] = g ? indicesOf(g.steps) : [];
+    if (i == null) return;
+    stopPlay();
+    T.session = sessionOf(gi);
+    replay(i, 'after');
+  }
+
+  // the ask before or after the one on show
+  function groupBy(d) {
+    if (!A.groups.length) return;
+    const cur = A.of.get(T.steps[T.at]?.seq);
+    const from = cur == null ? (d > 0 ? -1 : A.groups.length) : cur;
+    goGroup(clamp(from + d, 0, A.groups.length - 1));
+  }
+
+  // every step from a session's first ask to its last, changes by hand between them included
+  function playSession(session) {
+    const at = A.groups.map((g, i) => (g.ask && g.ask.session === session ? i : -1)).filter(i => i >= 0);
+    if (!at.length) return;
+    stopPlay();
+    T.session = session;
+    play(indicesOf(A.groups.slice(at[0], at[at.length - 1] + 1).flatMap(g => g.steps)));
+  }
+
+  function bindTimeline() {
+    const track = $('tl-track');
+    let scrubbing = false;
+    let timer = 0;
+    const pick = x => {
+      if (!T.steps.length) return;
+      // the tick under the pointer - ticks are packed left, so a share of the
+      // track's width is not a step
+      const ticks = [...$('tl-ticks').querySelectorAll('.tick')];
+      let k = ticks.findIndex(t => x < t.getBoundingClientRect().right);
+      if (k < 0) k = ticks.length - 1;
+      if (k < 0) return;
+      const i = +ticks[k].dataset.i;
+      if (i === T.at && T.replay) return;
+      stopPlay();
+      T.follow = false;
+      T.at = i;
+      drawTimeline();
+      // a fast scrub draws only where it comes to rest
+      clearTimeout(timer);
+      timer = setTimeout(() => replay(i, T.side), 110);
+    };
+    track.addEventListener('pointerdown', e => {
+      scrubbing = true;
+      track.setPointerCapture(e.pointerId);
+      pick(e.clientX);
+    });
+    track.addEventListener('pointermove', e => {
+      if (scrubbing) pick(e.clientX);
+    });
+    track.addEventListener('pointerup', () => (scrubbing = false));
+    track.addEventListener('pointercancel', () => (scrubbing = false));
+    track.addEventListener('keydown', e => {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        e.stopPropagation();
+        stepBy(e.key === 'ArrowLeft' ? -1 : 1);
+      }
+    });
+    $('tl-prev').addEventListener('click', () => stepBy(-1));
+    $('tl-next').addEventListener('click', () => stepBy(1));
+    $('tl-play').addEventListener('click', () => play());
+    $('tl-follow').addEventListener('click', () => followLive());
+    $('tl-speed').addEventListener('click', e => {
+      // shift steps back up through the speeds
+      const i = SPEEDS.indexOf(T.speed);
+      setReplay(SPEEDS[(i + (e.shiftKey ? SPEEDS.length - 1 : 1)) % SPEEDS.length]);
+    });
+    $('tl-focus').addEventListener('click', () => setReplay(undefined, !T.focus));
+    $('tl-ask').addEventListener('click', () => (S.asksPanel ? hidePanel() : panelAsks()));
+    $('tl-ws').addEventListener('click', () => {
+      T.ws = !T.ws;
+      store.set('ws', T.ws);
+      applyMarks();
+      drawTimeline();
+    });
+    $('tl-step').addEventListener('click', () => {
+      const ev = T.steps[T.at];
+      if (ev) panelEvent(ev);
+    });
+    for (const b of $('tl-side').children) {
+      b.addEventListener('click', () => {
+        if (T.at != null) replay(T.at, b.dataset.side);
+      });
+    }
+  }
+
+  // One request a second carries both: new edit steps, and the map's
+  // generation - which a save or a branch switch moves without any step.
+  async function poll() {
+    let wait = 1000;
+    try {
+      let r = await getJSON('/vis/events?since=' + T.seq);
+      if (r.boot !== T.boot) {
+        // the server started again - perhaps a newer build, serving a newer
+        // page than this one - so the page is loaded afresh; a host that
+        // cannot do that leaves this one running, its numbering started over
+        if (T.boot != null && !T.reloading) {
+          T.reloading = true;
+          if (vscode) vscode.postMessage({ type: 'reload' });
+          else location.reload();
+        }
+        if (T.boot != null && T.seq) r = await getJSON('/vis/events?since=0');
+        T.boot = r.boot;
+        T.steps = [];
+        T.full.clear();
+        T.at = null;
+        A.groups = [];
+        A.of = new Map();
+      }
+      const fresh = r.events || [];
+      T.steps.push(...fresh);
+      // past the cap a look goes before an edit does, as on the server
+      while (T.steps.length > MAX_TIMELINE) {
+        const look = T.steps.slice(0, T.steps.length >> 1).findIndex(e => e.status === 'read');
+        const cut = look < 0 ? 0 : look;
+        T.steps.splice(cut, 1);
+        if (T.at != null && T.at > cut) T.at--;
+      }
+      T.seq = r.latest;
+      if (fresh.length) asksSoon(T.primed ? 2500 : 0);
+      if (!T.primed) {
+        T.primed = true;
+        if (T.steps.length) T.at = T.steps.length - 1;
+        drawTimeline();
+      } else if (fresh.length) {
+        // each takes its turn at the chosen speed, the polling going on meanwhile
+        if (T.follow && !T.playing) {
+          T.queue.push(...fresh);
+          pump();
+        } else drawTimeline();
+      } else if (S.generated && r.generated !== S.generated && !T.replay) {
         S.overview = null;
-        S.generated = health.generated;
         await render(true);
       }
     } catch {
-      // not answering right now - the next poll tries again
+      // not answering right now - try again a little later
+      wait = 4000;
     }
-    setTimeout(poll, 4000);
+    setTimeout(poll, wait);
   }
 
   chips();
   bindCanvas();
   bindChrome();
+  bindTimeline();
   applyView();
-  render(false).then(() => setTimeout(poll, 4000));
+  if (vscode && !location.hash) {
+    const saved = store.get('hash', '');
+    try {
+      if (saved) history.replaceState(null, '', saved);
+    } catch {
+      // the default view will do
+    }
+  }
+  drawTimeline();
+  render(false).then(poll);
 })();

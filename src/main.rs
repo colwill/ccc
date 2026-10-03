@@ -235,8 +235,8 @@ enum Command {
         no_html: bool,
         #[arg(long)]
         deps: bool,
-        // serve the architecture visualiser at /vis - C4-style levels from the
-        // system down to one function's logic - and open it in the browser
+        // open the architecture visualiser in the browser - C4-style levels from
+        // the system down to one function's logic, served at /vis with the html UI
         #[arg(long, conflicts_with = "no_html")]
         vis: bool,
     },
@@ -276,6 +276,14 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+    // Replays of what agents did on a branch, kept under `refs/ccc/replay/<branch>`
+    // - beside the branches, never in them, so a merge cannot carry one to the
+    // default branch. `ccc run` installs a pre-push hook that saves each branch's
+    // replay as it is pushed; these do it by hand.
+    Replay {
+        #[command(subcommand)]
+        action: ReplayCommand,
+    },
     // install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
     Install {
         // Directory to install into, positionally: `ccc install ~/bin`. Every
@@ -289,6 +297,35 @@ enum Command {
         // overwrite an existing `ccc` in the target directory
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReplayCommand {
+    // save the branch's new steps to its replay ref, and push it beside the branch
+    Save {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // the branch to save - the one checked out when left out
+        #[arg(long)]
+        branch: Option<String>,
+        // where to push it - the branch's upstream remote, else `origin`
+        #[arg(long)]
+        remote: Option<String>,
+        // keep it local: write the ref, push nothing
+        #[arg(long)]
+        no_push: bool,
+        // save one for the default branch too, which keeps none unless asked to
+        #[arg(long)]
+        default_branch: bool,
+        // say nothing when nothing was saved - for the hook
+        #[arg(long)]
+        quiet: bool,
+    },
+    // install the pre-push hook that saves a replay with every push
+    Install {
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
 }
 
@@ -692,6 +729,21 @@ fn run() -> Result<ExitCode> {
             };
             Ok(if gating > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
         }
+        Command::Replay { action } => match action {
+            ReplayCommand::Save { path, branch, remote, no_push, default_branch, quiet } => {
+                let opts = codecache::replay::SaveOptions { branch, remote, push: !no_push, default_branch };
+                let saved = codecache::replay::save(&canonical(&path), &opts)?;
+                let failed = matches!(saved.pushed, Some(Err(_)));
+                if !quiet || saved.skipped.is_none() || failed {
+                    println!("{}", saved.describe());
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            ReplayCommand::Install { path } => {
+                println!("{}", codecache::replay::install_hook(&canonical(&path))?.describe());
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Command::Install { path, dir, force } => run_install(path.or(dir), force),
     }
 }

@@ -8,6 +8,8 @@ use ignore::WalkBuilder;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 // don't scan these dirs even with `.gitignore`
 const SKIP_DIRS: &[&str] = &[
@@ -114,10 +116,43 @@ pub fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
 
 // parse every discovered file into a `FileCache`, sorted by path
 pub fn build_caches(root: &Path, files: &[PathBuf]) -> Vec<FileCache> {
-    let mut caches: Vec<FileCache> = files.iter().filter_map(|p| build_one(root, p)).collect();
+    let mut caches = parse_all(root, files);
     caches.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     disambiguate_cache_names(&mut caches);
     caches
+}
+
+// the main thread's default - `visit` recurses once per syntax tree level
+const PARSE_STACK_BYTES: usize = 8 << 20;
+
+// every file parses on its own, so spread them over all cores; workers pull the
+// next file off a shared counter so one large file never stalls a whole batch
+fn parse_all(root: &Path, files: &[PathBuf]) -> Vec<FileCache> {
+    let workers = thread::available_parallelism().map_or(1, |n| n.get()).min(files.len());
+    let next = AtomicUsize::new(0);
+    let drain = || {
+        let mut out = Vec::new();
+        while let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+            out.extend(build_one(root, path));
+        }
+        out
+    };
+    thread::scope(|s| {
+        // the calling thread drains too, so a helper that fails to spawn costs speed, not files
+        let helpers: Vec<_> = (1..workers)
+            .filter_map(|_| {
+                thread::Builder::new()
+                    .stack_size(PARSE_STACK_BYTES)
+                    .spawn_scoped(s, drain)
+                    .ok()
+            })
+            .collect();
+        let mut caches = drain();
+        for h in helpers {
+            caches.extend(h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+        }
+        caches
+    })
 }
 
 // fixes bug where cache_name wasnt unique oops
@@ -139,10 +174,17 @@ fn disambiguate_cache_names(caches: &mut [FileCache]) {
 }
 
 fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
-    let lang = Language::from_path(path)?;
+    Language::from_path(path)?;
     let src = fs::read_to_string(path).ok()?;
-    let ex = extract::extract(lang, &src)?;
-    let rel = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+    read_one(path.strip_prefix(root).unwrap_or(path), &src)
+}
+
+// one file's text parsed into a `FileCache` - read from disk, or a text not
+// written yet; none for a file in no language ccc reads, or one that will not parse
+pub fn read_one(rel: &Path, src: &str) -> Option<FileCache> {
+    let lang = Language::from_path(rel)?;
+    let ex = extract::extract(lang, src)?;
+    let rel = rel.to_path_buf();
     Some(FileCache {
         cache_name: naming::cache_name(&rel),
         display_name: naming::display_name(&rel),

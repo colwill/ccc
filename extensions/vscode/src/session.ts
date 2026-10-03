@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { CccClient, isAborted } from './client';
+import { CccClient, isAborted, type RawReply } from './client';
 import { type Cfg, needsRebuild, needsServerRestart } from './config';
 import { FileStructureCache, refineFileHints } from './enclosing';
 import { describe, type Log } from './log';
@@ -267,6 +267,20 @@ export class WorkspaceSession implements vscode.Disposable {
   get insightsUrl(): string | undefined {
     const address = this.server.address;
     return address ? `${address.base}/insights` : undefined;
+  }
+
+  get visualiserUrl(): string | undefined {
+    const address = this.server.address;
+    return address ? `${address.base}/vis` : undefined;
+  }
+
+  // The visualiser's requests, passed through to this folder's analyser as
+  // they are. It asks every second, so a running analyser is used as it is -
+  // starting one schedules a full refresh.
+  async fetchRaw(path: string): Promise<RawReply> {
+    if (!this.client) await this.ensureStarted();
+    if (!this.client) throw new Error('the ccc analyser is not running');
+    return this.client.raw(path);
   }
 
   async restartServer(): Promise<void> {

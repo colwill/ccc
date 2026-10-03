@@ -8,7 +8,7 @@
 </head>
 <body>
 <header class="bar">
-  <div class="brand"><b>ccc</b><span>Collateral Code Check</span></div>
+  <div class="brand"><i class="logo" role="img" aria-label="ccc"></i></div>
   <nav class="crumbs" id="crumbs" aria-label="level"></nav>
   <div class="spacer"></div>
   <div class="search">
@@ -60,6 +60,26 @@
 <div class="legend" id="legend"></div>
 <div class="note-bar" id="note" hidden></div>
 <div class="message" id="message" hidden></div>
+<div class="replay-badge" id="replay-badge" hidden></div>
+
+<section class="timeline" id="timeline" aria-label="edit timeline" hidden>
+  <div class="tl-controls">
+    <button id="tl-prev" title="Previous step (,)" aria-label="previous step">‹</button>
+    <button id="tl-play" title="Replay the steps from here" aria-label="replay">▶</button>
+    <button id="tl-next" title="Next step (.)" aria-label="next step">›</button>
+  </div>
+  <div class="tl-track" id="tl-track" tabindex="0" role="slider" aria-label="scrub through edit steps"><div class="tl-ticks" id="tl-ticks"></div></div>
+  <button class="tl-ask" id="tl-ask" hidden>Asks</button>
+  <button class="tl-step" id="tl-step"></button>
+  <div class="tl-side" id="tl-side" role="group" aria-label="which side of the step" hidden>
+    <button data-side="before" title="The code as it was before this step">before</button>
+    <button data-side="after" title="The code as this step left it">after</button>
+  </div>
+  <button class="tl-speed" id="tl-speed" title="Replay speed - Live keeps the time between steps as it was, slower stretches it (shift-click goes back up)" aria-label="replay speed">Live</button>
+  <button class="tl-focus" id="tl-focus" title="See each step on its own - what it did not touch fades back, and a big scene keeps only what is wired to it" aria-label="see each step on its own" aria-pressed="true">◎</button>
+  <button class="tl-ws" id="tl-ws" title="Show whitespace changes - steps that only move whitespace or wrap lines" aria-label="show whitespace changes" aria-pressed="false">¶</button>
+  <button class="tl-follow" id="tl-follow" title="Follow each edit as it lands (L)" aria-pressed="true">Following</button>
+</section>
 
 <script>/*__CCC_VIS_JS__*/</script>
 </body>

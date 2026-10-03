@@ -144,6 +144,7 @@ mod tests {
                 branch: None,
                 prompt: "add a retry to the charge call".into(),
                 edits: vec![],
+                changesets: vec![],
                 epoch: 0,
             }],
             counts: PromptsCounts {

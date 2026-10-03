@@ -1,10 +1,11 @@
 import { type ChildProcessByStdio, spawn } from 'node:child_process';
+import * as net from 'node:net';
 import type { Readable } from 'node:stream';
 import * as vscode from 'vscode';
 import { CccBinaryError, resolveCccBinary } from './binary';
 import type { Cfg } from './config';
 import { describe, type Log } from './log';
-import { publishMcpConfig } from './mcpconfig';
+import { publishedPort, publishMcpConfig } from './mcpconfig';
 
 export interface ServerAddress {
   host: string;
@@ -30,6 +31,9 @@ const MAX_FAILURES = 5;
 const FAILURE_WINDOW_MS = 5 * 60 * 1000;
 const STABLE_UPTIME_MS = 60 * 1000;
 const STDERR_TAIL = 20;
+// how long a restart waits for the analyser before it to let go of its port
+const PORT_WAIT_MS = 2000;
+const PORT_POLL_MS = 200;
 
 // owns one `ccc serve` child per folder - private to this window so a user's own server is undisturbed
 export class ServerProcess implements vscode.Disposable {
@@ -83,14 +87,15 @@ export class ServerProcess implements vscode.Disposable {
   async restart(): Promise<ServerAddress> {
     this.clearRetry();
     this.failures = [];
-    this.kill();
+    // gone before the next asks for its port
+    await this.kill();
     this.setState({ kind: 'stopped' });
     return this.start();
   }
 
   stop(): void {
     this.clearRetry();
-    this.kill();
+    void this.kill();
     this.setState({ kind: 'stopped' });
   }
 
@@ -109,13 +114,14 @@ export class ServerProcess implements vscode.Disposable {
       throw err;
     }
 
+    const port = await this.stickyPort();
     const args = [
       this.folder.fsPath,
       '--html',
       '--addr',
       this.cfg.server.address,
       '--port',
-      String(this.cfg.server.port),
+      String(port),
       ...(this.cfg.server.watchIntervalSec === 0
         ? ['--no-watch']
         : ['--watch-interval', String(this.cfg.server.watchIntervalSec)]),
@@ -137,10 +143,26 @@ export class ServerProcess implements vscode.Disposable {
     this.wireExit(child);
     this.setState({ kind: 'running', address, pid: child.pid, startedAt: Date.now() });
     this.log.info(`[${this.label}] analyser ready on ${address.base} (pid ${child.pid ?? '?'})`);
-    // the port is ephemeral, so republish it for agents on every start
+    // republished on every start, in case the port had to move
     // deliberately not awaited - a slow disk must not hold up a server that is already serving
     void publishMcpConfig(this.folder, address, this.log);
     return address;
+  }
+
+  // The port this folder's analyser had, so agents already talking to it are
+  // not left holding a dead address - waiting a moment for the analyser before
+  // to let go of it, and taking a free one only when it stays taken. A port
+  // set in the settings is always the one asked for.
+  private async stickyPort(): Promise<number> {
+    if (this.cfg.server.port !== 0) return this.cfg.server.port;
+    const last = await publishedPort(this.folder, this.cfg.server.address);
+    if (last === undefined) return 0;
+    for (let waited = 0; waited <= PORT_WAIT_MS; waited += PORT_POLL_MS) {
+      if (await portFree(this.cfg.server.address, last)) return last;
+      await new Promise((resolve) => setTimeout(resolve, PORT_POLL_MS));
+    }
+    this.log.info(`[${this.label}] port ${last} stayed taken, so the analyser takes a free one`);
+    return 0;
   }
 
   private awaitListening(child: CccChild): Promise<ServerAddress> {
@@ -262,10 +284,13 @@ export class ServerProcess implements vscode.Disposable {
     }
   }
 
-  private kill(): void {
+  // stop the analyser, settling once it has gone
+  private kill(): Promise<void> {
     const child = this.child;
-    if (!child) return;
+    if (!child) return Promise.resolve();
     this.child = undefined;
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    const gone = new Promise<void>((resolve) => child.once('exit', () => resolve()));
     try {
       child.kill('SIGTERM');
     } catch {
@@ -280,15 +305,25 @@ export class ServerProcess implements vscode.Disposable {
       }
     }, 2000);
     child.once('exit', () => clearTimeout(hard));
+    return gone;
   }
 
   dispose(): void {
     this.disposing = true;
     this.clearRetry();
-    this.kill();
+    void this.kill();
     process.removeListener('exit', this.exitGuard);
     this.emitter.dispose();
   }
+}
+
+// can `port` on `host` be bound right now
+function portFree(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(false));
+    probe.listen({ port, host, exclusive: true }, () => probe.close(() => resolve(true)));
+  });
 }
 
 // exported for the port-parsing edge cases (IPv6, non-default hosts)

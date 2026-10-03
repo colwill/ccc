@@ -125,6 +125,18 @@
         "category": "ccc"
       },
       {
+        "command": "ccc.openVisualiser",
+        "title": "Open Architecture Visualiser",
+        "category": "ccc",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "ccc.openVisualiserInBrowser",
+        "title": "Open Architecture Visualiser in Browser",
+        "category": "ccc",
+        "icon": "$(link-external)"
+      },
+      {
         "command": "ccc.selectBaseRef",
         "title": "Select Git Base Ref...",
         "category": "ccc"
@@ -283,6 +295,16 @@
         }
       ],
       "view/title": [
+        {
+          "command": "ccc.openVisualiser",
+          "when": "view == ccc.visualiser",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ccc.openVisualiserInBrowser",
+          "when": "view == ccc.visualiser",
+          "group": "navigation@2"
+        },
         {
           "command": "ccc.refreshTestTriggers",
           "when": "view == ccc.testTriggers",
@@ -517,7 +539,7 @@
         {
           "id": "ccc",
           "title": "Collateral Code Check",
-          "icon": "media/icon.png"
+          "icon": "media/run.svg"
         }
       ]
     },
@@ -530,6 +552,11 @@
         {
           "id": "ccc.complexity",
           "name": "Complexity"
+        },
+        {
+          "type": "webview",
+          "id": "ccc.visualiser",
+          "name": "Visualiser"
         }
       ]
     }

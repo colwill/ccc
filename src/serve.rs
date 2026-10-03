@@ -27,7 +27,7 @@ pub struct ServeOptions {
     pub watch: Option<std::time::Duration>,
     // serve the human-facing `/insights` UI alongside the agent endpoints
     pub html: bool,
-    // serve the architecture visualiser at `/vis` and open it on start
+    // open the architecture visualiser on start; `/vis` is served with `html`
     pub vis: bool,
 }
 
@@ -56,12 +56,24 @@ struct MapState {
     facade: Option<String>,
     watch_secs: Option<u64>,
     html: bool,
-    // the `/vis` page is served - `ccc run --vis`
-    vis: bool,
+    // a git work tree, so its steps keep their branch and texts for replays
+    git: bool,
     origin: String,
     analysis: Mutex<Option<Analysis>>,
     // the visualiser's model of this generation, built on first use
     vis_model: Mutex<Option<(String, Arc<vis::Model>)>>,
+    // every edit step this server saw, for the visualiser to replay
+    timeline: Mutex<Timeline>,
+    // every mapped file as the timeline last saw it, so a change made by hand
+    // lands on it too; none on a server without the page
+    seen: Mutex<Option<Seen>>,
+    // the edit ledger as far as it was read - how a write by another ccc
+    // server is told from one made by hand
+    others: Mutex<Others>,
+    // the steps other ccc servers on the project shared, as far as they were read
+    feed: Mutex<Feed>,
+    // the requests behind the timeline's steps, read from agents' transcripts
+    asks: Mutex<AsksCache>,
     // the advisory answer for this map generation; asking osv is a network round trip
     audit: Mutex<Option<(String, audit::AuditReport)>>,
     // security findings for this generation, keyed also by whether tests were included
@@ -81,11 +93,275 @@ struct Analysis {
     report: Arc<Value>,
 }
 
+// edit steps the timeline keeps, and how many of the newest keep snapshots -
+// an overview snapshot holds a whole generation's levels
+const TIMELINE_STEPS: usize = 200;
+const TIMELINE_SNAPSHOTS: usize = 50;
+// how much of the feed's end a starting server reads its history back from
+const RESTORE_BYTES: u64 = 4 << 20;
+// a visualiser that asked this recently is open; only then are steps drawn
+const VIS_OPEN: std::time::Duration = std::time::Duration::from_secs(600);
+
+// The visualiser's history of edit steps and looks, oldest first.
+struct Timeline {
+    // this server's start, so a page can tell its numbering began again
+    boot: u64,
+    // this server among the others on the project's shared feed
+    server: String,
+    seq: u64,
+    steps: std::collections::VecDeque<Logged>,
+    // when a visualiser last asked for the timeline
+    watched: Option<std::time::Instant>,
+}
+
+impl Timeline {
+    fn new() -> Timeline {
+        let boot = now_ms();
+        Timeline {
+            boot,
+            server: format!("{}-{boot}", std::process::id()),
+            seq: 0,
+            steps: Default::default(),
+            watched: None,
+        }
+    }
+
+    fn open(&self) -> bool {
+        self.watched.is_some_and(|t| t.elapsed() < VIS_OPEN)
+    }
+
+    // A timeline that carries on from the steps the project's feed kept, so a
+    // restarted server - or a fresh one - shows what agents did before it,
+    // every server's, though without the snapshots drawn of them.
+    fn restored(root: &Path) -> Timeline {
+        let mut tl = Timeline::new();
+        let len = std::fs::metadata(feed_path(root)).map_or(0, |m| m.len());
+        // only the tail is read; a line it cuts into does not parse and is passed over
+        let (lines, _) = tail_since(&feed_path(root), len.saturating_sub(RESTORE_BYTES));
+        let skip = lines.len().saturating_sub(TIMELINE_STEPS);
+        for mut v in lines.into_iter().skip(skip) {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("server");
+            }
+            tl.log(Logged { json: v, before: None, after: None });
+        }
+        tl
+    }
+
+    // A step onto the end, numbered, and the event as logged. Past the cap a
+    // look goes before an edit does - the edits are what a replay is for -
+    // and only the newest steps keep their snapshots.
+    fn log(&mut self, mut l: Logged) -> Value {
+        self.seq += 1;
+        l.json["seq"] = json!(self.seq);
+        let json = l.json.clone();
+        self.steps.push_back(l);
+        while self.steps.len() > TIMELINE_STEPS {
+            let older = self.steps.len() / 2;
+            match self.steps.iter().take(older).position(|s| s.json["status"] == "read") {
+                Some(i) => drop(self.steps.remove(i)),
+                None => drop(self.steps.pop_front()),
+            }
+        }
+        let n = self.steps.len();
+        for old in self.steps.iter_mut().take(n.saturating_sub(TIMELINE_SNAPSHOTS)) {
+            old.before = None;
+            old.after = None;
+        }
+        json
+    }
+}
+
+struct Logged {
+    json: Value,
+    // the step drawn at its focus level, on each side
+    before: Option<Arc<Value>>,
+    after: Option<Arc<Value>>,
+}
+
+// a step on its way to the timeline, read while the map still held its before side
+struct Draft {
+    step: edit::Activity,
+    event: vis::Event,
+    before: Option<Arc<Value>>,
+    // a part of a step, or a staged call - sides no map held
+    unmapped: bool,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+// the tool a change made outside the edit tools is put down to
+const BY_HAND: &str = "by hand";
+// and the tool a write another ccc server's ledger accounts for is put down to
+const ELSEWHERE: &str = "another ccc server";
+// changesets another server applied, kept to match the changes they made
+const OTHERS_KEPT: usize = 64;
+// an ask is looked for this long before the first step it could explain
+const ASK_LEAD_SECS: i64 = 4 * 3600;
+// agents' transcripts are read again at most this often
+const ASKS_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+// what the edit ledger says other ccc servers applied lately
+#[derive(Default)]
+struct Others {
+    // bytes of the ledger read so far
+    read: u64,
+    // applied, oldest first, each with the files a change was already put down to
+    applied: std::collections::VecDeque<(edit::LedgerLine, BTreeSet<String>)>,
+}
+
+// The steps every ccc server on a project shares, beside the edit ledger:
+// each server appends its own and reads the others', so a visualiser shows an
+// agent's staged parts and looks whichever server the agent talks to.
+const FEED_NAME: &str = "timeline.jsonl";
+// past this the feed starts again - it carries news, and `ccc replay save`
+// takes what a replay needs from it first
+const FEED_MAX: u64 = 64 << 20;
+
+pub(crate) fn feed_path(root: &Path) -> PathBuf {
+    root.join(".ccc").join(FEED_NAME)
+}
+
+// the shared feed as far as this server read it
+#[derive(Default)]
+struct Feed {
+    read: u64,
+    // changesets whose writes came in on the feed, and those the ledger
+    // accounted for first - so neither puts a write on the timeline twice
+    fed: BTreeSet<String>,
+    ledgered: BTreeSet<String>,
+}
+
+// The JSON lines a shared log gained past byte `from`, and the byte they end
+// at. A line still being written waits for the next read; a log shorter than
+// `from` began again, so it is read from the top.
+fn tail_since(path: &Path, from: u64) -> (Vec<Value>, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (Vec::new(), 0);
+    };
+    let from = if f.metadata().map_or(0, |m| m.len()) < from { 0 } else { from };
+    let mut tail = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut tail).is_err() {
+        return (Vec::new(), from);
+    }
+    let end = tail.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let lines = String::from_utf8_lossy(&tail[..end])
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    (lines, from + end as u64)
+}
+
+#[derive(Default)]
+struct AsksCache {
+    read: crate::prompts::Asks,
+    turns: Vec<crate::prompts::Turn>,
+    // when they were read, and from what time on
+    at: Option<(std::time::Instant, i64)>,
+}
+
+// one timeline step, as grouping it by its ask needs it
+struct StepRef {
+    seq: u64,
+    at: u64,
+    human: bool,
+    changeset: Option<String>,
+}
+
+// Steps into runs by the ask behind them. A step an agent took belongs to the
+// ask whose calls named its changeset - the latest made before it, as a
+// changeset can be staged under one ask and applied under the next. One no
+// transcript accounts for stays an agent's, unexplained, and changes made by
+// hand run together on their own. A look names no changeset, so it goes to
+// the ask made last before it.
+fn group_by_ask(steps: &[StepRef], turns: &[crate::prompts::Turn]) -> Value {
+    let named = crate::replay::by_changeset(turns);
+    let mut groups: Vec<(&str, Option<&crate::prompts::Turn>, Vec<u64>)> = Vec::new();
+    for s in steps {
+        let ask = crate::replay::ask_of(s.human, s.changeset.as_deref(), s.at, turns, &named);
+        let kind = match (s.human, ask) {
+            (true, _) => "hand",
+            (_, Some(_)) => "ask",
+            _ => "agent",
+        };
+        match groups.last_mut() {
+            Some((k, a, seqs)) if *k == kind && a.map(|t| &t.id) == ask.map(|t| &t.id) => seqs.push(s.seq),
+            _ => groups.push((kind, ask, vec![s.seq])),
+        }
+    }
+    let ask_json = |t: &crate::prompts::Turn| {
+        json!({"id": t.id, "agent": t.agent, "session": t.session, "at": t.epoch * 1000, "prompt": t.prompt, "model": t.model})
+    };
+    json!({
+        "groups": groups
+            .iter()
+            .map(|(kind, ask, seqs)| json!({"kind": kind, "steps": seqs, "ask": ask.map(ask_json)}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+// does a file's new text still hold the lines a ledger line says were
+// written to it - the first of them, at least
+fn still_holds(written: &str, after: Option<&str>) -> bool {
+    let mut lines = written.lines().map(str::trim).filter(|l| !l.is_empty()).take(8).peekable();
+    match after {
+        Some(text) => lines.all(|l| text.contains(l)),
+        None => lines.peek().is_none(),
+    }
+}
+// a file past this is watched but not kept, so a change to it lands on no step
+const SEEN_TEXT_MAX: u64 = 1 << 20;
+
+// what each mapped file held when the timeline last looked, by path
+type Seen = BTreeMap<String, SeenFile>;
+
+struct SeenFile {
+    // mtime and size, so an untouched file is never read again
+    stamp: Option<(u128, u64)>,
+    // none - too big to keep, or not text
+    text: Option<String>,
+}
+
+impl SeenFile {
+    // the file as it is now - stamped before it is read, so a write between
+    // the two is read again next time
+    fn read(file: &Path) -> SeenFile {
+        let md = std::fs::metadata(file).ok();
+        let text = match &md {
+            Some(m) if m.len() <= SEEN_TEXT_MAX => std::fs::read_to_string(file).ok(),
+            _ => None,
+        };
+        SeenFile { stamp: md.as_ref().map(stamp), text }
+    }
+}
+
+// every mapped file read as it is now
+fn seen_of(root: &Path, caches: &[FileCache]) -> Seen {
+    caches
+        .iter()
+        .map(|c| (crate::changes::path_str(&c.rel_path), SeenFile::read(&root.join(&c.rel_path))))
+        .collect()
+}
+
+// changes made outside the edit tools, as one step of their own
+fn hand_step(files: Vec<edit::FileText>) -> Vec<edit::Activity> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    vec![edit::Activity { changeset: String::new(), status: "edited", ops: Vec::new(), files, intent: Vec::new() }]
+}
+
 impl MapState {
     fn build(root: &Path) -> Result<MapState> {
         let files = scan::collect_files(root)?;
         let caches = scan::build_caches(root, &files);
         let withdrawn = scan::withdrawn_files(root, &files, &caches);
+        let seen = seen_of(root, &caches);
         let root_label = root
             .file_name()
             .and_then(|s| s.to_str())
@@ -102,7 +378,7 @@ impl MapState {
             facade: cargo_package_name(root),
             watch_secs: None,
             html: true,
-            vis: false,
+            git: crate::replay::is_repo(root),
             // `--port 0` picks one at runtime
             origin: {
                 let d = ServeOptions::default();
@@ -110,6 +386,13 @@ impl MapState {
             },
             analysis: Mutex::new(None),
             vis_model: Mutex::new(None),
+            timeline: Mutex::new(Timeline::restored(root)),
+            seen: Mutex::new(Some(seen)),
+            // only what is applied from here on is news
+            others: Mutex::new(Others { read: edit::ledger_len(root), ..Default::default() }),
+            // and only what the others share from here on
+            feed: Mutex::new(Feed { read: std::fs::metadata(feed_path(root)).map_or(0, |m| m.len()), ..Default::default() }),
+            asks: Mutex::new(AsksCache::default()),
             audit: Mutex::new(None),
             sast: Mutex::new(None),
             deps: Mutex::new((String::new(), BTreeMap::new())),
@@ -169,18 +452,23 @@ impl MapState {
     fn rescan(&mut self) -> Result<(usize, usize)> {
         let before = self.caches.len();
         let files = scan::collect_files(&self.root)?;
-        self.caches = scan::build_caches(&self.root, &files);
+        let caches = scan::build_caches(&self.root, &files);
+        // read while the map still holds what a change by hand started from
+        let drafts = self.found_drafts(&caches);
+        self.caches = caches;
         self.withdrawn = scan::withdrawn_files(&self.root, &files, &self.caches);
         self.contracts = ContractIndex::for_root(&self.root, &self.caches);
         self.externals = manifest_deps(&self.root);
         self.facade = cargo_package_name(&self.root);
         self.ts = render::now_ts();
         self.invalidate();
+        self.timeline_finish(drafts);
         Ok((before, self.caches.len()))
     }
 
     // swap in a fresh map (built outside lock by watcher)
     fn swap_in(&mut self, caches: Vec<FileCache>) {
+        let drafts = self.found_drafts(&caches);
         self.caches = caches;
         // the watcher hands over caches alone; the walk is cheap next to the parse
         self.withdrawn = scan::collect_files(&self.root)
@@ -191,6 +479,178 @@ impl MapState {
         self.facade = cargo_package_name(&self.root);
         self.ts = render::now_ts();
         self.invalidate();
+        self.timeline_finish(drafts);
+    }
+
+    // What changed on disk since the timeline last looked, other than through
+    // this server's edit tools, as the map about to hold `next` reads it -
+    // another server's writes as its changesets, the rest as changes by hand.
+    // What is read becomes what the timeline saw.
+    fn hand_edits(&self, next: &[FileCache]) -> Vec<edit::Activity> {
+        let mut slot = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(seen) = slot.as_mut() else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        let mut held = BTreeSet::new();
+        for c in next {
+            let path = crate::changes::path_str(&c.rel_path);
+            let file = self.root.join(&c.rel_path);
+            held.insert(path.clone());
+            let now = std::fs::metadata(&file).ok().map(|m| stamp(&m));
+            if now.is_some() && seen.get(&path).is_some_and(|s| s.stamp == now) {
+                continue;
+            }
+            let read = SeenFile::read(&file);
+            let after = read.text.clone();
+            match seen.insert(path.clone(), read) {
+                // read as text on both sides, and no longer saying the same
+                Some(SeenFile { text: Some(before), .. }) if after.as_ref().is_some_and(|a| *a != before) => {
+                    files.push(edit::FileText { path, before: Some(before), after })
+                }
+                // new to the map
+                None if after.is_some() => files.push(edit::FileText { path, before: None, after }),
+                _ => {}
+            }
+        }
+        let gone: Vec<String> = seen.keys().filter(|p| !held.contains(*p)).cloned().collect();
+        for path in gone {
+            let was = seen.remove(&path);
+            // let go of while still on disk - withdrawn, or not source - so nothing in it changed
+            if self.root.join(&path).exists() {
+                continue;
+            }
+            if let Some(SeenFile { text: Some(before), .. }) = was {
+                files.push(edit::FileText { path, before: Some(before), after: None });
+            }
+        }
+        drop(slot);
+        let (mut found, hand) = self.written_elsewhere(files);
+        found.extend(hand_step(hand));
+        found
+    }
+
+    // Drafts for what changed under the map since it was read, taken while the
+    // map still holds what each change started from.
+    fn found_drafts(&self, next: &[FileCache]) -> Vec<Draft> {
+        // what the feed says other servers wrote, before their writes are put down to anyone
+        self.feed_in();
+        let (theirs, hand): (Vec<_>, Vec<_>) = self.hand_edits(next).into_iter().partition(|a| a.status != "edited");
+        let mut drafts = self.timeline_begin(ELSEWHERE, theirs);
+        drafts.extend(self.timeline_begin(BY_HAND, hand));
+        drafts
+    }
+
+    // Changes another ccc server wrote, told apart by the ledger every server
+    // appends to: each becomes a step of its changeset, and the rest were made
+    // by hand.
+    fn written_elsewhere(&self, files: Vec<edit::FileText>) -> (Vec<edit::Activity>, Vec<edit::FileText>) {
+        let mut others = self.others.lock().unwrap_or_else(|p| p.into_inner());
+        let (lines, read) = edit::ledger_since(&self.root, others.read);
+        others.read = read;
+        let mut reverted: Vec<edit::LedgerLine> = Vec::new();
+        for line in lines {
+            if !line.reverted {
+                others.applied.push_back((line, BTreeSet::new()));
+                if others.applied.len() > OTHERS_KEPT {
+                    others.applied.pop_front();
+                }
+            // a revert names only its changeset - its files are the ones it applied
+            } else if let Some(i) = others.applied.iter().rposition(|(a, _)| a.id == line.id) {
+                reverted.extend(others.applied.remove(i).map(|(a, _)| a));
+            }
+        }
+        let mut steps: Vec<edit::Activity> = Vec::new();
+        let mut hand = Vec::new();
+        for f in files {
+            let found = match reverted.iter().find(|r| r.files.iter().any(|(p, _)| *p == f.path)) {
+                Some(r) => Some((r.id.clone(), "reverted", r.ops.clone(), r.intent.clone())),
+                None => others
+                    .applied
+                    .iter()
+                    .rposition(|(a, matched)| {
+                        !matched.contains(&f.path)
+                            && a.files.iter().any(|(p, w)| *p == f.path && still_holds(w, f.after.as_deref()))
+                    })
+                    .map(|i| {
+                        let (a, matched) = &mut others.applied[i];
+                        // a write is matched once - a later change to the file is someone else's
+                        matched.insert(f.path.clone());
+                        (a.id.clone(), "applied", a.ops.clone(), a.intent.clone())
+                    }),
+            };
+            let Some((id, status, ops, intent)) = found else {
+                hand.push(f);
+                continue;
+            };
+            // a write the shared feed already put on the timeline, part by part
+            {
+                let mut feed = self.feed.lock().unwrap_or_else(|p| p.into_inner());
+                if feed.fed.contains(&id) {
+                    continue;
+                }
+                feed.ledgered.insert(id.clone());
+            }
+            match steps.iter_mut().find(|s| s.changeset == id && s.status == status) {
+                Some(s) => s.files.push(f),
+                None => steps.push(edit::Activity { changeset: id, status, ops, files: vec![f], intent }),
+            }
+        }
+        (steps, hand)
+    }
+
+    // The timeline's steps grouped by the ask behind them, the transcripts
+    // read again only when they are older than a moment.
+    fn timeline_asks(&self) -> Value {
+        let steps: Vec<StepRef> = self
+            .timeline()
+            .steps
+            .iter()
+            .map(|l| StepRef {
+                seq: l.json["seq"].as_u64().unwrap_or(0),
+                at: l.json["at"].as_u64().unwrap_or(0),
+                human: l.json["by"] == "human",
+                changeset: l.json["changeset"].as_str().map(str::to_string),
+            })
+            .collect();
+        let Some(first) = steps.first() else {
+            return json!({"groups": []});
+        };
+        let since = (first.at / 1000) as i64 - ASK_LEAD_SECS;
+        let mut cache = self.asks.lock().unwrap_or_else(|p| p.into_inner());
+        let fresh = cache.at.is_some_and(|(when, from)| when.elapsed() < ASKS_EVERY && from <= since);
+        if !fresh {
+            cache.turns = cache.read.since(&self.root, since);
+            cache.at = Some((std::time::Instant::now(), since));
+        }
+        group_by_ask(&steps, &cache.turns)
+    }
+
+    // A write found its files as the timeline last saw them - or someone
+    // changed them by hand first, a step of its own before the write's. What
+    // the write left becomes what the timeline saw.
+    fn hand_edits_before(&self, steps: &[edit::Activity]) -> Vec<edit::Activity> {
+        let mut slot = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(seen) = slot.as_mut() else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        let mut first = BTreeSet::new();
+        let written = steps.iter().filter(|s| matches!(s.status, "applied" | "reverted"));
+        for f in written.flat_map(|s| &s.files) {
+            // a write made in several steps starts from the disk only at its first
+            let found = seen.get(&f.path).filter(|_| first.insert(f.path.clone()));
+            if let Some(SeenFile { text: Some(was), .. }) = found {
+                if f.before.as_ref() != Some(was) {
+                    files.push(edit::FileText { path: f.path.clone(), before: Some(was.clone()), after: f.before.clone() });
+                }
+            }
+            match f.after {
+                Some(_) => seen.insert(f.path.clone(), SeenFile::read(&self.root.join(&f.path))),
+                None => seen.remove(&f.path),
+            };
+        }
+        hand_step(files)
     }
 
     fn external_named(&self, want: &str) -> Option<&ExternalDep> {
@@ -227,6 +687,219 @@ impl MapState {
         ));
         *slot = Some((self.ts.clone(), Arc::clone(&model)));
         model
+    }
+
+    fn timeline(&self) -> std::sync::MutexGuard<'_, Timeline> {
+        self.timeline.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    // The first half of putting edit steps on the timeline: each split into
+    // the parts it is made of, a definition at a time, and read into an event
+    // while the map still holds the side it started from - and, when a
+    // visualiser is open, that side drawn.
+    fn timeline_begin(&self, tool: &str, steps: Vec<edit::Activity>) -> Vec<Draft> {
+        if steps.is_empty() {
+            return Vec::new();
+        }
+        let model = self.timeline().open().then(|| self.vis_model());
+        let lang_of = |p: &str| {
+            self.caches
+                .iter()
+                .find(|c| crate::changes::path_str(&c.rel_path) == p)
+                .map(|c| c.language)
+                .or_else(|| crate::languages::Language::from_path(Path::new(p)))
+        };
+        steps
+            .iter()
+            .flat_map(|step| vis::split(step, lang_of))
+            .map(|(step, part)| {
+                let mut event = vis::event(0, now_ms(), tool, &step, lang_of);
+                event.json["part"] = part.as_ref().map_or(Value::Null, vis::Part::json);
+                // a staged call starts where the calls before it left the file
+                let unmapped = part.is_some() || step.status == "staged";
+                let before = match &model {
+                    // a discarded step is drawn already, as the step that staged it
+                    Some(m) if step.status != "discarded" => self.side_of(m, &step, unmapped, &event.focus, false),
+                    _ => None,
+                };
+                Draft { step, event, before, unmapped }
+            })
+            .collect()
+    }
+
+    // One side of a step drawn at its focus. A function's logic draws from the
+    // step's own text through this map; a wider view of a side no map held -
+    // a part's, a staged call's - draws from the map that text would make.
+    fn side_of(&self, m: &vis::Model, step: &edit::Activity, unmapped: bool, focus: &vis::Focus, after: bool) -> Option<Arc<Value>> {
+        let flow = matches!(focus, vis::Focus::Flow(_));
+        if unmapped && (!flow || (after && step.status == "staged")) {
+            let (caches, m) = self.proposed(step, after);
+            return m.snapshot(&caches, step, focus, after);
+        }
+        m.snapshot(&self.caches, step, focus, after)
+    }
+
+    // The second half, once any write is folded into the map: each step's
+    // after side drawn from the map it left, the steps logged, and this
+    // server's own shared on the project's feed. A staged step is drawn from
+    // the map it would leave, so it can be looked over before it is written.
+    fn timeline_finish(&self, drafts: Vec<Draft>) {
+        if drafts.is_empty() {
+            return;
+        }
+        let model = self.timeline().open().then(|| self.vis_model());
+        let mut logged = Vec::with_capacity(drafts.len());
+        // what each side held, kept as git objects so a saved replay draws it again
+        let mut kept = std::collections::HashMap::new();
+        for d in drafts {
+            let after = match (&model, d.step.status) {
+                (Some(m), "applied" | "reverted" | "edited" | "staged") => {
+                    self.side_of(m, &d.step, d.unmapped, &d.event.focus, true)
+                }
+                _ => None,
+            };
+            let mut json = d.event.json;
+            if self.git && json["tool"] != ELSEWHERE {
+                json["texts"] = crate::replay::texts_of(&self.root, &d.step.files, &mut kept);
+            }
+            logged.push(Logged { json, before: d.before, after });
+        }
+        let shared: Vec<Value> = {
+            let mut tl = self.timeline();
+            logged.into_iter().map(|l| tl.log(l)).collect()
+        };
+        // another server's writes are its own to share; a change by hand goes on
+        // for replays, though every server finds those for itself
+        let own: Vec<Value> = shared.into_iter().filter(|e| e["tool"] != ELSEWHERE).collect();
+        self.feed_out(&own);
+    }
+
+    // The map as one side of a step leaves it - each file it moves read from
+    // that side's text - so a side no map held draws at any level.
+    fn proposed(&self, step: &edit::Activity, after: bool) -> (Vec<FileCache>, vis::Model) {
+        let moved = |c: &FileCache| step.files.iter().any(|f| f.path == crate::changes::path_str(&c.rel_path));
+        let mut caches: Vec<FileCache> = self.caches.iter().filter(|c| !moved(c)).cloned().collect();
+        caches.extend(step.files.iter().filter_map(|f| {
+            let text = if after { f.after.as_deref() } else { f.before.as_deref() }?;
+            scan::read_one(Path::new(&f.path), text)
+        }));
+        caches.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let model = vis::Model::build(&caches, &self.root, &self.root_label, &self.ts, &self.contracts);
+        (caches, model)
+    }
+
+    // the steps after `since`, light - their snapshots wait for `/vis/event`;
+    // asking marks a visualiser open
+    fn timeline_since(&self, since: u64) -> Value {
+        self.feed_in();
+        let mut tl = self.timeline();
+        tl.watched = Some(std::time::Instant::now());
+        let steps: Vec<Value> = tl
+            .steps
+            .iter()
+            .filter(|l| l.json["seq"].as_u64().is_some_and(|s| s > since))
+            .map(|l| {
+                let mut v = l.json.clone();
+                v["snapshot"] = json!(l.before.is_some() || l.after.is_some());
+                v
+            })
+            .collect();
+        json!({
+            "boot": tl.boot,
+            "latest": tl.seq,
+            "first": tl.steps.front().map(|l| l.json["seq"].clone()),
+            "generated": self.ts,
+            "events": steps,
+        })
+    }
+
+    // one step whole: the event and the level it happened on, drawn each side
+    fn timeline_step(&self, seq: u64) -> Option<Value> {
+        let tl = self.timeline();
+        let l = tl.steps.iter().find(|l| l.json["seq"].as_u64() == Some(seq))?;
+        let side = |s: &Option<Arc<Value>>| s.as_deref().cloned().unwrap_or(Value::Null);
+        Some(json!({"event": l.json, "before": side(&l.before), "after": side(&l.after)}))
+    }
+
+    // An agent's look at the code through a read tool, logged as a step of
+    // its own and shared - unless it is the look just logged.
+    fn timeline_look(&self, tool: &str, what: &str, sites: &[(String, usize, bool)]) {
+        let Some(ev) = vis::look(now_ms(), tool, what, sites, &self.caches) else {
+            return;
+        };
+        let shared = {
+            let mut tl = self.timeline();
+            let again = tl.steps.back().is_some_and(|l| l.json["status"] == "read" && l.json["intent"] == ev.json["intent"]);
+            if again {
+                return;
+            }
+            tl.log(Logged { json: ev.json, before: None, after: None })
+        };
+        self.feed_out(&[shared]);
+    }
+
+    // this server's own steps onto the project's shared feed
+    fn feed_out(&self, events: &[Value]) {
+        if events.is_empty() {
+            return;
+        }
+        let server = self.timeline().server.clone();
+        // the branch a step was taken on, which its replay is saved under
+        let branch = if self.git { crate::replay::branch_of(&self.root) } else { None };
+        let mut text = String::new();
+        for e in events {
+            let mut e = e.clone();
+            e["server"] = json!(server);
+            e["branch"] = json!(branch);
+            text.push_str(&e.to_string());
+            text.push('\n');
+        }
+        let path = feed_path(&self.root);
+        let wrote = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(path.parent().unwrap_or(&self.root))?;
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > FEED_MAX) {
+                std::fs::write(&path, "")?;
+            }
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            std::io::Write::write_all(&mut f, text.as_bytes())
+        })();
+        if wrote.is_ok() {
+            let _ = crate::prompts::ignore_path(
+                &self.root,
+                &format!("/.ccc/{FEED_NAME}"),
+                "timeline steps the ccc servers on this project share",
+            );
+        }
+    }
+
+    // What the other servers shared since the feed was last read, onto this
+    // timeline - a write the ledger already accounted for excepted.
+    fn feed_in(&self) {
+        let mut feed = self.feed.lock().unwrap_or_else(|p| p.into_inner());
+        let (lines, read) = tail_since(&feed_path(&self.root), feed.read);
+        feed.read = read;
+        if lines.is_empty() {
+            return;
+        }
+        let mut tl = self.timeline();
+        let me = tl.server.clone();
+        for mut v in lines {
+            // its own, and changes by hand, which every server finds for itself
+            if v["server"].as_str() == Some(me.as_str()) || v["by"] == "human" {
+                continue;
+            }
+            let write = matches!(v["status"].as_str(), Some("applied" | "reverted"));
+            if let Some(id) = v["changeset"].as_str().filter(|_| write) {
+                if feed.ledgered.contains(id) {
+                    continue;
+                }
+                feed.fed.insert(id.to_string());
+            }
+            if let Some(o) = v.as_object_mut() {
+                o.remove("server");
+            }
+            tl.log(Logged { json: v, before: None, after: None });
+        }
     }
 
     // The insights analysis for this map, computed at most once per
@@ -338,16 +1011,21 @@ fn fingerprint(root: &Path) -> Result<Fingerprint> {
     let mut fp = Fingerprint::new();
     for f in scan::collect_files(root)? {
         if let Ok(md) = std::fs::metadata(&f) {
-            let mtime = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            fp.insert(f, (mtime, md.len()));
+            fp.insert(f, stamp(&md));
         }
     }
     Ok(fp)
+}
+
+// a file's mtime (unix nanos) and size - it changed when either did
+fn stamp(md: &std::fs::Metadata) -> (u128, u64) {
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    (mtime, md.len())
 }
 
 fn fingerprint_delta(a: &Fingerprint, b: &Fingerprint) -> usize {
@@ -373,12 +1051,17 @@ fn check_and_rebuild(
     Ok(Some((now, caches, delta)))
 }
 
-fn spawn_watcher(state: Arc<RwLock<MapState>>, root: PathBuf, interval: std::time::Duration) {
+// `while_open` watches only while a visualiser is open - one that shows
+// changes as they land, whoever makes them
+fn spawn_watcher(state: Arc<RwLock<MapState>>, root: PathBuf, interval: std::time::Duration, while_open: bool) {
     std::thread::spawn(move || {
         let mut last = fingerprint(&root).unwrap_or_default();
         let mut warned = false;
         loop {
             std::thread::sleep(interval);
+            if while_open && !state.read().expect("map lock poisoned").timeline().open() {
+                continue;
+            }
             match check_and_rebuild(&root, &last) {
                 Ok(Some((fp, caches, delta))) => {
                     let n = caches.len();
@@ -2059,6 +2742,7 @@ fn mcp_tools() -> Value {
                 "result": {"type": "string", "description": "handle from `find` / `references` (or a follow-up handle an edit tool listed)"},
                 "to": {"type": "string", "description": "the new name; for a `find` handle, what replaces the matched substring"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
@@ -2072,6 +2756,7 @@ fn mcp_tools() -> Value {
                 "text": {"type": "string", "description": "the replacement"},
                 "target": {"type": "string", "enum": ["token", "line", "definition"], "description": "what at each site is replaced (default token)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
@@ -2084,6 +2769,7 @@ fn mcp_tools() -> Value {
                 "result": {"type": "string", "description": "handle from `find` / `references`"},
                 "force": {"type": "boolean", "description": "delete even though other sites still name it (default false)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
@@ -2097,6 +2783,7 @@ fn mcp_tools() -> Value {
                 "text": {"type": "string", "description": "the code to add"},
                 "position": {"type": "string", "enum": ["after", "before"], "description": "which side of the site (default after)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
@@ -2112,6 +2799,7 @@ fn mcp_tools() -> Value {
                 "all": {"type": "boolean", "description": "replace every occurrence of `old` (default false)"},
                 "delete": {"type": "boolean", "description": "remove the file (default false)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
             &["path"],
@@ -2214,7 +2902,9 @@ fn mcp_initialize(params: &Value) -> Value {
             function, config, docs, a new or removed file - `edit_text`. Each stages a \
             changeset and shows its diff: read it, then `edit_apply` it (or pass apply=true \
             when the diff would tell you nothing new); `edit_discard` drops one, \
-            `edit_revert` undoes an applied one. The map records where code is and how it \
+            `edit_revert` undoes an applied one. Pass `intent`, one terse line on why \
+            (`retry on timeout`), with each staging call: a person watching the visualiser \
+            reviews the step by it. The map records where code is and how it \
             connects, not every character of it: read the real source before writing code \
             that depends on its exact text. Never write under `.ccc` except map.json and \
             surface.json.\n\n\
@@ -3777,6 +4467,8 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Res
         .get("structured")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // what a read tool's answer named, so the timeline shows the agent looking
+    let mut looked: Option<(String, Sites)> = None;
     let out: Result<String, String> = match name {
         "security" => {
             let include_tests = args
@@ -3812,15 +4504,27 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Res
         "find" => {
             let query = arg("query").unwrap_or_default();
             q_find(&map, &query, arg("kind").as_deref().unwrap_or("any")).map(|v| {
+                looked = Some((query.clone(), sites_of(&v, "results", None)));
                 let (qualifier, name) = split_query(&query);
                 let sites = edit::ResultSet::from_find(&v, name, qualifier.is_some());
                 md_find(&v) + &handle_line(&map, sites)
             })
         }
-        "references" => q_references(&map, &arg("symbol").unwrap_or_default())
-            .map(|v| md_references(&v) + &handle_line(&map, edit::ResultSet::from_references(&v))),
-        "dependencies" => q_dependencies(&map, arg("file").as_deref()).map(|v| md_dependencies(&v)),
+        "references" => {
+            let symbol = arg("symbol").unwrap_or_default();
+            q_references(&map, &symbol).map(|v| {
+                let mut sites = sites_of(&v, "definitions", Some(true));
+                sites.extend(sites_of(&v, "references", Some(false)));
+                looked = Some((symbol.clone(), sites));
+                md_references(&v) + &handle_line(&map, edit::ResultSet::from_references(&v))
+            })
+        }
+        "dependencies" => q_dependencies(&map, arg("file").as_deref()).map(|v| {
+            looked = v["file"].as_str().map(|f| (f.to_string(), vec![(f.to_string(), 0, true)]));
+            md_dependencies(&v)
+        }),
         "file" => q_file(&map, &arg("path").unwrap_or_default()).map(|v| {
+            looked = v["path"].as_str().map(|p| (p.to_string(), vec![(p.to_string(), 0, true)]));
             if structured {
                 md_file_structured(&v)
             } else {
@@ -3925,10 +4629,33 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Res
         "insights" => q_insights(&map, launcher()),
         _ => return Err((-32602, format!("unknown tool '{name}'"))),
     };
+    // an agent's reads are its looks - a page reading for itself is not
+    if let Some((what, sites)) = looked.filter(|_| !browser) {
+        map.timeline_look(name, &what, &sites);
+    }
     Ok(match out {
         Ok(text) => mcp_md(&text, false),
         Err(e) => mcp_md(&format!("error: {e}"), true),
     })
+}
+
+// the sites a read tool's answer named, each as (file, line, main)
+type Sites = Vec<(String, usize, bool)>;
+
+// The sites a find or references answer listed. Unless `main` says, a
+// definition is what was looked for and a call or use what was found around it.
+fn sites_of(v: &Value, key: &str, main: Option<bool>) -> Sites {
+    v[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let file = r["file"].as_str()?.to_string();
+            let line = r["line"].as_u64()? as usize;
+            let definition = matches!(r["kind"].as_str(), Some("func" | "const" | "type"));
+            Some((file, line, main.unwrap_or(definition)))
+        })
+        .collect()
 }
 
 // the handle an edit tool takes, closing a `find` / `references` answer that has sites
@@ -3960,13 +4687,14 @@ fn edit_tool_call(state: &RwLock<MapState>, name: &str, args: &Value) -> Value {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
             .unwrap_or_default(),
+        intent: s("intent"),
     };
     let out = {
         let map = state.read().expect("map lock poisoned");
         let ctx = edit::Ctx { root: &map.root, caches: &map.caches };
         let mut store = map.edits.lock().unwrap_or_else(|p| p.into_inner());
         let store = &mut *store;
-        match name {
+        let out = match name {
             "edit_rename" => need("result")
                 .and_then(|r| need("to").and_then(|to| edit::rename(&ctx, store, &r, &to, &stage))),
             "edit_replace" => need("result").and_then(|r| {
@@ -3998,11 +4726,24 @@ fn edit_tool_call(state: &RwLock<MapState>, name: &str, args: &Value) -> Value {
             "edit_discard" => edit::discard(store, s("changeset").as_deref()),
             "edit_revert" => need("changeset").and_then(|c| edit::revert(&map.root, store, &c)),
             _ => Err(format!("unknown edit tool '{name}'")),
-        }
+        };
+        // what a write found on disk, against what the timeline last saw - read
+        // before any rescan can take the write for a change by hand
+        out.map(|done| {
+            let hand = map.hand_edits_before(&done.activity);
+            (done, hand)
+        })
     };
     match out {
-        Ok(done) => {
+        Ok((done, hand)) => {
             let mut text = done.text;
+            // the visualiser's timeline reads each step before the map moves past it
+            let drafts = {
+                let map = state.read().expect("map lock poisoned");
+                let mut drafts = map.timeline_begin(BY_HAND, hand);
+                drafts.extend(map.timeline_begin(name, done.activity));
+                drafts
+            };
             // a write landed - fold it into the map before anyone asks again
             if done.wrote {
                 let mut map = state.write().expect("map lock poisoned");
@@ -4011,6 +4752,7 @@ fn edit_tool_call(state: &RwLock<MapState>, name: &str, args: &Value) -> Value {
                     Err(e) => text.push_str(&format!("the map did not rescan ({e}) - call `refresh`\n")),
                 }
             }
+            state.read().expect("map lock poisoned").timeline_finish(drafts);
             mcp_md(&text, false)
         }
         Err(e) => mcp_md(&format!("error: {e}"), true),
@@ -4353,7 +5095,8 @@ const ENDPOINTS: &[&str] = &[
     "GET /insights.json[?base=<ref>] (the whole analysis payload)",
     "GET /insights (human UI over the same data; off with --no-html)",
     "GET /vis.json | /vis/code?file=<path> | /vis/flow?file=<path>&line=<n> (architecture levels)",
-    "GET /vis (architecture visualiser; on with --vis)",
+    "GET /vis/events?since=<n> | /vis/event?seq=<n> | /vis/asks (edit timeline: each step the edit tools took, and the ask behind it)",
+    "GET /vis (architecture visualiser; off with --no-html, opened by --vis)",
     "POST /refresh",
     "POST /mcp (Model Context Protocol, JSON-RPC)",
     "GET /fragment/{find,references,dependencies,health} (HTML for HTMX)",
@@ -4487,18 +5230,40 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
             }
             html_ok(crate::html::render_insights_html(&map.root_label, None))
         }
-        // the architecture visualiser: the page is on with `ccc run --vis`, the
-        // data behind it always, the way /insights.json outlives --no-html
+        // the architecture visualiser: the page goes with the insights UI and
+        // `--vis` opens it; the data behind it answers either way, the way
+        // /insights.json outlives --no-html
         ("GET", "/vis") => {
             let map = state.read().expect("map lock poisoned");
-            if !map.vis {
+            if !map.html {
                 return bad(
                     404,
-                    "the visualiser is off; restart as `ccc run --vis` (its data is at \
-                     /vis.json either way)",
+                    "the visualiser is disabled by `--no-html`; restart with `ccc run --vis` \
+                     (its data is at /vis.json either way)",
                 );
             }
             html_ok(vis::page(&map.root_label))
+        }
+        // the edit timeline: steps after `since`, without their snapshots
+        ("GET", "/vis/events") => {
+            let since = get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let map = state.read().expect("map lock poisoned");
+            ok(map.timeline_since(since))
+        }
+        // the timeline's steps grouped by the ask behind each, or by hand
+        ("GET", "/vis/asks") => {
+            let map = state.read().expect("map lock poisoned");
+            ok(map.timeline_asks())
+        }
+        ("GET", "/vis/event") => {
+            let Some(seq) = get("seq").and_then(|s| s.parse().ok()) else {
+                return bad(400, "missing ?seq=<n>");
+            };
+            let map = state.read().expect("map lock poisoned");
+            match map.timeline_step(seq) {
+                Some(v) => ok(v),
+                None => bad(404, format!("no step {seq} on the timeline - it keeps the last {TIMELINE_STEPS}")),
+            }
         }
         ("GET", "/vis.json") => {
             let map = state.read().expect("map lock poisoned");
@@ -4607,12 +5372,28 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
         let mut map = state.write().expect("map lock poisoned");
         map.watch_secs = opts.watch.map(|d| d.as_secs());
         map.html = opts.html;
-        map.vis = opts.vis;
+        // only the page's timeline reads the texts kept for changes by hand
+        if !map.html {
+            *map.seen.get_mut().unwrap_or_else(|p| p.into_inner()) = None;
+        }
         if map.caches.is_empty() {
             eprintln!("warning: no supported source files under {}", root.display());
         }
     }
 
+    // one instance serves a project: any other still serving it goes, so
+    // every agent's edits land on the one the visualiser watches
+    let stopped = crate::instance::take_over(root);
+    if !stopped.is_empty() {
+        let pids: Vec<String> = stopped.iter().map(u32::to_string).collect();
+        println!("stopped {} other ccc instance(s) serving this project (pid {})", stopped.len(), pids.join(", "));
+    }
+    // each branch pushed carries its replay with it
+    match crate::replay::install_hook(root) {
+        Ok(hook @ (crate::replay::Hook::Installed(_) | crate::replay::Hook::Foreign(_))) => println!("{}", hook.describe()),
+        Ok(_) => {}
+        Err(e) => eprintln!("ccc: the replay hook was not installed: {e:#}"),
+    }
     let bind = format!("{}:{}", opts.addr, opts.port);
     let server = tiny_http::Server::http(&bind)
         .map_err(|e| anyhow::anyhow!("binding {bind}: {e}"))?;
@@ -4648,9 +5429,16 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     match opts.watch {
         Some(interval) => {
             println!("watching for changes every {}s", interval.as_secs().max(1));
-            spawn_watcher(Arc::clone(&state), root.to_path_buf(), interval);
+            spawn_watcher(Arc::clone(&state), root.to_path_buf(), interval, false);
         }
-        None => println!("watching disabled - POST /refresh after editing source"),
+        None => {
+            println!("watching disabled - POST /refresh after editing source");
+            // the visualiser shows each change as it lands, whoever made it
+            if opts.html {
+                println!("  (while a visualiser is open, its changes are watched for every 2s)");
+                spawn_watcher(Arc::clone(&state), root.to_path_buf(), std::time::Duration::from_secs(2), true);
+            }
+        }
     }
 
     let server = Arc::new(server);
@@ -6146,18 +6934,19 @@ mod tests {
         assert_eq!(pre.status, 204);
     }
 
-    // The page is behind `--vis`; the data behind it always answers, the way
-    // /insights.json outlives --no-html.
+    // The page goes with the insights UI; the data behind it always answers,
+    // the way /insights.json outlives --no-html.
     #[test]
-    fn the_visualiser_page_needs_vis_and_its_data_does_not() {
+    fn the_visualiser_page_goes_with_the_html_ui_and_its_data_does_not() {
         let state = RwLock::new(fixture());
+        state.write().unwrap().html = false;
         assert_eq!(route(&state, "GET", "/vis", b"").status, 404);
         let data = route(&state, "GET", "/vis.json", b"");
         assert_eq!(data.status, 200);
         assert_eq!(json_of(&data)["schema"], vis::SCHEMA);
         assert!(json_of(&data)["components"].as_array().unwrap().iter().any(|c| c["id"] == "lib/money.rs"));
 
-        state.write().unwrap().vis = true;
+        state.write().unwrap().html = true;
         let page = route(&state, "GET", "/vis", b"");
         assert_eq!(page.status, 200);
         let html = html_of(&page);
@@ -6572,6 +7361,372 @@ mod tests {
         let lib = read(&dir, "src/lib.rs");
         assert!(!lib.contains("condense"), "{lib}");
         assert!(lib.contains("    summarise(t)\n"), "{lib}");
+    }
+
+    // Every step the edit tools take lands on the visualiser's timeline - staged,
+    // applied, reverted, discarded - with the function it touched, and, while a
+    // visualiser is open, that function's logic drawn on each side of it.
+    #[test]
+    fn the_timeline_replays_each_edit_step() {
+        let (_dir, state) = scratch(
+            "timeline",
+            &[("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n\npub fn refund(n: i32) -> i32 {\n    charge(-n)\n}\n")],
+        );
+        let events = |since: u64| json_of(&route(&state, "GET", &format!("/vis/events?since={since}"), b"")).clone();
+        // asking opens the visualiser, so the steps after this are drawn
+        assert_eq!(events(0)["latest"], 0);
+
+        let (err, staged) = tool(&state, "edit_text", json!({"path": "src/pay.rs", "old": "    n\n", "new": "    log(n);\n    n\n"}));
+        assert!(!err, "{staged}");
+        let id = id_after(&staged, "changeset `");
+        let (err, out) = tool(&state, "edit_apply", json!({"changeset": id}));
+        assert!(!err, "{out}");
+        let (err, out) = tool(&state, "edit_revert", json!({"changeset": id}));
+        assert!(!err, "{out}");
+        tool(&state, "edit_text", json!({"path": "src/pay.rs", "old": "charge(-n)", "new": "charge(0 - n)"}));
+        tool(&state, "edit_discard", json!({}));
+
+        let all = events(0);
+        let steps = all["events"].as_array().unwrap();
+        let status: Vec<&str> = steps.iter().map(|e| e["status"].as_str().unwrap()).collect();
+        assert_eq!(status, ["staged", "applied", "reverted", "staged", "discarded"]);
+        assert_eq!(all["latest"], 5);
+        assert_eq!(steps[0]["focus"]["level"], "flow");
+        assert_eq!(steps[0]["focus"]["name"], "charge");
+        assert_eq!(steps[0]["focus"]["lines_after"], json!([[2, 2]]));
+        assert_eq!((steps[0]["on_disk"].as_str(), steps[1]["on_disk"].as_str()), (Some("before"), Some("after")));
+        assert_eq!(steps[3]["focus"]["name"], "refund");
+        assert_eq!(steps[1]["snapshot"], true);
+        assert_eq!(events(4)["events"].as_array().map(Vec::len), Some(1), "only what came after");
+
+        // an applied step draws its function as it was and as it became
+        let step = json_of(&route(&state, "GET", "/vis/event?seq=2", b"")).clone();
+        assert_eq!(step["event"]["status"], "applied");
+        let calls = |side: &str| -> Vec<String> {
+            step[side]["steps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|s| s["t"] == "call")
+                .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        assert!(calls("before").is_empty(), "{}", step["before"]);
+        assert_eq!(calls("after"), ["log"]);
+        assert_eq!(route(&state, "GET", "/vis/event?seq=99", b"").status, 404);
+        assert_eq!(route(&state, "GET", "/vis/event", b"").status, 400);
+    }
+
+    // A step staged and not written yet is drawn as the map it would leave, a
+    // part at a time - a new function shows, logic and all, before anything
+    // reaches the disk, and then the change that calls it.
+    #[test]
+    fn a_staged_step_is_drawn_as_the_map_it_would_leave() {
+        let (dir, state) = scratch("proposed", &[("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n")]);
+        let events = |since: u64| json_of(&route(&state, "GET", &format!("/vis/events?since={since}"), b"")).clone();
+        events(0);
+        let (err, out) = tool(
+            &state,
+            "edit_text",
+            json!({
+                "path": "src/pay.rs",
+                "old": "    n\n}\n",
+                "new": "    fee(n)\n}\n\npub fn fee(n: i32) -> i32 {\n    n / 100\n}\n",
+                "intent": "  charge a fee  \nonly the first line is kept",
+            }),
+        );
+        assert!(!err, "{out}");
+        let all = events(0);
+        let parts: Vec<(&str, &str, &str, &str)> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                fn s(v: &Value) -> &str {
+                    v.as_str().unwrap_or("-")
+                }
+                (s(&e["status"]), s(&e["focus"]["level"]), s(&e["part"]["name"]), s(&e["part"]["change"]))
+            })
+            .collect();
+        assert_eq!(parts, [("staged", "flow", "fee", "added"), ("staged", "flow", "charge", "modified")]);
+        assert_eq!(all["events"][1]["intent"], json!(["charge a fee"]));
+        assert_eq!(all["events"][1]["part"]["of"], 2);
+        // the new function's logic draws from the text it would write, and it had no before
+        let step = json_of(&route(&state, "GET", "/vis/event?seq=1", b"")).clone();
+        assert_eq!(step["after"]["function"]["name"], "fee");
+        assert!(step["before"].is_null(), "{}", step["before"]);
+        assert!(!fs::read_to_string(dir.0.join("src/pay.rs")).unwrap().contains("fee"), "nothing was written");
+    }
+
+    // A change made by hand - saved from an editor, not written by the edit
+    // tools - lands on the timeline as a step of its own, put down to a
+    // person. The edit tools' own writes never do, and a change by hand an
+    // agent's write finds already on disk is logged just before it.
+    #[test]
+    fn a_change_made_by_hand_lands_on_the_timeline_as_a_persons() {
+        let pay = |charge: &str, refund: &str| {
+            format!("pub fn charge(n: i32) -> i32 {{\n    {charge}\n}}\n\npub fn refund(n: i32) -> i32 {{\n    {refund}\n}}\n")
+        };
+        let (dir, state) = scratch("by-hand", &[("src/pay.rs", &pay("n", "charge(-n)"))]);
+        let save = |path: &str, text: &str| fs::write(dir.0.join(path), text).unwrap();
+        let events = |since: u64| json_of(&route(&state, "GET", &format!("/vis/events?since={since}"), b"")).clone();
+        events(0);
+
+        // saved by hand, then picked up by a rescan
+        save("src/pay.rs", &pay("n + 1", "charge(-n)"));
+        tool(&state, "refresh", json!({}));
+        // an agent's write, and the rescans after it, add only the agent's step
+        let (err, out) = tool(&state, "edit_text", json!({"path": "src/pay.rs", "old": "charge(-n)", "new": "charge(0 - n)", "apply": true}));
+        assert!(!err, "{out}");
+        tool(&state, "refresh", json!({}));
+        // changed by hand, then written over by an agent before any rescan
+        save("src/pay.rs", &pay("n + 1", "charge(0 - n) * 1"));
+        let (err, out) = tool(&state, "edit_text", json!({"path": "src/pay.rs", "old": "n + 1", "new": "n + 2", "apply": true}));
+        assert!(!err, "{out}");
+        // a file made by hand
+        save("src/fee.rs", "pub fn fee() -> i32 {\n    1\n}\n");
+        tool(&state, "refresh", json!({}));
+
+        let all = events(0);
+        let steps = all["events"].as_array().unwrap();
+        let who: Vec<(&str, &str, &str)> = steps
+            .iter()
+            .map(|e| (e["by"].as_str().unwrap(), e["status"].as_str().unwrap(), e["focus"]["name"].as_str().unwrap_or("-")))
+            .collect();
+        assert_eq!(
+            who,
+            [
+                ("human", "edited", "charge"),
+                ("agent", "applied", "refund"),
+                ("human", "edited", "refund"),
+                ("agent", "applied", "charge"),
+                ("human", "edited", "fee"),
+            ]
+        );
+        assert_eq!(steps[0]["tool"], "by hand");
+        assert!(steps[0]["changeset"].is_null(), "{}", steps[0]);
+        assert_eq!(steps[0]["on_disk"], "after");
+        assert_eq!(steps[4]["files"][0]["change"], "added");
+        // drawn on both sides, like an agent's
+        let step = json_of(&route(&state, "GET", "/vis/event?seq=1", b"")).clone();
+        assert!(!step["before"].is_null() && !step["after"].is_null(), "{step}");
+    }
+
+    // Two servers on one project: what one writes through its edit tools, the
+    // other finds in the ledger they share and logs as that agent's changeset,
+    // intent and all, rather than as a change made by hand - and a revert too.
+    #[test]
+    fn another_servers_write_is_its_changeset_not_a_hand_edit() {
+        let (dir, mine) = scratch(
+            "elsewhere",
+            &[
+                ("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n"),
+                ("src/fee.rs", "pub fn fee() -> i32 {\n    1\n}\n"),
+            ],
+        );
+        let theirs = RwLock::new(MapState::build(&dir.0).unwrap());
+        let events = || json_of(&route(&mine, "GET", "/vis/events?since=0", b"")).clone();
+        events();
+        // a server too old to share a feed leaves only the ledger
+        let no_feed = || {
+            let _ = fs::remove_file(feed_path(&dir.0));
+        };
+
+        let (err, out) = tool(
+            &theirs,
+            "edit_text",
+            json!({"path": "src/pay.rs", "old": "    n\n", "new": "    n + 1\n", "intent": "charge one more", "apply": true}),
+        );
+        assert!(!err, "{out}");
+        no_feed();
+        let id = id_after(&out, "changeset `");
+        fs::write(dir.0.join("src/fee.rs"), "pub fn fee() -> i32 {\n    2\n}\n").unwrap();
+        tool(&mine, "refresh", json!({}));
+        tool(&theirs, "edit_revert", json!({"changeset": id}));
+        no_feed();
+        tool(&mine, "refresh", json!({}));
+
+        let all = events();
+        let steps: Vec<(&str, &str, &str, &str)> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let s = |k: &str| e[k].as_str().unwrap_or("-");
+                (s("by"), s("status"), s("tool"), s("changeset"))
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("agent", "applied", ELSEWHERE, id.as_str()),
+                ("human", "edited", BY_HAND, "-"),
+                ("agent", "reverted", ELSEWHERE, id.as_str()),
+            ]
+        );
+        assert_eq!(all["events"][0]["intent"], json!(["charge one more"]));
+        assert_eq!(all["events"][0]["files"][0]["path"], "src/pay.rs");
+    }
+
+    // A changeset staged over several calls to one file is applied as those
+    // calls, and the file moving on past the first of them is the write
+    // itself - not a change made by hand.
+    #[test]
+    fn a_write_in_several_steps_is_not_a_change_by_hand() {
+        let (_dir, state) = scratch("several", &[("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n")]);
+        let events = || json_of(&route(&state, "GET", "/vis/events?since=0", b"")).clone();
+        events();
+        let (_, out) = tool(&state, "edit_text", json!({"path": "src/pay.rs", "old": "    n\n", "new": "    n + 1\n"}));
+        let id = id_after(&out, "changeset `");
+        tool(&state, "edit_text", json!({"path": "src/pay.rs", "changeset": id, "old": "    n + 1\n", "new": "    n + 2\n"}));
+        let (err, out) = tool(&state, "edit_apply", json!({"changeset": id}));
+        assert!(!err, "{out}");
+        let all = events();
+        let who: Vec<(&str, &str)> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["by"].as_str().unwrap(), e["status"].as_str().unwrap()))
+            .collect();
+        assert_eq!(who, [("agent", "staged"), ("agent", "staged"), ("agent", "applied"), ("agent", "applied")]);
+    }
+
+    // A server started on a project picks the timeline up where the servers
+    // before it left it, so a restart loses none of what agents did.
+    #[test]
+    fn a_restarted_server_carries_the_timeline_on() {
+        let (dir, before) = scratch("restored", &[("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n")]);
+        tool(&before, "references", json!({"symbol": "charge"}));
+        let (err, out) = tool(&before, "edit_text", json!({"path": "src/pay.rs", "old": "    n\n", "new": "    n + 1\n", "apply": true}));
+        assert!(!err, "{out}");
+        drop(before);
+        let after = RwLock::new(MapState::build(&dir.0).unwrap());
+        let all = json_of(&route(&after, "GET", "/vis/events?since=0", b"")).clone();
+        let steps: Vec<(u64, &str)> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["seq"].as_u64().unwrap(), e["status"].as_str().unwrap()))
+            .collect();
+        // staged and written in one call, the change is its write alone
+        assert_eq!(steps, [(1, "read"), (2, "applied")]);
+    }
+
+    // Two servers on one project share what the ledger cannot carry: one
+    // agent's looks and the parts of its write reach the other server's
+    // timeline, and the write lands there once - not again from the ledger.
+    #[test]
+    fn servers_on_one_project_share_their_steps() {
+        let (dir, mine) = scratch("feed", &[("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n")]);
+        let theirs = RwLock::new(MapState::build(&dir.0).unwrap());
+        let events = || json_of(&route(&mine, "GET", "/vis/events?since=0", b"")).clone();
+        events();
+        tool(&theirs, "references", json!({"symbol": "charge"}));
+        let (err, out) = tool(
+            &theirs,
+            "edit_text",
+            json!({"path": "src/pay.rs", "old": "    n\n}\n", "new": "    fee(n)\n}\n\npub fn fee(n: i32) -> i32 {\n    n / 100\n}\n", "apply": true}),
+        );
+        assert!(!err, "{out}");
+        tool(&mine, "refresh", json!({}));
+        let all = events();
+        let steps: Vec<(&str, &str, &str)> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["status"].as_str().unwrap(), e["tool"].as_str().unwrap(), e["focus"]["name"].as_str().unwrap_or("-")))
+            .collect();
+        assert_eq!(steps, [("read", "references", "charge"), ("applied", "edit_text", "fee"), ("applied", "edit_text", "charge")]);
+    }
+
+    // An agent's reads land on the timeline as looks at what they named - the
+    // definition it looked up, a file it read - the same look once, and a page
+    // reading for itself is no agent looking.
+    #[test]
+    fn an_agents_reads_land_on_the_timeline_as_looks() {
+        let (_dir, state) = scratch(
+            "looks",
+            &[("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n\npub fn refund(n: i32) -> i32 {\n    charge(-n)\n}\n")],
+        );
+        let events = || json_of(&route(&state, "GET", "/vis/events?since=0", b"")).clone();
+        events();
+        tool(&state, "references", json!({"symbol": "charge"}));
+        tool(&state, "references", json!({"symbol": "charge"}));
+        tool(&state, "file", json!({"path": "src/pay.rs"}));
+        let page = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "file", "arguments": {"path": "src/pay.rs"}}});
+        mcp_handle_from(&state, &page, true);
+        let all = events();
+        let looks: Vec<(&str, &str, &str)> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["status"].as_str().unwrap(), e["intent"][0].as_str().unwrap(), e["focus"]["level"].as_str().unwrap()))
+            .collect();
+        assert_eq!(looks, [("read", "references charge", "flow"), ("read", "file src/pay.rs", "code")]);
+        assert_eq!(all["events"][0]["focus"]["name"], "charge");
+        let marked: Vec<&str> = all["events"][0]["functions"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(marked, ["charge", "refund"]);
+    }
+
+    // Each step is put down to the ask whose calls named its changeset - the
+    // latest made before it, since a changeset staged under one ask can be
+    // applied under the next - and changes made by hand run on their own.
+    #[test]
+    fn the_timeline_groups_into_the_asks_behind_its_steps() {
+        let turn = |id: &str, epoch: i64, changesets: &[&str]| crate::prompts::Turn {
+            id: id.into(),
+            agent: "claude".into(),
+            session: "s1".into(),
+            model: None,
+            ts: String::new(),
+            branch: None,
+            prompt: format!("ask {id}"),
+            edits: Vec::new(),
+            changesets: changesets.iter().map(|c| c.to_string()).collect(),
+            epoch,
+        };
+        let step = |seq: u64, secs: u64, human: bool, changeset: Option<&str>| StepRef {
+            seq,
+            at: secs * 1000,
+            human,
+            changeset: changeset.map(str::to_string),
+        };
+        let turns = [turn("a", 100, &["c1"]), turn("b", 200, &["c1", "c2"])];
+        let steps = [
+            // staged under the first ask
+            step(1, 110, false, Some("c1")),
+            step(2, 150, true, None),
+            step(3, 160, true, None),
+            // applied under the next
+            step(4, 210, false, Some("c1")),
+            step(5, 220, false, Some("c2")),
+            // no transcript names it
+            step(6, 230, false, Some("c9")),
+            // a look names no changeset, so it serves the ask made last before it
+            step(7, 240, false, None),
+        ];
+        let v = group_by_ask(&steps, &turns);
+        let groups: Vec<(&str, Option<&str>, Vec<u64>)> = v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                let seqs = g["steps"].as_array().unwrap().iter().filter_map(|s| s.as_u64()).collect();
+                (g["kind"].as_str().unwrap(), g["ask"]["id"].as_str(), seqs)
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                ("ask", Some("a"), vec![1]),
+                ("hand", None, vec![2, 3]),
+                ("ask", Some("b"), vec![4, 5]),
+                ("agent", None, vec![6]),
+                ("ask", Some("b"), vec![7]),
+            ]
+        );
+        assert_eq!(v["groups"][0]["ask"]["prompt"], "ask a");
+        assert_eq!(v["groups"][0]["ask"]["at"], 100_000);
     }
 
     // A type that is built and never called - a struct literal, a `new` - is still

@@ -152,6 +152,11 @@ pub struct Changeset {
     files: BTreeMap<String, FileChange>,
     // identifiers renamed old to new - counted again once applied
     renames: BTreeMap<String, String>,
+    // why, one terse line per staging call that gave one - for the timeline
+    intents: Vec<String>,
+    // each staging call's own change, in the order they came - so the
+    // timeline replays the changeset the way it was built
+    calls: Vec<Activity>,
 }
 
 // handles, pending changesets and the recently applied ones, for one server
@@ -231,6 +236,8 @@ impl Store {
                     ops: Vec::new(),
                     files: BTreeMap::new(),
                     renames: BTreeMap::new(),
+                    intents: Vec::new(),
+                    calls: Vec::new(),
                 })
             }
         }
@@ -252,13 +259,87 @@ pub struct Stage {
     pub apply: bool,
     // `path:line` sites to leave untouched
     pub skip: Vec<String>,
+    // why, in one terse line - shown beside the step on the visualiser's timeline
+    pub intent: Option<String>,
 }
+
+// an intent past this is cut - a note beside a step, not a description
+const INTENT_MAX: usize = 120;
 
 // what a call produced - the answer, and whether anything reached the disk
 #[derive(Debug)]
 pub struct Outcome {
     pub text: String,
     pub wrote: bool,
+    // what the call did to the code, for the visualiser's timeline
+    pub activity: Vec<Activity>,
+}
+
+// One step of an edit's life - staged, applied, reverted or discarded - with
+// every file it touches and that file's text on each side, so the visualiser
+// can show the change as it happens and replay it later.
+#[derive(Debug, Clone)]
+pub struct Activity {
+    pub changeset: String,
+    // staged | applied | reverted | discarded - or edited, a change made by
+    // hand that the server found on disk
+    pub status: &'static str,
+    pub ops: Vec<String>,
+    pub files: Vec<FileText>,
+    // why, as the agent put it when staging - a line per call that said
+    pub intent: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileText {
+    pub path: String,
+    // none - the file did not exist before the step
+    pub before: Option<String>,
+    // none - the step removes the file
+    pub after: Option<String>,
+}
+
+impl Changeset {
+    // the files this changeset moves, as one step; a revert runs the change
+    // backwards, so its before and after swap
+    fn activity(&self, status: &'static str) -> Activity {
+        let backwards = status == "reverted";
+        Activity {
+            changeset: self.id.clone(),
+            status,
+            ops: self.ops.clone(),
+            files: self
+                .files
+                .iter()
+                .filter(|(_, fc)| fc.before != fc.after)
+                .map(|(path, fc)| {
+                    let (before, after) = if backwards {
+                        (fc.after.clone(), fc.before.clone())
+                    } else {
+                        (fc.before.clone(), fc.after.clone())
+                    };
+                    FileText { path: path.clone(), before, after }
+                })
+                .collect(),
+            intent: self.intents.clone(),
+        }
+    }
+
+    // the files this changeset moves, one step per staging call in the order
+    // they came; a revert runs them backwards, each with its sides swapped
+    fn steps(&self, status: &'static str) -> Vec<Activity> {
+        if self.calls.is_empty() {
+            return vec![self.activity(status)];
+        }
+        let mut steps: Vec<Activity> = self.calls.iter().map(|c| Activity { status, ..c.clone() }).collect();
+        if status == "reverted" {
+            steps.reverse();
+            for f in steps.iter_mut().flat_map(|s| s.files.iter_mut()) {
+                std::mem::swap(&mut f.before, &mut f.after);
+            }
+        }
+        steps
+    }
 }
 
 // path safety
@@ -987,6 +1068,40 @@ fn staged(
             return Err(e);
         }
     };
+    // its first line, kept short
+    let why: Option<String> = stage
+        .intent
+        .as_deref()
+        .and_then(|i| i.lines().next())
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(|w| w.chars().take(INTENT_MAX).collect());
+    // the same reason given call after call is one reason
+    if let Some(w) = why.clone().filter(|w| cs.intents.last() != Some(w)) {
+        cs.intents.push(w);
+    }
+    // this call's own change, from the text it found to the text it left
+    let files: Vec<FileText> = cs
+        .files
+        .iter()
+        .filter_map(|(rel, fc)| {
+            let found = base.files.get(rel).map_or(&fc.before, |b| &b.after);
+            (*found != fc.after).then(|| FileText { path: rel.clone(), before: found.clone(), after: fc.after.clone() })
+        })
+        .collect();
+    let activity: Vec<Activity> = if files.is_empty() {
+        Vec::new()
+    } else {
+        let call = Activity {
+            changeset: cs.id.clone(),
+            status: "staged",
+            ops: cs.ops.get(base.ops.len()..).unwrap_or_default().to_vec(),
+            files,
+            intent: why.into_iter().collect(),
+        };
+        cs.calls.push(call.clone());
+        vec![call]
+    };
     let id = cs.id.clone();
     let mut text = format!("{report}\n{}", preview(&cs));
     store.pending.insert(id.clone(), cs);
@@ -994,13 +1109,13 @@ fn staged(
         let done = apply(ctx.root, store, &id)?;
         text.push('\n');
         text.push_str(&done.text);
-        return Ok(Outcome { text, wrote: true });
+        return Ok(Outcome { text, wrote: true, activity: done.activity });
     }
     text.push_str(&format!(
         "\nnext: `edit_apply` changeset=\"{id}\" to write it, `edit_discard` to drop it, or pass \
          changeset=\"{id}\" to another edit tool to stage more into it\n"
     ));
-    Ok(Outcome { text, wrote: false })
+    Ok(Outcome { text, wrote: false, activity })
 }
 
 // a listed section, capped
@@ -1692,7 +1807,14 @@ pub fn apply(root: &Path, store: &mut Store, id: &str) -> Result<Outcome, String
     }
     if !cs.renames.is_empty() {
         let olds: BTreeSet<String> = cs.renames.keys().cloned().collect();
-        let empty = Changeset { id: String::new(), ops: Vec::new(), files: BTreeMap::new(), renames: BTreeMap::new() };
+        let empty = Changeset {
+            id: String::new(),
+            ops: Vec::new(),
+            files: BTreeMap::new(),
+            renames: BTreeMap::new(),
+            intents: Vec::new(),
+            calls: Vec::new(),
+        };
         let still: Vec<Hit> = sweep(root, &empty, &olds).hits;
         if still.is_empty() {
             let names: Vec<String> = olds.iter().map(|o| format!("`{o}`")).collect();
@@ -1713,11 +1835,12 @@ pub fn apply(root: &Path, store: &mut Store, id: &str) -> Result<Outcome, String
     out.push_str(&format!(
         "undo: `edit_revert` changeset=\"{id}\"\nnext: `test_triggers` names the tests this puts at risk\n"
     ));
+    let activity = cs.steps("applied");
     store.applied.push(cs);
     if store.applied.len() > MAX_APPLIED {
         store.applied.remove(0);
     }
-    Ok(Outcome { text: out, wrote: true })
+    Ok(Outcome { text: out, wrote: true, activity })
 }
 
 // puts back every file an applied changeset wrote, provided none changed since
@@ -1746,28 +1869,27 @@ pub fn revert(root: &Path, store: &mut Store, id: &str) -> Result<Outcome, Strin
     for rel in &written {
         out.push_str(&format!("  {rel}\n"));
     }
-    Ok(Outcome { text: out, wrote: true })
+    Ok(Outcome { text: out, wrote: true, activity: cs.steps("reverted") })
 }
 
 // drops one pending changeset, or all of them
 pub fn discard(store: &mut Store, id: Option<&str>) -> Result<Outcome, String> {
-    let dropped: Vec<String> = match id.map(str::trim).filter(|i| !i.is_empty()) {
-        Some(id) => {
-            store
-                .pending
-                .remove(id)
-                .ok_or_else(|| format!("no pending changeset `{id}`"))?;
-            vec![id.to_string()]
-        }
-        None => std::mem::take(&mut store.pending).into_keys().collect(),
+    let dropped: Vec<Changeset> = match id.map(str::trim).filter(|i| !i.is_empty()) {
+        Some(id) => vec![store
+            .pending
+            .remove(id)
+            .ok_or_else(|| format!("no pending changeset `{id}`"))?],
+        None => std::mem::take(&mut store.pending).into_values().collect(),
     };
+    let ids: Vec<&str> = dropped.iter().map(|c| c.id.as_str()).collect();
     Ok(Outcome {
         text: if dropped.is_empty() {
             "nothing pending - no changeset to discard\n".into()
         } else {
-            format!("discarded {} - nothing was written\n", dropped.join(", "))
+            format!("discarded {} - nothing was written\n", ids.join(", "))
         },
         wrote: false,
+        activity: dropped.iter().map(|c| c.activity("discarded")).collect(),
     })
 }
 
@@ -1788,6 +1910,7 @@ fn ledger_entry(cs: &Changeset) -> Value {
         "id": cs.id,
         "ts": chrono::Utc::now().to_rfc3339(),
         "ops": cs.ops,
+        "intent": cs.intents,
         "files": files,
     })
 }
@@ -1837,6 +1960,87 @@ pub fn ledger(root: &Path) -> BTreeMap<String, Vec<(String, String)>> {
             .collect();
         out.insert(id.to_string(), files);
     }
+    out
+}
+
+// One ledger line as any server reads it back: a changeset applied - what it
+// did, why, and what it wrote to each file - or one reverted.
+#[derive(Debug, Clone)]
+pub struct LedgerLine {
+    pub id: String,
+    pub reverted: bool,
+    pub ops: Vec<String>,
+    pub intent: Vec<String>,
+    // each file, and the lines the changeset added to it
+    pub files: Vec<(String, String)>,
+}
+
+// how far the ledger runs now - a reader starting here sees only what comes next
+pub fn ledger_len(root: &Path) -> u64 {
+    fs::metadata(root.join(".ccc").join(LEDGER_NAME)).map_or(0, |m| m.len())
+}
+
+// The ledger lines past byte `from`, and the byte they end at. A line still
+// being written waits for the next read; a ledger shorter than `from` was
+// started again, so it is read from the top.
+pub fn ledger_since(root: &Path, from: u64) -> (Vec<LedgerLine>, u64) {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(root.join(".ccc").join(LEDGER_NAME)) else {
+        return (Vec::new(), 0);
+    };
+    let from = if f.metadata().map_or(0, |m| m.len()) < from { 0 } else { from };
+    let mut tail = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut tail).is_err() {
+        return (Vec::new(), from);
+    }
+    let end = tail.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let strs = |v: &Value, k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(|a| a.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    };
+    let lines = String::from_utf8_lossy(&tail[..end])
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            Some(LedgerLine {
+                id: v.get("id")?.as_str()?.to_string(),
+                reverted: v.get("reverted").and_then(|r| r.as_bool()).unwrap_or(false),
+                ops: strs(&v, "ops"),
+                intent: strs(&v, "intent"),
+                files: v
+                    .get("files")
+                    .and_then(|f| f.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| {
+                        let written = f.get("written").and_then(|w| w.as_str()).unwrap_or_default();
+                        Some((f.get("path")?.as_str()?.to_string(), written.to_string()))
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+    (lines, from + end as u64)
+}
+
+// every changeset id an answer names - staged, applied, reverted or dropped
+pub fn changeset_ids(answer: &str) -> Vec<String> {
+    let mut out: Vec<String> = answer
+        .match_indices("changeset `")
+        .map(|(i, m)| {
+            answer[i + m.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|id| !id.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -1973,8 +2177,51 @@ fn added_lines(before: Option<&str>, after: Option<&str>) -> String {
         .join("\n")
 }
 
+// One run of change, as `(start, len)` on each side, 1-based. An empty side
+// starts at the line the run sits before, so a pure insertion still names
+// where in `before` it lands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hunk {
+    pub before: (usize, usize),
+    pub after: (usize, usize),
+}
+
+impl Hunk {
+    // the lines one side spans, inclusive - an empty side is its one anchor line
+    pub fn span(side: (usize, usize)) -> (usize, usize) {
+        (side.0, side.0 + side.1.max(1) - 1)
+    }
+}
+
+// every run of lines a change touched, in order
+pub fn hunks(before: Option<&str>, after: Option<&str>) -> Vec<Hunk> {
+    let (a, b) = (split(before), split(after));
+    let mut out: Vec<Hunk> = Vec::new();
+    let mut open: Option<Hunk> = None;
+    // the next line on each side, 0-based
+    let (mut ni, mut nj) = (0, 0);
+    for l in diff_lines(&a, &b) {
+        match l {
+            Line::Same(i, j) => {
+                out.extend(open.take());
+                (ni, nj) = (i + 1, j + 1);
+            }
+            Line::Gone(i) => {
+                open.get_or_insert(Hunk { before: (i + 1, 0), after: (nj + 1, 0) }).before.1 += 1;
+                ni = i + 1;
+            }
+            Line::Added(j) => {
+                open.get_or_insert(Hunk { before: (ni + 1, 0), after: (j + 1, 0) }).after.1 += 1;
+                nj = j + 1;
+            }
+        }
+    }
+    out.extend(open);
+    out
+}
+
 // one file as a unified diff
-fn unified(rel: &str, before: Option<&str>, after: Option<&str>) -> Vec<String> {
+pub(crate) fn unified(rel: &str, before: Option<&str>, after: Option<&str>) -> Vec<String> {
     let (a, b) = (split(before), split(after));
     let ops = diff_lines(&a, &b);
     let mut out = vec![
@@ -2146,6 +2393,103 @@ mod tests {
         assert_eq!(counts(Some(before), Some(after)), (2, 1));
         let new = unified("n.rs", None, Some("x\n")).join("\n");
         assert!(new.starts_with("--- /dev/null\n+++ b/n.rs\n@@ -0,0 +1,1 @@\n+x"), "{new}");
+    }
+
+    #[test]
+    fn a_hunk_names_both_sides_even_when_one_is_empty() {
+        let before = "a\nb\nc\nd\ne\n";
+        let after = "a\nB\nc\nx\ny\nd\n";
+        assert_eq!(
+            hunks(Some(before), Some(after)),
+            vec![
+                // b -> B
+                Hunk { before: (2, 1), after: (2, 1) },
+                // x, y land before d
+                Hunk { before: (4, 0), after: (4, 2) },
+                // e goes, and the end of `after` is where it went
+                Hunk { before: (5, 1), after: (7, 0) },
+            ]
+        );
+        assert_eq!(Hunk::span((4, 0)), (4, 4));
+        assert_eq!(Hunk::span((4, 2)), (4, 5));
+        assert_eq!(hunks(None, Some("x\n")), vec![Hunk { before: (1, 0), after: (1, 1) }]);
+        assert!(hunks(Some(before), Some(before)).is_empty());
+    }
+
+    #[test]
+    fn a_step_carries_both_texts_and_a_revert_runs_backwards() {
+        let file = |before: Option<&str>, after: Option<&str>| FileChange {
+            before: before.map(str::to_string),
+            after: after.map(str::to_string),
+        };
+        let cs = Changeset {
+            id: "c1-x".into(),
+            ops: vec!["text a.rs (1 replacement(s))".into()],
+            files: BTreeMap::from([
+                ("a.rs".to_string(), file(Some("fn a() {}\n"), Some("fn a() { b(); }\n"))),
+                ("b.rs".to_string(), file(None, Some("fn b() {}\n"))),
+                // staged and staged back - nothing moves, so the step leaves it out
+                ("c.rs".to_string(), file(Some("x\n"), Some("x\n"))),
+            ]),
+            renames: BTreeMap::new(),
+            intents: Vec::new(),
+            calls: Vec::new(),
+        };
+        let applied = cs.activity("applied");
+        assert_eq!((applied.changeset.as_str(), applied.status), ("c1-x", "applied"));
+        let paths: Vec<&str> = applied.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.rs", "b.rs"]);
+        assert_eq!(applied.files[0].after.as_deref(), Some("fn a() { b(); }\n"));
+        assert_eq!(applied.files[1].before, None);
+
+        let reverted = cs.activity("reverted");
+        assert_eq!(reverted.files[0].before.as_deref(), Some("fn a() { b(); }\n"));
+        assert_eq!(reverted.files[0].after.as_deref(), Some("fn a() {}\n"));
+        // reverting a created file removes it
+        assert_eq!(reverted.files[1].after, None);
+    }
+
+    // A changeset staged over several calls is applied as those calls, in the
+    // order they came, and reverted as the same calls run backwards.
+    #[test]
+    fn a_changeset_replays_the_calls_that_built_it() {
+        let dir = Dir::new("calls");
+        fs::write(dir.0.join("a.rs"), "fn a() {}\n").unwrap();
+        let caches = Vec::new();
+        let ctx = Ctx { root: &dir.0, caches: &caches };
+        let mut store = Store::new();
+        let stage = |changeset: Option<&str>, intent: &str| Stage {
+            changeset: changeset.map(str::to_string),
+            intent: Some(intent.into()),
+            ..Default::default()
+        };
+        let first = text(&ctx, &mut store, "a.rs", Some("fn a() {}"), Some("fn a() { b(); }"), false, false, &stage(None, "call b"))
+            .unwrap();
+        assert_eq!(first.activity.len(), 1);
+        let id = first.activity[0].changeset.clone();
+        let second = text(&ctx, &mut store, "a.rs", None, Some("fn a() { b(); }\n\nfn b() {}\n"), false, false, &stage(Some(&id), "add b"))
+            .unwrap();
+        // a staging call is its own change, not the changeset so far
+        assert_eq!(second.activity[0].files[0].before.as_deref(), Some("fn a() { b(); }\n"));
+        assert_eq!(second.activity[0].intent, ["add b"]);
+
+        let applied = apply(&dir.0, &mut store, &id).unwrap().activity;
+        let sides: Vec<(&str, Option<&str>, Option<&str>)> = applied
+            .iter()
+            .map(|s| (s.status, s.files[0].before.as_deref(), s.files[0].after.as_deref()))
+            .collect();
+        assert_eq!(
+            sides,
+            [
+                ("applied", Some("fn a() {}\n"), Some("fn a() { b(); }\n")),
+                ("applied", Some("fn a() { b(); }\n"), Some("fn a() { b(); }\n\nfn b() {}\n")),
+            ]
+        );
+        let reverted = revert(&dir.0, &mut store, &id).unwrap().activity;
+        let intents: Vec<&str> = reverted.iter().map(|s| s.intent[0].as_str()).collect();
+        assert_eq!(intents, ["add b", "call b"]);
+        assert_eq!(reverted[0].files[0].after.as_deref(), Some("fn a() { b(); }\n"));
+        assert_eq!(reverted[1].files[0].after.as_deref(), Some("fn a() {}\n"));
     }
 
     #[test]

@@ -103,6 +103,10 @@ pub struct Turn {
     // the files it wrote; empty is meaningful - a question that changed
     // nothing is still an answer
     pub edits: Vec<TurnEdit>,
+    // every changeset its calls to ccc's edit tools named - staged, applied or
+    // dropped - so a step on the visualiser's timeline finds the ask behind it
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changesets: Vec<String>,
     // epoch seconds, not serialised: ordering and windowing only
     #[serde(skip)]
     pub epoch: i64,
@@ -630,6 +634,7 @@ fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(St
                 .map(str::to_string),
             prompt,
             edits: Vec::new(),
+            changesets: Vec::new(),
         });
     }
 
@@ -683,8 +688,21 @@ fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(St
                     .collect()
             })
             .unwrap_or_default();
+        let named: Vec<String> = rec
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .flat_map(|b| match b.get("name").and_then(|n| n.as_str()) {
+                Some(name) if is_ccc_edit(name) => changesets_of(b, &ccc.answers),
+                // ccc reached another way - a shell, a client naming it otherwise - answers alike
+                _ => reported_changesets(b, &ccc.answers),
+            })
+            .collect();
         // a purely conversational reply still names the model that gave it
-        if edits.is_empty() && model.is_none() {
+        if edits.is_empty() && named.is_empty() && model.is_none() {
             continue;
         }
         let Some(idx) = walk_to_prompt(rec, &records, &by_uuid) else {
@@ -692,6 +710,7 @@ fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(St
         };
         if let Some(turn) = at.get(&idx).and_then(|&slot| out.get_mut(slot)) {
             turn.edits.extend(edits);
+            turn.changesets.extend(named);
             if turn.model.is_none() {
                 turn.model = model.map(str::to_string);
             }
@@ -701,8 +720,36 @@ fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(St
     for t in &mut out {
         t.edits.sort_by(|a, b| (&a.path, &a.tool).cmp(&(&b.path, &b.tool)));
         t.edits.dedup_by(|a, b| a.path == b.path && a.anchor == b.anchor);
+        t.changesets.sort();
+        t.changesets.dedup();
     }
     out
+}
+
+// the changesets one ccc edit call named - in what it was asked, and in its answer
+fn changesets_of(block: &Value, answers: &BTreeMap<&str, String>) -> Vec<String> {
+    let asked = block.get("input").and_then(|i| i.get("changeset")).and_then(|c| c.as_str());
+    let mut ids: Vec<String> = asked.map(|c| c.trim().to_string()).into_iter().collect();
+    if let Some(answer) = block.get("id").and_then(|i| i.as_str()).and_then(|id| answers.get(id)) {
+        ids.extend(crate::edit::changeset_ids(answer));
+    }
+    ids.retain(|i| !i.is_empty());
+    ids
+}
+
+// the changesets ccc reported in the answer to any other call, known by the
+// shape ccc gives them
+fn reported_changesets(block: &Value, answers: &BTreeMap<&str, String>) -> Vec<String> {
+    let answer = block.get("id").and_then(|i| i.as_str()).and_then(|id| answers.get(id));
+    let ids = answer.map(|a| crate::edit::changeset_ids(a)).unwrap_or_default();
+    ids.into_iter().filter(|id| changeset_shaped(id)).collect()
+}
+
+// `c<number>-<tag>`, as ccc names a changeset
+fn changeset_shaped(id: &str) -> bool {
+    id.strip_prefix('c')
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(n, tag)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !tag.is_empty())
 }
 
 // climb `parentUuid` from an assistant record to the request that led to it
@@ -804,6 +851,7 @@ fn parse_copilot(path: &Path) -> Vec<Turn> {
                 // copilot's log records the request and the rendered reply, not
                 // the edit payload, so its changes can only be placed in time
                 edits: Vec::new(),
+                changesets: Vec::new(),
             })
         })
         .collect()
@@ -864,6 +912,70 @@ pub fn collect(root: &Path, opts: &PromptsOptions) -> (Vec<Turn>, Vec<SourceStat
     turns.sort_by(|a, b| (a.epoch, &a.id).cmp(&(b.epoch, &b.id)));
     turns.dedup_by(|a, b| a.id == b.id);
     (turns, sources)
+}
+
+// where agents' records are looked for again - finding them walks VS Code's storage
+const ASK_SOURCES_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+// and again for a project claude keeps no directory of its own for, where
+// finding its sessions means opening every other project's
+const ASK_SOURCES_SLOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+// One stamp per record: when it was last written, and how long it was.
+type Stamp = (Option<std::time::SystemTime>, u64);
+
+// The requests made in this project, kept per transcript and read again only
+// once that transcript changes - the visualiser asks often, and one session's
+// transcript runs to megabytes.
+#[derive(Default)]
+pub struct Asks {
+    // the records found, claude's marked true, and when they were looked for
+    sources: Option<(std::time::Instant, Vec<(PathBuf, bool)>)>,
+    read: BTreeMap<PathBuf, (Stamp, Vec<Turn>)>,
+}
+
+impl Asks {
+    // every request made since `since` (epoch seconds), oldest first
+    pub fn since(&mut self, root: &Path, since: i64) -> Vec<Turn> {
+        let quick = claude_root().is_some_and(|b| b.join(claude_slug(root)).is_dir());
+        let every = if quick { ASK_SOURCES_EVERY } else { ASK_SOURCES_SLOW };
+        let stale = self.sources.as_ref().is_none_or(|(at, _)| at.elapsed() > every);
+        if stale {
+            let mut found: Vec<(PathBuf, bool)> = claude_transcripts(root).0.into_iter().map(|f| (f, true)).collect();
+            found.extend(copilot_sessions(root).0.into_iter().map(|f| (f, false)));
+            self.sources = Some((std::time::Instant::now(), found));
+        }
+        let sources = self.sources.as_ref().map(|(_, s)| s.clone()).unwrap_or_default();
+        // edits are not wanted here, so no ledger is read for them
+        let ledger = BTreeMap::new();
+        let mut out = Vec::new();
+        let mut live = BTreeSet::new();
+        for (f, claude) in sources {
+            let Ok(md) = fs::metadata(&f) else {
+                continue;
+            };
+            let modified = md.modified().ok();
+            // a record last written before the window holds nothing inside it
+            let secs = modified
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            if secs.is_some_and(|s| s < since) {
+                continue;
+            }
+            let stamp = (modified, md.len());
+            if self.read.get(&f).is_none_or(|(s, _)| *s != stamp) {
+                let turns = if claude { parse_claude_with(&f, root, &ledger) } else { parse_copilot(&f) };
+                self.read.insert(f.clone(), (stamp, turns));
+            }
+            if let Some((_, turns)) = self.read.get(&f) {
+                out.extend(turns.iter().filter(|t| t.epoch >= since).cloned());
+            }
+            live.insert(f);
+        }
+        self.read.retain(|f, _| live.contains(f));
+        out.sort_by(|a, b| (a.epoch, &a.id).cmp(&(b.epoch, &b.id)));
+        out.dedup_by(|a, b| a.id == b.id);
+        out
+    }
 }
 
 // attribution
@@ -1374,6 +1486,7 @@ mod tests {
             branch: None,
             prompt: format!("request {id}"),
             edits,
+            changesets: Vec::new(),
         }
     }
 
@@ -1543,5 +1656,34 @@ mod tests {
         use std::io::Write;
         writeln!(f, "{}", serde_json::json!({"id": "c3-abc", "reverted": true})).unwrap();
         assert!(parse_claude(&file, root)[0].edits.is_empty());
+    }
+
+    // ccc reached through a shell answers with its changeset all the same, and
+    // the ask is credited with it; prose that only looks like one is not one
+    #[test]
+    fn a_changeset_ccc_reported_through_any_tool_is_credited() {
+        let dir = tempdir::Dir::new("prompt-shell-ccc");
+        let root = dir.path();
+        let ts = "2026-08-20T10:00:00Z";
+        let file = write(
+            &root.join("transcripts"),
+            "s1.jsonl",
+            &[
+                user("u1", None, ts, serde_json::json!("tidy the parser")),
+                assistant("a1", "u1", ts, serde_json::json!([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ccc.py edit_text"}}])),
+                user("r1", Some("a1"), ts, serde_json::json!([{
+                    "type": "tool_result", "tool_use_id": "t1",
+                    "content": "# edit_text src/a.rs (1 replacement(s)) -> changeset `c7-mck1` (staged, nothing written yet)",
+                }])),
+                assistant("a2", "u1", ts, serde_json::json!([{"type": "tool_use", "id": "t2", "name": "Read", "input": {}}])),
+                user("r2", Some("a2"), ts, serde_json::json!([{
+                    "type": "tool_result", "tool_use_id": "t2",
+                    "content": "let id = id_after(&out, \"changeset `\"); the changeset `release-notes` waits",
+                }])),
+            ],
+        );
+        let turns = parse_claude(&file, root);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].changesets, ["c7-mck1"]);
     }
 }
