@@ -44,7 +44,7 @@ the ten colours are contributed theme colours, so a theme or a `workbench.colorC
 can restyle any of them.
 
 Click the **Collateral Code Check** mark in the activity bar to open the panel, and again to close it. It has
-two views. **Triggers** is the tests your changes invoke: a triggered test usually lives in a
+three views. **Triggers** is the tests your changes invoke: a triggered test usually lives in a
 different file from the change that triggered it, so this is the only place that shows the whole set
 - **Run these** (click to open; the tooltip carries how many call hops it sits from the change and
 why), **No test covers**, and **Commands** - the suggested command for running exactly that set,
@@ -56,6 +56,20 @@ monadic, dyadic, variadic - pick several), and by band (a 1-10 range). Test func
 but hidden by default; the beaker button shows them, and the clear button appears whenever any
 filter is active. The view's subtitle always says how many of the measured functions you are
 looking at, so a filtered list can never pass itself off as the whole map.
+
+**Visualiser** is the [architecture visualiser](../README.md#architecture-visualiser) - the system,
+its containers, components, code and the logic of each function - with the timeline of ccc's edit
+steps along its foot. While an agent edits through ccc's tools, it flies to each change as it lands
+and marks it, and any step can be replayed before and after. A staged change is drawn as
+**Proposed** - the code as it would be - before anything is written, beside the one-line intent the
+agent gave for it. Changes saved by hand land on the timeline too, marked with a person. Each edit
+plays a definition at a time and an agent's reads land as looks, at the pace the speed button sets -
+it is the same page as in a browser, so it behaves the same there (see the
+[README](../README.md#architecture-visualiser)). A change
+that only moves whitespace or wraps lines is not marked unless ¶ is on. Its title-bar buttons open the same
+page as a tab beside the editor (`ccc: Open Architecture Visualiser`), where a long function has
+room, or in a browser. "Open in editor" in its panels opens the file at the line. The page talks to
+the analyser through the extension, so it works the same when the workspace is remote.
 
 The status bar entry on the right is the summary - counts, the base ref being compared, and, when a
 file has no marks at all, which of the two reasons applies: nothing in it changed, or it is not in

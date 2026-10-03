@@ -11,6 +11,7 @@ import { WorkspaceSession } from './session';
 import { type ActiveFileState, StatusBar } from './status';
 import { ComplexityPanel } from './complexitypanel';
 import { TestTriggerPanel } from './testpanel';
+import { VisualiserView } from './visview';
 import { VulnerabilityMarks } from './vulns';
 
 // re-applying decorations while typing is cheap but not free
@@ -46,6 +47,7 @@ class Extension implements CommandHost {
   private readonly testPanel: TestTriggerPanel;
   private readonly vulns = new VulnerabilityMarks();
   private readonly complexityPanel: ComplexityPanel;
+  private readonly visualiser: VisualiserView;
   private cfg: Cfg;
   private lastFocusRefresh = 0;
   private dirtyTimer: NodeJS.Timeout | undefined;
@@ -86,6 +88,11 @@ class Extension implements CommandHost {
       () => this.sessions(),
       () => void this.wake(),
     );
+    // opening the visualiser is intent enough to start the analyser, as a panel is
+    this.visualiser = new VisualiserView(async () => {
+      await this.wake();
+      return this.activeSession();
+    }, this.log);
   }
 
   async start(): Promise<void> {
@@ -105,6 +112,21 @@ class Extension implements CommandHost {
       this.vulns,
       vscode.languages.registerCodeLensProvider({ scheme: 'file' }, this.codeLens),
       vscode.languages.registerHoverProvider({ scheme: 'file' }, this.hover),
+      this.visualiser,
+      // kept alive while hidden, so the edit timeline and where it was looking survive
+      vscode.window.registerWebviewViewProvider(VisualiserView.viewId, this.visualiser, {
+        webviewOptions: { retainContextWhenHidden: true },
+      }),
+      vscode.commands.registerCommand('ccc.openVisualiser', () => this.visualiser.openPanel()),
+      vscode.commands.registerCommand('ccc.openVisualiserInBrowser', async () => {
+        await this.wake();
+        const url = this.activeSession()?.visualiserUrl;
+        if (!url) {
+          void vscode.window.showWarningMessage('ccc: the analyser is not running yet.');
+          return;
+        }
+        await vscode.env.openExternal(vscode.Uri.parse(url));
+      }),
       vscode.commands.registerCommand('ccc.refreshTestTriggers', () =>
         this.refreshAll('test triggers panel'),
       ),

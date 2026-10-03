@@ -25,6 +25,11 @@ export function isAborted(err: unknown): boolean {
   return err instanceof AbortedError;
 }
 
+export interface RawReply {
+  status: number;
+  body: string;
+}
+
 const TIMEOUT_FAST_MS = 5000;
 // a cold rescan of a large repo is slow and waiting beats failing
 const TIMEOUT_SLOW_MS = 60000;
@@ -82,12 +87,27 @@ export class CccClient {
     return this.request<RefreshResult>('POST', '/refresh', TIMEOUT_SLOW_MS, signal);
   }
 
+  // a GET answered as it came, any status - the visualiser page reads its own errors
+  raw(path: string, signal?: AbortSignal): Promise<RawReply> {
+    return this.send('GET', path, TIMEOUT_SLOW_MS, signal);
+  }
+
   private getJson<T>(path: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
     return this.request<T>('GET', path, timeoutMs, signal);
   }
 
-  private request<T>(method: string, path: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
+  private async request<T>(method: string, path: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+    const { status, body } = await this.send(method, path, timeoutMs, signal);
+    if (status < 200 || status >= 300) throw new CccHttpError(status, path, body);
+    try {
+      return JSON.parse(body) as T;
+    } catch (err) {
+      throw new Error(`ccc ${path} returned malformed JSON: ${String(err)}`);
+    }
+  }
+
+  private send(method: string, path: string, timeoutMs: number, signal?: AbortSignal): Promise<RawReply> {
+    return new Promise<RawReply>((resolve, reject) => {
       if (signal?.aborted) {
         reject(new AbortedError());
         return;
@@ -111,15 +131,7 @@ export class CccClient {
             const body = Buffer.concat(chunks).toString('utf8');
             const status = res.statusCode ?? 0;
             this.log.trace(`${method} ${path} -> ${status} ${body.length}b in ${Date.now() - started}ms`);
-            if (status < 200 || status >= 300) {
-              reject(new CccHttpError(status, path, body));
-              return;
-            }
-            try {
-              resolve(JSON.parse(body) as T);
-            } catch (err) {
-              reject(new Error(`ccc ${path} returned malformed JSON: ${String(err)}`));
-            }
+            resolve({ status, body });
           });
         },
       );

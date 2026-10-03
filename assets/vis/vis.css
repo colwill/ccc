@@ -139,12 +139,18 @@ button, input { font: inherit; color: inherit; }
 
 .brand {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  align-items: center;
   white-space: nowrap;
 }
-.brand b { font-weight: 800; letter-spacing: -.01em; }
-.brand span { color: var(--muted); font-size: 12px; }
+/* the logo is white on clear, so it is drawn as a mask in the text's colour - it reads on either theme */
+.brand .logo {
+  display: block;
+  width: 72px;
+  height: 16px;
+  background: var(--text);
+  -webkit-mask: url("data:image/png;base64,__CCC_LOGO__") center / contain no-repeat;
+  mask: url("data:image/png;base64,__CCC_LOGO__") center / contain no-repeat;
+}
 
 .crumbs {
   display: flex;
@@ -253,6 +259,20 @@ button, input { font: inherit; color: inherit; }
   touch-action: none;
 }
 .viewport.panning { cursor: grabbing; }
+/* zoomed out this far the grid is noise, not a measure */
+.viewport.far { background-image: none; }
+/* the logo, faint and tiled, under everything drawn - fixed to the window,
+   so zooming and panning the canvas never move it */
+.viewport::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: var(--text);
+  opacity: .01;
+  -webkit-mask: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='440' height='220'%3E%3Cimage href='data:image/png;base64,__CCC_LOGO__' x='30' y='40' width='110' height='25'/%3E%3Cimage href='data:image/png;base64,__CCC_LOGO__' x='250' y='150' width='110' height='25'/%3E%3C/svg%3E") 0 0 / 440px 220px repeat;
+  mask: url("data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='440' height='220'%3E%3Cimage href='data:image/png;base64,__CCC_LOGO__' x='30' y='40' width='110' height='25'/%3E%3Cimage href='data:image/png;base64,__CCC_LOGO__' x='250' y='150' width='110' height='25'/%3E%3C/svg%3E") 0 0 / 440px 220px repeat;
+}
 
 .surface {
   position: absolute;
@@ -639,9 +659,262 @@ button, input { font: inherit; color: inherit; }
 }
 .note-bar[hidden] { display: none; }
 
+/* ---------- edit timeline ---------- */
+
+/* what a step changed: added green, modified purple, removed red; a step not
+   written yet is dashed amber */
+.node.chg {
+  --chg: var(--primary);
+  border-color: var(--chg);
+  box-shadow: var(--shadow), 0 0 0 3px color-mix(in srgb, var(--chg) 30%, transparent);
+  animation: chg-pulse 1.4s ease-out 2;
+}
+.node.chg-added { --chg: var(--green); }
+.node.chg-removed { --chg: var(--red); opacity: .85; }
+.node.chg-pending { --chg: var(--orange); border-style: dashed; }
+/* what an agent looked at, rather than changed */
+.node.chg-read { --chg: var(--blue); }
+@keyframes chg-pulse {
+  0% { box-shadow: var(--shadow), 0 0 0 0 color-mix(in srgb, var(--chg) 60%, transparent); }
+  70% { box-shadow: var(--shadow), 0 0 0 16px color-mix(in srgb, var(--chg) 0%, transparent); }
+  100% { box-shadow: var(--shadow), 0 0 0 3px color-mix(in srgb, var(--chg) 30%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .node.chg { animation: none; }
+  .viewport.glide .surface { transition: none !important; }
+}
+.viewport.glide .surface { transition: transform .6s cubic-bezier(.2, .7, .2, 1); }
+.viewport.glide { transition: background-size .6s, background-position .6s; }
+/* a step on show, seen alone: whatever it did not touch fades back */
+.node.faded, .wire.faded, .elabel.faded, #frames.faded { opacity: .2; }
+
+.timeline {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  z-index: 14;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-bar);
+}
+.timeline[hidden] { display: none; }
+/* no edits yet: only the switches for what comes stay, in the corner */
+.timeline.empty { left: auto; }
+.timeline.empty > :not(.tl-ws):not(.tl-follow):not(.tl-speed):not(.tl-focus) { display: none; }
+body.with-tl-switches .zoom { bottom: 62px; }
+body.with-timeline .legend { bottom: 62px; }
+body.with-timeline .zoom { bottom: 62px; }
+body.with-timeline .panel { bottom: 62px; }
+.tl-controls { display: flex; gap: 2px; }
+.timeline button {
+  height: 28px;
+  min-width: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--tool);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.timeline button:hover:not(:disabled) { background: var(--hover); color: var(--tool-active); }
+.timeline button:disabled { opacity: .4; cursor: default; }
+.tl-track {
+  position: relative;
+  flex: 1 1 160px;
+  min-width: 80px;
+  height: 28px;
+  border-radius: 4px;
+  background: var(--surface-2);
+  cursor: pointer;
+  touch-action: none;
+  outline: none;
+}
+.tl-track:focus-visible { box-shadow: 0 0 0 2px var(--primary-soft); }
+.tl-ticks { position: absolute; inset: 4px 4px; display: flex; align-items: flex-end; gap: 1px; pointer-events: none; }
+.tl-ticks .tick { flex: 1 1 0; max-width: 14px; height: 55%; border-radius: 2px; background: var(--grey); opacity: .75; }
+.tl-ticks .tick.staged { background: var(--orange); }
+.tl-ticks .tick.applied { background: var(--green); }
+.tl-ticks .tick.reverted { background: var(--red); }
+.tl-ticks .tick.discarded { background: var(--grey); opacity: .45; }
+.tl-ticks .tick.edited { background: var(--blue); }
+.tl-ticks .tick.read { background: var(--primary); opacity: .4; height: 30%; }
+.tl-ticks .tick.at { height: 100%; opacity: 1; box-shadow: 0 0 0 2px var(--primary); }
+/* a change made by hand is a little person: the tick its body, this its head */
+.tl-ticks .tick.human { position: relative; height: 40%; }
+.tl-ticks .tick.human.at { height: 70%; }
+.tl-ticks .tick.human::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 1px);
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: inherit;
+  transform: translateX(-50%);
+}
+/* a step that only moved layout, while those are hidden */
+.tl-ticks .tick.ws:not(.at) { height: 20%; opacity: .3; }
+.timeline .tl-ws, .timeline .tl-speed, .timeline .tl-focus { border: 1px solid var(--border); border-radius: 14px; font-weight: 400; }
+.timeline .tl-speed { min-width: 46px; font-variant-numeric: tabular-nums; }
+.timeline .tl-ws[aria-pressed="true"], .timeline .tl-focus[aria-pressed="true"] { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.panel .chg-tag.ws { background: var(--grey); }
+.person, .glyph { flex: none; width: 12px; height: 12px; margin-right: 4px; vertical-align: -2px; fill: currentColor; }
+.tl-step .person, .replay-badge .person, .tl-ask .person, .ask-row .person { color: var(--blue); }
+.tl-ask .glyph, .ask-row .glyph { color: var(--primary); }
+/* where one ask's steps end and the next one's begin */
+.tl-ticks .tl-sep { flex: none; align-self: stretch; width: 2px; margin: 0 2px; border-radius: 1px; background: var(--border); }
+.timeline .tl-ask {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  font-weight: 400;
+  font-size: 12px;
+}
+.timeline .tl-ask[hidden] { display: none; }
+.panel .ask-session {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 12px 0 4px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.panel .ask-session button { flex: none; white-space: nowrap; text-transform: none; letter-spacing: 0; }
+.panel .ask-row { display: flex; align-items: stretch; gap: 2px; margin: 2px 0; border-radius: 6px; }
+.panel .ask-row.at { background: var(--primary-soft); }
+.panel .ask-go {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.panel .ask-go:hover { background: var(--hover); }
+.panel .ask-go .glyph, .panel .ask-go .person { margin-top: 2px; }
+.panel .ask-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.panel .ask-n { flex: none; color: var(--muted); font-size: 11px; }
+.panel .ask-play { flex: none; border: 0; background: none; color: var(--tool); cursor: pointer; }
+.panel .ask-play:hover { color: var(--primary); }
+.timeline .tl-step {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font: 12px var(--mono);
+  font-weight: 400;
+  color: var(--muted);
+}
+.timeline .tl-step:disabled { opacity: 1; }
+.tl-side { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.tl-side[hidden] { display: none; }
+.timeline .tl-side button { border-radius: 0; font-weight: 400; font-size: 12px; }
+.timeline .tl-side button[aria-pressed="true"] { background: var(--primary-soft); color: var(--primary); }
+.timeline .tl-follow { border: 1px solid var(--border); border-radius: 14px; font-weight: 400; }
+.timeline .tl-follow[aria-pressed="true"] { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+
+.replay-badge {
+  position: fixed;
+  left: 12px;
+  top: 64px;
+  z-index: 12;
+  padding: 4px 10px;
+  border: 1px solid var(--orange);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: var(--shadow-bar);
+  max-width: calc(100vw - 24px);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.replay-badge[hidden] { display: none; }
+
+.panel .chg-row { display: flex; align-items: baseline; gap: 8px; }
+.panel .chg-tag {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  color: #fff;
+  background: var(--primary);
+}
+.panel .chg-tag.added { background: var(--green); }
+.panel .chg-tag.removed { background: var(--red); }
+.panel .chg-tag.read { background: var(--blue); }
+.panel .diff-file { margin: 8px 0 2px; font: 12px var(--mono); }
+.panel .diff-file span { color: var(--muted); }
+.panel .diff pre {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 340px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  font: 11px/1.45 var(--mono);
+}
+.panel .diff .add { display: block; background: color-mix(in srgb, var(--green) 16%, transparent); }
+.panel .diff .del { display: block; background: color-mix(in srgb, var(--red) 14%, transparent); }
+.panel .diff .hunk { display: block; color: var(--primary); }
+.panel .diff .meta { display: block; color: var(--faint); }
+
 @media (max-width: 900px) {
-  .brand span { display: none; }
   .search input { width: 160px; }
   .panel { width: auto; left: 12px; top: auto; height: 45vh; }
   .panel:not([hidden]) ~ .zoom { right: 12px; bottom: calc(45vh + 24px); }
+  body.with-timeline .panel { bottom: 62px; }
+  body.with-timeline .panel:not([hidden]) ~ .zoom { bottom: calc(45vh + 74px); }
+}
+
+/* a VS Code side bar: one column - the crumbs get a row of their own above
+   search and the toggles, and the rest of the chrome folds away */
+@media (max-width: 560px) {
+  .brand, .crumbs .lvl, .spacer, .legend, #layout-reset { display: none; }
+  .bar { height: 84px; flex-wrap: wrap; align-content: center; gap: 4px 6px; padding: 4px 8px; }
+  .crumbs { flex: 1 1 100%; order: -1; }
+  .crumbs button { max-width: 150px; padding: 3px 5px; }
+  .search { flex: 1 1 0; min-width: 0; }
+  .search input { width: 100%; height: 30px; }
+  .search svg { top: 8px; }
+  .tools .chip { padding: 0 6px; font-size: 11px; }
+  .viewport { top: 84px; }
+  .panel, .note-bar, .replay-badge { top: 94px; }
+  .timeline { flex-wrap: wrap; left: 6px; right: 6px; bottom: 6px; }
+  .tl-track { order: 5; flex-basis: 100%; }
+  .timeline .tl-step { flex: 1 1 0; max-width: none; }
+  .timeline .tl-ask { max-width: 12ch; }
+  body.with-timeline .zoom, body.with-timeline .panel { bottom: 88px; }
+  .panel { left: 6px; right: 6px; }
 }

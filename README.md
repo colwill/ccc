@@ -2,22 +2,35 @@
 
 [![Release Collateral Code Check](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml/badge.svg)](https://github.com/colwill/ccc/actions/workflows/ccc-release.yaml)
 
+<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="visual.png" alt="Collateral Code Check Visualiser Example"></a></p>
 
 # Collateral Code Check (`ccc`)
 
-Collateral Code Check tells you, and your AI agent, what a change touches before you commit it - the functions, tests, services and cross-service contracts it reaches - by:
+What is becoming obvious is that understanding the changes being made by LLMs/Agents to projects is an increasingly complex problem. 
 
-  - highlighting which tests will be ran with your changes
+`ccc` reduces that problem by providing tools to understand code, visualise changes for humans and allow LLMs/Agents to make the changes they need to with significant oversight by the human in charge.
+
+## So what is ccc?
+
+Collateral Code Check - (collateral as-in collateral damage) shows everything a change touches (before you commit it!) visually in your IDE, in your pipeline or anywhere else you need to see it. This includes; functions, tests, services and cross-service contracts it reaches.
+
+It does this by:
+
+  - Highlighting what pipeline tests run with your changes
   
-  - showing if your change violates language linting rules
+  - Showing if your change violates language linting rules
 
-  - showing when you create or modify cross-service calls before you commit
+  - Showing new or modified cross-service calls before you commit
 
-  - providing language models with accurate real-time insights into your changes
+  - Provides agents/models with accurate real-time insights
 
-  - triggering specific testing tools based on your changes
+  - Provides agents/models with restricted edit controls (no sed, sudo etc)
 
-  - making your agent's changes for it - a project-wide rename, a dead-code delete, a new function beside an old one - as one confined, previewed, revertible call that costs a fraction of the tokens read-then-edit does with an extra layer of safety ([how much](#edits-go-through-ccc))
+  - Visualise changes from agents/models before they are applied with the visualiser. 
+
+Additionally, benefits for heavy agent/model usage are:
+ 
+- Project-wide rename, dead-code delete, new functions beside an old one are a single confined, previewed and revertible atomic call that costs a fraction of the tokens read-then-edit does with an extra layer of safety ([more info](#edits-go-through-ccc))
 
 **ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and builds the **ccc** code map in memory. 
 This is a human and machine readable map of the source tree including every source file; its
@@ -149,8 +162,7 @@ ccc insights --html page.html         # output format is html, as a single page 
 
 `ccc run --vis` serves a 2D map of the project at `http://127.0.0.1:6767/vis` and opens it in your
 browser. It follows the C4 model from the whole system down to the code, then goes one level
-further: the logic of a single function, drawn as a node graph in the style of Unreal Engine
-Blueprints.
+further: the logic of a single function, drawn as a node graph.
 
 | level | boxes | arrows |
 |---|---|---|
@@ -170,6 +182,23 @@ languages are drawn the same way. Like the rest of ccc it reads syntax, not beha
 is a call the resolver found evidence for, and a branch is a node in the syntax tree, not a path
 anything was seen to take. Calls that reach nothing in the project (the standard library, a
 dependency) are folded into grey pills, and the toolbar can show them in full or hide them.
+
+Along the foot of the page runs the timeline of what agents did through ccc - the same in a browser
+as in the editor:
+
+- **A definition at a time.** An edit is split into the definitions it touches - imports first,
+  then what it adds, then what it changes, then what it removes - so a replay builds the change up
+  one function, type or constant at a time, in the order the agent staged it.
+- **Looks too.** `find`, `references`, `file` and `dependencies` calls land as looks at what they
+  named, so you can see what an agent read before it wrote anything.
+- **At your pace.** Live keeps the time between steps as it was; ½×, ¼×, ⅛× and ⅒× stretch it, and
+  following runs behind by however many steps are still waiting.
+- **One step on its own.** While a step is on show (◎), what it did not touch fades back, and a big
+  scene draws only what is wired to it, laid out together to fit the screen. Click the canvas to
+  bring the rest back.
+
+Every ccc server on a project shares its steps through `.ccc/timeline.jsonl` (kept out of git), so
+the visualiser shows an agent's work whichever server the agent talks to.
 
 The data behind the page is plain JSON, with or without `--vis`:
 

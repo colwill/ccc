@@ -43,6 +43,25 @@ export async function publishMcpConfig(
   }
 }
 
+// The port agents were last told for this folder, when it is on `host`. Agents
+// keep the address they were given when their session began, so a restarted
+// analyser asks for this one again rather than strand them.
+export async function publishedPort(folder: vscode.Uri, host: string): Promise<number | undefined> {
+  // the address claude code was given - copilot's file says the same
+  const doc = await readJson(path.join(folder.fsPath, '.mcp.json')).catch(() => undefined);
+  if (doc === undefined || doc === MALFORMED) return undefined;
+  const entry = asRecord(asRecord(doc['mcpServers'])?.[SERVER_KEY]);
+  const url = entry?.['url'];
+  if (typeof url !== 'string') return undefined;
+  try {
+    const parsed = new URL(url);
+    const port = Number.parseInt(parsed.port, 10);
+    return parsed.hostname === host && port > 0 ? port : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // returns true when the file was rewritten, false when it already said the right thing
 async function writeOne(file: string, target: Target, url: string): Promise<boolean> {
   const existing = await readJson(file);

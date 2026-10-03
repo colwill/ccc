@@ -51,4 +51,6 @@ What every write is held to:
   `file://` report) can read the map but never write through it.
 - **Attributed.** Each applied changeset is appended to `.ccc/edits.jsonl`, which is kept out of git. `ccc prompts`
   reads it to credit a ccc edit to the request behind it, as strongly as it credits an `Edit` or `Write`.
+- **Shared.** Every step - staged, applied, reverted, and each look a read tool took - is appended to
+  `.ccc/timeline.jsonl`, also kept out of git, so the visualiser of any ccc server on the project shows it.
 
