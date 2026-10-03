@@ -17,6 +17,8 @@ CodeCaChe tells you, and your AI agent, what a change touches before you commit 
 
   - triggering specific testing tools based on your changes
 
+  - making your agent's changes for it - a project-wide rename, a dead-code delete, a new function beside an old one - as one confined, previewed, revertible call that costs a fraction of the tokens read-then-edit does with an extra layer of safety ([how much](#edits-go-through-ccc))
+
 **ccc** stands on the shoulders of [Tree-Sitter](https://github.com/tree-sitter/tree-sitter). It scans a project and generates the **CodeCaChe** in memory. 
 This is a human and machine readable map of the source tree including every source file; its
 constants, functions (with return types and doc summaries), intra-file call
@@ -27,11 +29,42 @@ It is designed to give engineers a always-fresh index of a project, the latest c
 Supports: `C99`, `C++ (20 except modules)`, `C#`, `Rust`, `Go`, `Python`, `Zig`, `Odin`, `TypeScript`, `Protobuf`
 & `JavaScript` - see [`LANGUAGES.md`](docs/LANGUAGES.md) for what each one resolves.
 
+## Edits go through ccc
+
+Agents don't only read the map - they change the code through it. A `find` or `references` answer ends with a
+handle, and the `edit_*` MCP tools take that handle. One call renames a symbol across the project, deletes a dead
+function, or adds code beside a definition. The agent never opens each file or edits it line by line.
+
+- **One call per change, not one per site.** `edit_rename` follows a name through every file the map ties to it,
+  including lines the map does not index, such as a `ccc:skip` body. It lists every same-named identifier it left
+  alone, with the reason, so nothing changes silently.
+- **Safe by construction.** Every write stays inside the project root: no `..`, no symlinks, never `.git`. Each
+  change is staged and shown as a diff first. On apply, every file is checked against what it held when staged,
+  and then every file is written or none is. The map is rescanned before the call returns, and `edit_revert`
+  takes the change back.
+- **ccc is the only writer.** The MCP server tells agents to make every change through these tools, never through
+  their own Edit/Write tools or `sed -i`. That way every change is confined, previewed and revertible, and
+  [`ccc prompts`](docs/MCP.md#editing) credits it to the request that asked for it.
+
+Napkin math. Assumptions: 300-line source files at ~12 tokens a line, and an agent that must read a file before it
+edits it, as Claude Code does.
+
+| Task | Agent's own tools | Through ccc | Saving |
+|---|---|---|---|
+| Rename a function used at 20 sites in 8 files | grep + 8 reads + 20 edits ≈ 33k tokens, 29 calls | `references` + `edit_rename` + `edit_apply` ≈ 2.3k tokens, 3 calls | ~14x tokens, ~10x calls |
+| Delete a dead 50-line function | grep + read + edit ≈ 4.4k tokens, 3 calls | `references` + `edit_delete` ≈ 1k tokens, 2 calls | ~4x tokens |
+| Add a 25-line function beside an existing one | grep + read + edit ≈ 4.2k tokens, 3 calls | `find` + `edit_insert` ≈ 0.9k tokens, 2 calls | ~4.5x tokens |
+| Change a few lines inside one function | read + edit | read + `edit_text` | about even |
+
+Every call saved is also a model turn saved, and each turn re-reads the whole conversation. On a 60k-token
+session, the rename's 26 fewer turns skip roughly 1.5M cached input tokens and 26 round trips of latency.
+
 ## Table of content
 
 <details>
 <summary>Expand contents</summary>
 
+- [Edits go through ccc](#edits-go-through-ccc)
 - [Quick-Start](#quick-start)
 - [Usage](#usage)
 - [Insights](#insights)
@@ -196,15 +229,16 @@ as the entry point for everything you do here.
 
 - no bash, grep or sed usage for exploring the project
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
-- All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, file, notes, changes, test_triggers, test_targets, lints, hot, services refresh)
-- When I ask to *see* the analysis, call `insights` - it opens the insights UI in my browser (needs `ccc serve --html`)
-- Make code changes in the source, never to the in-memory map.
-- After changing tracked source call the `ccc` tool with `refresh` to ensure you have the latest changes in-memory.
+- All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, vulnerabilities, deps, security, file, notes, changes, prompts, pr_summary, test_triggers, test_targets, lints, hot, services, refresh)
+- When I ask to *see* the analysis, call `insights` - it opens the insights UI in my browser (off under `ccc run --no-html`)
+- ccc is the only writer: make every change through its edit tools - `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` or `edit_text`, then `edit_apply` - never your own Edit/Write tools, `sed -i` or shell redirection.
+- `edit_apply` rescans the map before it answers; call `refresh` only after a change made outside ccc.
 
 ```
 
-Because the agent loads `AGENTS.md` at the start of a session, this wires the
-code map into every interaction: reasoning and answers come from `ccc`'s map, whilst edits still apply to the source and trigger a refresh.
+Because the agent loads `AGENTS.md` at the start of a session, this wires the code map into every interaction:
+reasoning and answers come from `ccc`'s map, and every change goes back through `ccc`, so it stays inside the
+project, is previewed before it is written, and can be reverted.
 
 ## Testing
 

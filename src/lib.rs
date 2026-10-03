@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod coverage;
 pub mod deps;
+pub mod edit;
 pub mod extract;
 pub mod externals;
 pub mod html;

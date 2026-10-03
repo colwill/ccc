@@ -2,7 +2,7 @@
   "name": "ccc-codecache",
   "displayName": "CodeCaChe (ccc)",
   "description": "Test-coverage, untested-changes and cross-service hints from the ccc static analyser, inline in your editor.",
-  "version": "1.4.4",
+  "version": "1.6.0",
   "publisher": "colwill",
   "license": "MIT",
   "icon": "media/icon.png",

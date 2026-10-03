@@ -13,7 +13,12 @@ to pick the new one up.
 - bash/grep shouldn't be used for understanding the project
     - IF `ccc` tool calls are unable to find a term your are searching for; stop the session and respond with `CCC: unable to find <term> in ccc using calls: [calls]`
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
-- All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, vulnerabilities, security, file, notes, changes, test_triggers, test_targets, lints, hot, services refresh)
+- All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, vulnerabilities, deps, security, file, notes, changes, prompts, pr_summary, test_triggers, test_targets, lints, hot, services, refresh)
 - When I ask to *see* the analysis, call `insights` - it opens the insights UI in my browser
-- Make code changes in the source, never to the in-memory map.
-- After changing tracked source call the `ccc` tool with `refresh` to ensure you have the latest changes in-memory.
+- ccc is the only writer in this project. Every change goes through its edit tools, never through your own
+  Edit/Write/MultiEdit/NotebookEdit tools, `sed -i`, or shell redirection:
+    - a symbol: take the handle a `find` / `references` answer ends with and pass it to `edit_rename`,
+      `edit_replace`, `edit_delete` or `edit_insert`
+    - anything else (lines inside a function, docs, config, a new or removed file): `edit_text`
+    - read the staged diff, then `edit_apply`; `edit_discard` drops a changeset, `edit_revert` undoes an applied one
+- `edit_apply` rescans the map before it answers; call `refresh` only after a change made outside ccc.
