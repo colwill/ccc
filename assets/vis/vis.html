@@ -37,8 +37,11 @@
       </defs>
       <g id="wire-layer"></g>
     </svg>
+    <svg class="wires lit" id="lit-wires" xmlns="http://www.w3.org/2000/svg"></svg>
     <div class="labels" id="labels"></div>
     <div id="nodes"></div>
+    <div class="groups" id="groups"></div>
+    <svg class="wires group-wires" id="group-wires" xmlns="http://www.w3.org/2000/svg"></svg>
   </div>
 </main>
 
@@ -58,12 +61,16 @@
   <button id="layout-reset" title="Forget dragged positions in this view">Re-layout</button>
 </div>
 <div class="legend" id="legend"></div>
-<div class="note-bar" id="note" hidden></div>
+<!-- what the view is, and under it what a proposed or replayed step on show is, centred at the top -->
+<div class="top-notes">
+  <div class="note-bar" id="note" hidden></div>
+  <div class="replay-badge" id="replay-badge" hidden></div>
+</div>
 <div class="message" id="message" hidden></div>
-<div class="replay-badge" id="replay-badge" hidden></div>
 
 <section class="timeline" id="timeline" aria-label="edit timeline" hidden>
-  <div class="tl-controls">
+  <button class="tl-unfold" id="tl-unfold" title="Show the step controls" aria-label="show the step controls" aria-expanded="false" hidden>»</button>
+  <div class="tl-controls" id="tl-controls">
     <button id="tl-prev" title="Previous step (,)" aria-label="previous step">‹</button>
     <button id="tl-play" title="Replay the steps from here" aria-label="replay">▶</button>
     <button id="tl-next" title="Next step (.)" aria-label="next step">›</button>
@@ -76,9 +83,9 @@
     <button data-side="after" title="The code as this step left it">after</button>
   </div>
   <button class="tl-speed" id="tl-speed" title="Replay speed - Live keeps the time between steps as it was, slower stretches it (shift-click goes back up)" aria-label="replay speed">Live</button>
-  <button class="tl-focus" id="tl-focus" title="See each step on its own - what it did not touch fades back, and a big scene keeps only what is wired to it" aria-label="see each step on its own" aria-pressed="true">◎</button>
+  <button class="tl-focus" id="tl-focus" title="Granular Changes - each step seen on its own: what it did not touch fades back, and a big scene keeps only what is wired to it" aria-label="granular changes" aria-pressed="true">◎</button>
   <button class="tl-ws" id="tl-ws" title="Show whitespace changes - steps that only move whitespace or wrap lines" aria-label="show whitespace changes" aria-pressed="false">¶</button>
-  <button class="tl-follow" id="tl-follow" title="Follow each edit as it lands (L)" aria-pressed="true">Following</button>
+  <button class="tl-follow" id="tl-follow" role="switch" aria-checked="true" title="Follow live changes - each edit shown as it lands (L)"><span class="switch" aria-hidden="true"></span><span>Follow<span class="tl-follow-more"> live changes</span></span><span id="tl-behind"></span></button>
 </section>
 
 <script>/*__CCC_VIS_JS__*/</script>

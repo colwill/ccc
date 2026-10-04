@@ -133,7 +133,7 @@
       const timer = setTimeout(() => {
         waiting.delete(id);
         reject(new Error('the extension did not answer'));
-      }, 30000);
+      }, 65000);
       waiting.set(id, m => {
         clearTimeout(timer);
         resolve(m);
@@ -270,8 +270,12 @@
     }
   }
 
-  // the live map at the route in the address - any replay ends here
-  async function render(keepView) {
+  // a level that timed out, rather than one that could not be drawn
+  const busy = e => /did not answer|timed out/.test(e.message || '');
+
+  // the live map at the route in the address - any replay ends here; a level
+  // the analyser was too busy to answer for is asked for once more
+  async function render(keepView, again) {
     const seq = ++renderSeq;
     endReplay();
     const route = parseRoute();
@@ -303,6 +307,11 @@
     } catch (e) {
       if (seq !== renderSeq) return;
       clearCanvas();
+      if (!again && busy(e)) {
+        showMessage('Still drawing this level', 'the analyser is busy - asking again');
+        setTimeout(() => seq === renderSeq && render(keepView, true), 1500);
+        return;
+      }
       showMessage('Could not draw this level', e.message);
     }
     crumbs();
@@ -353,7 +362,7 @@
       gap.style.visibility = 'hidden';
       return gap;
     }
-    const e = h('div', `pin ${side} ${p.data ? 'data' : p.more ? 'more' : 'exec'}`);
+    const e = h('div', `pin ${side} ${p.data ? 'data' : p.more ? 'more' : 'exec'}${p.ret ? ' ret' : ''}`);
     if (p.pin) e.dataset.pin = p.pin;
     if (p.colour) e.style.setProperty('--pin', p.colour);
     if (p.title) e.title = p.title;
@@ -361,8 +370,12 @@
     return e;
   }
 
+  // the pin for what a function returns
+  const returnsPin = (type, pin) => ({ ret: true, data: true, label: 'Returns ' + type, title: 'returns ' + type, colour: typeColour(type), pin });
+
   // a node in the blueprint style: a header in the node's colour, then rows of
-  // input pins on the left and output pins on the right
+  // input pins on the left and output pins on the right - what it returns
+  // last, ruled off from the rest
   function bp({ accent, k, t, q, badges, ins, outs, body, cls }) {
     const n = h('div', 'node bp' + (cls ? ' ' + cls : ''));
     n.style.setProperty('--accent', accent || 'var(--grey)');
@@ -379,8 +392,13 @@
     if (body) n.append(h('div', 'body', body));
     const rows = h('div', 'rows');
     const left = ins || [];
-    const right = outs || [];
+    const right = (outs || []).filter(p => !p.ret);
+    const returns = (outs || []).filter(p => p.ret);
     for (let i = 0; i < Math.max(left.length, right.length); i++) rows.append(pinEl(left[i], 'in'), pinEl(right[i], 'out'));
+    if (returns.length) {
+      rows.append(h('div', 'sep'));
+      for (const p of returns) rows.append(pinEl(null, 'in'), pinEl(p, 'out'));
+    }
     n.append(rows);
     return n;
   }
@@ -660,7 +678,7 @@
         return { pin: 'c' + c.to, label: target ? target.name : '?', title: `line ${c.line}` };
       });
       if (f.calls_total > calls.length) outs.push({ more: true, label: `+${f.calls_total - calls.length} more` });
-      if (f.ret) outs.push({ data: true, label: f.ret, colour: typeColour(f.ret), pin: 'ret' });
+      if (f.ret) outs.push(returnsPin(f.ret, 'ret'));
       const badges = [];
       if (f.entry && !f.module && !f.test) badges.push(badge('mode entry', 'entry', 'nothing else in the map calls it'));
       if (f.recursive) badges.push(badge('mode', '↻', 'calls itself'));
@@ -737,8 +755,15 @@
     const f = d.function;
     const nodes = [];
     let seq = 0;
+    // a step is known again in the next drawing by what it is, not where it
+    // falls - its kind and words, and which of the same it is
+    const seen = new Map();
     const add = (el, kind, data, drill) => {
-      const n = { id: 'n' + seq++, kind, data, el, drill };
+      const what = data ? `${data.qual ? data.qual + '.' : ''}${data.name || data.label || data.kind || ''}` : '';
+      const base = `${kind}:${what}`;
+      const k = seen.get(base) || 0;
+      seen.set(base, k + 1);
+      const n = { id: 'n' + seq++, mkey: `${base}#${k}`, kind, data, el, drill };
       nodes.push(n);
       return n;
     };
@@ -753,7 +778,7 @@
         q: `${f.file}:${f.line}`,
         badges: entryBadges,
         body: d.callers_total ? `called by ${d.callers.slice(0, 3).map(c => c.name).join(', ')}${d.callers_total > 3 ? ` +${d.callers_total - 3}` : ''}` : f.module ? null : 'nothing in the map calls it',
-        outs: [{ pin: 'out', label: 'then' }, ...d.params.map((p, i) => ({ pin: 'p' + i, data: true, label: p, colour: typeColour(p.split(/[:\s]/).pop()) }))].concat(f.ret ? [{ data: true, label: '→ ' + f.ret, colour: typeColour(f.ret) }] : []),
+        outs: [{ pin: 'out', label: 'then' }, ...d.params.map((p, i) => ({ pin: 'p' + i, data: true, label: p, colour: typeColour(p.split(/[:\s]/).pop()) }))].concat(f.ret ? [returnsPin(f.ret)] : []),
       }),
       'entry',
       { ...d, step: null }
@@ -838,7 +863,7 @@
     }
 
     const tree = blocks(d.steps);
-    const end = add(bp({ cls: 'terminal', accent: 'var(--faint)', k: 'end', t: f.ret ? 'Falls off the end' : 'End', ins: [{ pin: 'in', label: '' }] }), 'end', { t: 'end' });
+    const end = add(bp({ cls: 'terminal', accent: 'var(--faint)', k: 'end', t: 'End of scope', ins: [{ pin: 'in', label: '' }] }), 'end', { t: 'end' });
     return {
       key: 'flow',
       kind: 'bp',
@@ -1024,6 +1049,401 @@
     return result;
   }
 
+  // ------------------------------------------------------------- groups
+
+  // a group of this many nodes or more splits into the groups within it,
+  // and a scene this big reads, zoomed out, as its groups
+  const GROUP_MIN = 50;
+  // zoomed out to this a group's nodes fold away into its card, and back in
+  // to this they return - a gap between, so it never flickers
+  const GROUP_HIDE = 0.4;
+  const GROUP_SHOW = 0.5;
+  // a group that holds groups opens into them once it covers this much of
+  // the screen, and folds again below this - and one opened by a click stays
+  // open until zoomed back out past where it fit
+  const OPEN_AT = 0.75;
+  const FOLD_AT = 0.6;
+  const HOLD_AT = 0.85;
+  // directories with fewer components than this, side by side, are one group
+  const GROUP_SMALL = 5;
+  // functions to a run of a file, about, when nothing else groups them
+  const FN_RUN = 30;
+  // room round a group's nodes for its outline - its title along the top
+  const GROUP_PAD = { left: 28, top: 40, right: 28, bottom: 28 };
+  const MARKS = ['added', 'removed', 'modified', 'inspect'];
+  // the shape groups are packed into, about the screen's
+  const SHELF_ASPECT = 1.6;
+  // a bundle of wires is counted from this many calls
+  const BUNDLE_COUNTED = 5;
+
+  // The groups a big scene's nodes fall into, each the context they share -
+  // a container's components by directory, a directory with too many in it
+  // split into the directories within it; a file's functions by the type
+  // that owns them - each before the groups within it. None for a scene
+  // small enough to read whole.
+  function groupScene(scene) {
+    const comps = scene.nodes.filter(n => n.kind === 'component');
+    const fns = scene.nodes.filter(n => n.kind === 'function');
+    let root;
+    let unit;
+    if (comps.length >= GROUP_MIN) [root, unit] = [dirTree(comps), 'component'];
+    else if (fns.length >= GROUP_MIN) {
+      const owner = n => (n.data.test ? 'tests' : n.data.module ? 'top level' : n.data.owner || 'free functions');
+      const by = new Map();
+      for (const n of fns) by.set(owner(n), [...(by.get(owner(n)) || []), n.id]);
+      const children = [...by].sort((a, b) => a[0].localeCompare(b[0])).map(([key, members]) => ({ key, title: key, path: '', members, children: [] }));
+      // A group of many with nothing more to tell them apart - a script's free
+      // functions - splits into runs of the file, a few dozen at a time, each
+      // called by the functions it runs from and to.
+      const fn = new Map(fns.map(n => [n.id, n]));
+      for (const c of children) {
+        if (c.members.length < GROUP_MIN) continue;
+        const inOrder = c.members.map(id => fn.get(id)).sort((a, b) => a.data.line - b.data.line);
+        const size = Math.ceil(inOrder.length / Math.ceil(inOrder.length / FN_RUN));
+        for (let at = 0; at < inOrder.length; at += size) {
+          const run = inOrder.slice(at, at + size);
+          const [a, b] = [run[0].data, run[run.length - 1].data];
+          c.children.push({ key: `${c.key} ${a.line}`, title: `${a.name} … ${b.name}`, path: `lines ${a.line}–${b.end || b.line}`, members: run.map(n => n.id), children: [] });
+        }
+      }
+      [root, unit] = [{ key: 'functions', title: 'functions', path: '', members: fns.map(n => n.id), children }, 'function'];
+    } else return null;
+    // the whole scene one card only when nothing splits it
+    const tops = root.children.length ? root.children : [root];
+    const all = [];
+    const chains = new Map();
+    const walk = (c, up) => {
+      Object.assign(c, { i: all.length, parent: up[up.length - 1] || null, unit });
+      all.push(c);
+      const chain = [...up, c];
+      if (!c.children.length) for (const id of c.members) chains.set(id, chain);
+      for (const k of c.children) walk(k, chain);
+    };
+    for (const t of tops) walk(t, []);
+    scene.tops = tops;
+    scene.chains = chains;
+    return all;
+  }
+
+  // A container's components as a tree of their directories: one that holds
+  // only one directory is passed through, and one with too many components
+  // splits into the directories in it - its own files a group of their own.
+  function dirTree(nodes) {
+    const segs = new Map(nodes.map(n => [n.id, (n.data.dir || '').split('/').filter(Boolean)]));
+    const named = key => {
+      const cut = key.lastIndexOf('/');
+      return { title: key.slice(cut + 1) || key, path: cut > 0 ? key.slice(0, cut + 1) : '' };
+    };
+    // `name` - the directory that sets the group apart from the ones beside
+    // it, which it is called by, however deep its own files sit below it
+    const build = (items, depth, name) => {
+      let d = depth;
+      while (items.every(n => segs.get(n.id).length > d) && new Set(items.map(n => segs.get(n.id)[d])).size === 1) d++;
+      const key = segs.get(items[0].id).slice(0, d).join('/') || '.';
+      const c = { key, ...named(key), members: items.map(n => n.id), children: [] };
+      if (name && name !== c.title) Object.assign(c, { title: name, path: key });
+      if (items.length < GROUP_MIN) return c;
+      const by = new Map();
+      for (const n of items) {
+        const s = segs.get(n.id)[d] ?? '';
+        if (!by.has(s)) by.set(s, []);
+        by.get(s).push(n);
+      }
+      if (by.size < 2) return c;
+      const subs = [...by].sort((a, b) => a[0].localeCompare(b[0]));
+      // a run of little directories reads better as one group than as a card each
+      const small = subs.filter(([s, sub]) => s && sub.length < GROUP_SMALL);
+      const merged = small.length >= 2 ? new Set(small.map(([s]) => s)) : new Set();
+      for (const [s, sub] of subs) {
+        if (merged.has(s)) continue;
+        c.children.push(s ? build(sub, d + 1, s) : { key: key + '/', title: c.title + ' files', path: key + '/', members: sub.map(n => n.id), children: [] });
+      }
+      if (merged.size) {
+        const members = small.flatMap(([, sub]) => sub.map(n => n.id));
+        c.children.push({ key: key + '/…', title: `${merged.size} smaller directories`, path: key + '/', members, children: [] });
+      }
+      return c;
+    };
+    return build(nodes, 0);
+  }
+
+  // a group and the groups it is in, outermost first
+  function chainOf(g) {
+    const out = [];
+    for (let x = g; x; x = x.parent) out.unshift(x);
+    return out;
+  }
+
+  // the classes a node or wire takes from the groups it is in - see `regroup`
+  const groupClasses = (scene, id) => ((scene.chains && scene.chains.get(id)) || []).map(g => 'cg-' + g.i);
+
+  // is a node out of sight in a folded group
+  const hiddenByGroup = id => !!S.collapsed && ((S.scene.chains && S.scene.chains.get(id)) || []).some(g => S.collapsed.has(g.i));
+
+  // A big scene laid out a group at a time: each group's nodes together, the
+  // groups in a group laid out as nodes of their own, and so on up - so each
+  // group holds a region of its own, which folded is one overview card.
+  function layeredGroups(scene) {
+    const byId = new Map(scene.nodes.map(n => [n.id, n]));
+    const opts = { gapX: scene.gapX, gapY: scene.gapY, order: scene.order, maxCol: 8 };
+    const padW = GROUP_PAD.left + GROUP_PAD.right;
+    const padH = GROUP_PAD.top + GROUP_PAD.bottom;
+    // Parts packed in rows, the biggest first, into a block the shape of the
+    // screen - the calls between groups are their bundled wires, so where a
+    // group sits needs to follow them less than it needs to be found - and
+    // where each part's own nodes then sit.
+    const arrange = (parts, gap) => {
+      const size = p => (p.k ? p.k.members.length : 0);
+      const sorted = [...parts].sort((a, b) => size(b) - size(a) || b.h - a.h || String(a.k ? a.k.key : a.id).localeCompare(String(b.k ? b.k.key : b.id)));
+      const area = parts.reduce((a, p) => a + (p.w + gap) * (p.h + gap), 0);
+      const row = Math.max(...parts.map(p => p.w), Math.sqrt(area * SHELF_ASPECT));
+      const where = new Map();
+      let [x, y, tall] = [0, 0, 0];
+      for (const p of sorted) {
+        if (x > 0 && x + p.w > row) [x, y, tall] = [0, y + tall + gap, 0];
+        where.set(p.id, { x, y });
+        x += p.w + gap;
+        tall = Math.max(tall, p.h);
+      }
+      const pos = new Map();
+      let w = 0;
+      let h = 0;
+      for (const p of parts) {
+        const o = where.get(p.id) || { x: 0, y: 0 };
+        if (p.k) for (const [id, q] of p.pos) pos.set(id, { x: o.x + q.x, y: o.y + q.y });
+        else pos.set(p.id, o);
+        w = Math.max(w, o.x + p.w);
+        h = Math.max(h, o.y + p.h);
+      }
+      return { pos, w, h };
+    };
+    // one group laid out: where each of its nodes sits within its box, and the box's size
+    const lay = c => {
+      let inner;
+      if (c.children.length) inner = arrange(c.children.map(k => ({ id: 'g:' + k.i, k, ...lay(k) })), 50);
+      else {
+        const members = c.members.map(id => byId.get(id)).filter(Boolean);
+        const ids = new Set(c.members);
+        const at = layered(members, scene.edges.filter(e => ids.has(e.from) && ids.has(e.to)), opts);
+        inner = { pos: new Map(), w: 0, h: 0 };
+        for (const n of members) {
+          const p = at.get(n.id) || { x: 0, y: 0 };
+          inner.pos.set(n.id, p);
+          inner.w = Math.max(inner.w, p.x + n.w);
+          inner.h = Math.max(inner.h, p.y + n.h);
+        }
+      }
+      const pos = new Map();
+      for (const [id, q] of inner.pos) pos.set(id, { x: GROUP_PAD.left + q.x, y: GROUP_PAD.top + q.y });
+      return { pos, w: inner.w + padW, h: inner.h + padH };
+    };
+    const parts = scene.tops.map(t => ({ id: 'g:' + t.i, k: t, ...lay(t) }));
+    const grouped = new Set(scene.tops.flatMap(t => t.members));
+    for (const n of scene.nodes) if (!grouped.has(n.id)) parts.push(n);
+    return arrange(parts, 90).pos;
+  }
+
+  // a group's box: round its nodes, or round the boxes of the groups in it,
+  // with room for its outline - worked out afresh, so it follows a dragged node
+  function clusterBox(c) {
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+    const take = (a, b, c2, d) => ([x0, y0, x1, y1] = [Math.min(x0, a), Math.min(y0, b), Math.max(x1, c2), Math.max(y1, d)]);
+    if (c.children.length) {
+      for (const k of c.children) {
+        const b = clusterBox(k);
+        if (b) take(b.x, b.y, b.x + b.w, b.y + b.h);
+      }
+    } else {
+      for (const id of c.members) {
+        const n = S.byId.get(id);
+        if (n) take(n.x, n.y, n.x + n.w, n.y + n.h);
+      }
+    }
+    c.box = x0 === Infinity ? null : { x: x0 - GROUP_PAD.left, y: y0 - GROUP_PAD.top, w: x1 - x0 + GROUP_PAD.left + GROUP_PAD.right, h: y1 - y0 + GROUP_PAD.top + GROUP_PAD.bottom };
+    return c.box;
+  }
+
+  // a group as one line: how much is in it
+  function groupSummary(g) {
+    const ms = g.members.map(id => S.byId.get(id)).filter(Boolean);
+    const within = g.children.length ? ` in ${plural(g.children.length, 'group')}` : '';
+    if (g.unit === 'component') {
+      const lines = ms.reduce((a, n) => a + (n.data.lines || 0), 0);
+      const langs = [...new Set(ms.map(n => langName(n.data.language)))].slice(0, 3).join(', ');
+      return `${plural(ms.length, 'component')}${within} · ${plural(lines, 'line')}${langs ? ' · ' + langs : ''}`;
+    }
+    const entries = ms.filter(n => n.data.entry).length;
+    return plural(ms.length, 'function') + within + (entries ? ` · ${plural(entries, 'entry point')}` : '');
+  }
+
+  // the rules that fold groups away, written as the zoom changes
+  function groupStyle() {
+    let el = document.getElementById('group-style');
+    if (!el) {
+      el = document.createElement('style');
+      el.id = 'group-style';
+      document.head.append(el);
+    }
+    return el;
+  }
+
+  // Which groups are folded at this zoom: one with nodes of its own, until
+  // zoomed in far enough to read them; one holding groups, until zoomed in
+  // near to where it alone would fill the screen. A folded group's nodes,
+  // wires and inner groups go, and its card shows - by a rule each, so
+  // folding a group of hundreds touches one style.
+  function regroup() {
+    const sc = S.scene;
+    if (!sc || !sc.groups) return;
+    const vp = $('viewport');
+    const z = S.zoom;
+    // the first look starts from everything folded
+    const was = S.collapsed || new Set(sc.groups.map(g => g.i));
+    const now = new Set();
+    const [vw, vh] = [vp.clientWidth, vp.clientHeight];
+    // the zoom the whole scene fits at - nothing opens by zoom until past it, so
+    // the scene fitted reads as its top groups however big a share one takes
+    if (S.sceneFit == null) {
+      const b = bounds();
+      S.sceneFit = clamp(Math.min((vw - 96) / b.w, (vh - 150) / b.h), minZoom(), 1.15);
+    }
+    const past = z > S.sceneFit * 1.15;
+    const visit = c => {
+      const folded = was.has(c.i);
+      let open = z >= (folded ? GROUP_SHOW : GROUP_HIDE);
+      if (!open && c.children.length && c.box) {
+        // how much of the screen it would take, wherever it is panned to
+        const cover = (Math.min(c.box.w * z, vw) * Math.min(c.box.h * z, vh)) / (vw * vh);
+        const fit = Math.min((vw - 96) / c.box.w, (vh - 150) / c.box.h);
+        open = (past && cover >= (folded ? OPEN_AT : FOLD_AT)) || (S.opened.has(c.i) && z >= fit * HOLD_AT);
+      }
+      if (open) return c.children.forEach(visit);
+      now.add(c.i);
+      S.opened.delete(c.i);
+    };
+    sc.tops.forEach(visit);
+    const same = !!S.collapsed && now.size === S.collapsed.size && [...now].every(i => S.collapsed.has(i));
+    S.collapsed = now;
+    if (!same) {
+      groupStyle().textContent = [...now].map(i => `.cg-${i}, .gframe-${i} { display: none !important; } .gcard-${i} { display: flex !important; }`).join('\n');
+      for (const g of sc.groups) if (now.has(g.i) && g.el && g.box) placeCard(g);
+    }
+    if (!same || (now.size && z !== S.groupZoom)) drawGroupWires();
+  }
+
+  function placeCard(g) {
+    Object.assign(g.el.style, { left: g.box.x + 'px', top: g.box.y + 'px', width: g.box.w + 'px', height: g.box.h + 'px' });
+    g.el.style.setProperty('--w', g.box.w + 'px');
+    g.el.style.setProperty('--h', g.box.h + 'px');
+  }
+
+  // Each group as one overview card over the region its nodes hold - shown
+  // while it is folded: what it is, how much is in it, and how much of it
+  // the step on show touched. A click opens it.
+  function drawGroups() {
+    const host = $('groups');
+    host.textContent = '';
+    for (const g of S.scene.groups || []) {
+      if (!g.box) continue;
+      const el = h('div', 'group-card gcard-' + g.i);
+      el.classList.add(...chainOf(g).slice(0, -1).map(x => 'cg-' + x.i));
+      g.mark = h('div', 'g-mark');
+      g.mark.hidden = true;
+      const what = g.path || (g.unit === 'component' ? 'components' : ['tests', 'top level', 'free functions'].includes(g.key) ? 'functions' : 'type');
+      el.append(h('div', 'g-what', what), h('div', 'g-title', g.title), h('div', 'g-sub', groupSummary(g)), g.mark);
+      el.title = `${g.key} - click, or zoom in, to open it`;
+      el.addEventListener('click', ev => {
+        ev.stopPropagation();
+        openGroup(g);
+      });
+      g.el = el;
+      placeCard(g);
+      host.append(el);
+    }
+    markGroups();
+  }
+
+  // a group opened: one of nodes zoomed in until they can be read, one of
+  // groups until it fills the screen and opens into them
+  function openGroup(g) {
+    if (!g.children.length) return flyTo(g.members.map(id => S.byId.get(id)).filter(Boolean));
+    S.opened.add(g.i);
+    const vp = $('viewport');
+    const b = g.box;
+    S.zoom = clamp(Math.min((vp.clientWidth - 96) / b.w, (vp.clientHeight - 150) / b.h), minZoom(), 1.15);
+    S.panX = vp.clientWidth / 2 - (b.x + b.w / 2) * S.zoom;
+    S.panY = vp.clientHeight / 2 - (b.y + b.h / 2) * S.zoom;
+    glide();
+    applyView();
+  }
+
+  // a group whose nodes the step on show touched is marked as most of them are, and counts them
+  function markGroups() {
+    for (const g of (S.scene && S.scene.groups) || []) {
+      if (!g.el) continue;
+      const hows = [];
+      for (const id of g.members) {
+        const n = S.byId.get(id);
+        const how = n && MARKS.find(m => n.el.classList.contains('chg-' + m));
+        if (how) hows.push(how);
+      }
+      g.el.classList.remove('chg', ...MARKS.map(m => 'chg-' + m));
+      g.mark.hidden = !hows.length;
+      if (!hows.length) continue;
+      const most = MARKS.map(m => [m, hows.filter(x => x === m).length]).sort((p, q) => q[1] - p[1])[0][0];
+      g.el.classList.add('chg', 'chg-' + most);
+      g.mark.textContent = `${hows.length} ${most === 'inspect' ? 'inspected' : 'changed'}`;
+    }
+  }
+
+  // The wires to and between folded groups: one for each pair of what is in
+  // sight, as thick as the calls it carries and counted - drawn for the zoom,
+  // so they read the same however far out.
+  function drawGroupWires() {
+    const svg = $('group-wires');
+    svg.textContent = '';
+    const sc = S.scene;
+    if (!sc || !sc.groups || !S.collapsed || !S.collapsed.size) return;
+    const z = 1 / S.zoom;
+    S.groupZoom = S.zoom;
+    $('groups').style.setProperty('--gz', String(z));
+    // what stands for a node: the outermost folded group it is in, if any
+    const stand = id => ((sc.chains && sc.chains.get(id)) || []).find(g => S.collapsed.has(g.i)) || null;
+    const all = new Map();
+    for (const e of sc.edges) {
+      const a = stand(e.from);
+      const b = stand(e.to);
+      if ((!a && !b) || a === b) continue;
+      const k = `${a ? 'g' + a.i : e.from}>${b ? 'g' + b.i : e.to}`;
+      if (!all.has(k)) all.set(k, { a: a ? a.box : S.byId.get(e.from), b: b ? b.box : S.byId.get(e.to), count: 0 });
+      all.get(k).count += (e.data && e.data.count) || 1;
+    }
+    const ns = 'http://www.w3.org/2000/svg';
+    const make = (tag, attrs) => {
+      const x = document.createElementNS(ns, tag);
+      for (const [k, v] of Object.entries(attrs)) x.setAttribute(k, v);
+      return x;
+    };
+    for (const { a, b, count } of all.values()) {
+      if (!a || !b || a.w == null || b.w == null) continue;
+      const [p1, p2] = sideAnchors(a, b);
+      const len = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
+      const ux = (p2.x - p1.x) / len;
+      const uy = (p2.y - p1.y) / len;
+      const s = 9 * z;
+      const bx = p2.x - ux * s;
+      const by = p2.y - uy * s;
+      // a thin bundle is told by its thickness alone - counting every one crowds the cards
+      const label = make('text', { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2, 'font-size': 12 * z, style: `stroke-width: ${4 * z}` });
+      label.textContent = count >= BUNDLE_COUNTED ? `×${count}` : '';
+      svg.append(
+        make('path', { d: `M${p1.x} ${p1.y} L${bx} ${by}`, class: 'gwire', 'vector-effect': 'non-scaling-stroke', style: `stroke-width: ${1.5 + Math.min(4, Math.log2(count))}` }),
+        make('path', { d: `M${p2.x} ${p2.y} L${bx - uy * s * 0.55} ${by + ux * s * 0.55} L${bx + uy * s * 0.55} ${by - ux * s * 0.55} z`, class: 'ghead' }),
+        label
+      );
+    }
+  }
+
   // the context level: the system in the middle, what calls in on its left,
   // what it reaches on its right
   function layoutContext(scene) {
@@ -1129,25 +1549,39 @@
     $('note').hidden = true;
     S.scene = null;
     S.byId = new Map();
+    S.lit = null;
+    $('lit-wires').textContent = '';
+    $('wires').classList.remove('dimming');
+    $('groups').textContent = '';
+    $('group-wires').textContent = '';
+    groupStyle().textContent = '';
+    S.collapsed = null;
+    S.opened = new Set();
+    S.sceneFit = null;
+    S.groupZoom = null;
+    S.alsoLit = new Set();
   }
 
+  // Each pin's dot centre, from the node's outer corner - as drawn, to the
+  // fraction of a pixel, and back out of the scale it is drawn at, whatever
+  // the camera or a running animation holds.
   function measurePins(n) {
     n.pins = new Map();
+    const box = n.el.getBoundingClientRect();
+    const k = box.width / (n.el.offsetWidth || 1) || 1;
     for (const p of n.el.querySelectorAll('[data-pin]')) {
-      const dot = p.querySelector('i') || p;
-      let x = dot.offsetWidth / 2;
-      let y = dot.offsetHeight / 2;
-      let e = dot;
-      while (e && e !== n.el) {
-        x += e.offsetLeft;
-        y += e.offsetTop;
-        e = e.offsetParent;
-      }
-      n.pins.set(p.dataset.pin, { x, y });
+      const dot = (p.querySelector('i') || p).getBoundingClientRect();
+      n.pins.set(p.dataset.pin, { x: (dot.left + dot.width / 2 - box.left) / k, y: (dot.top + dot.height / 2 - box.top) / k });
     }
   }
 
   function mount(scene, keepView) {
+    const was = remember();
+    const same = !!was && sameView(was.route, S.route);
+    const via = S.via;
+    S.via = null;
+    // another view: the one on show lifted off as a picture, to move away as this one comes in
+    const ghost = was && !same ? lift(was) : null;
     clearCanvas();
     // the list of asks belongs to no one level, so it stays while they are walked
     if (!S.asksPanel) hidePanel();
@@ -1167,9 +1601,23 @@
       n.h = n.el.offsetHeight;
       measurePins(n);
     }
+    // a big scene is laid out a group at a time, and zoomed out reads as its groups
+    if (scene.groups === undefined) {
+      scene.groups = scene.layout === 'layered' ? groupScene(scene) : null;
+      if (scene.groups) {
+        // laid out afresh, apart from where its nodes sat ungrouped
+        scene.key += ':grouped';
+        scene.frames = [
+          ...(scene.frames || []),
+          ...scene.groups.map(g => ({ title: g.key, sub: plural(g.members.length, g.unit), members: g.members, cls: 'group', group: g })),
+        ];
+      }
+    }
+    for (const n of scene.nodes) n.el.classList.add(...groupClasses(scene, n.id));
     let pos;
     if (scene.layout === 'flow') pos = layoutFlow(scene);
     else if (scene.layout === 'context') pos = layoutContext(scene);
+    else if (scene.groups) pos = layeredGroups(scene);
     else pos = layered(scene.nodes, scene.edges, scene);
     const saved = scene.persist ? store.get('pos:' + scene.key, {}) : {};
     for (const n of scene.nodes) {
@@ -1181,6 +1629,7 @@
     }
     drawFrames();
     drawEdges();
+    drawGroups();
     if (scene.note) {
       $('note').textContent = scene.note;
       $('note').hidden = false;
@@ -1190,8 +1639,375 @@
     if (keepView) applyView();
     else fit();
     const changed = applyMarks();
-    if (S.fly && changed.length) flyTo(changed);
+    for (const n of changed) if (n.el.classList.contains('chg-added')) keepNew('node:' + morphKey(n));
+    // the camera goes straight to where it ends, and the motion carries it there
+    const moving = same || !!ghost;
+    if (S.fly && changed.length) flyTo(changed, moving);
     S.fly = false;
+    if (same) morph(was);
+    else if (ghost) travel(was, ghost, via);
+    showKept();
+    showOffMap();
+    S.shownRoute = S.route && { ...S.route };
+  }
+
+  // ------------------------------------------------------------- additions kept
+
+  // What each step added - nodes, the pins of a parameter, a return or a
+  // call, and wires - by the view it was seen in. Those of the collection on
+  // show, up to the step on show, stay green: a flash fades to grey long
+  // before the ask is done. Another collection on show, they rest.
+  const KEPT = new Map();
+  // steps whose additions are kept, at most - the timeline holds fewer
+  const KEPT_MAX = 400;
+
+  // a view as its additions are kept: a function by its name, so a step that
+  // moves it keeps them
+  const keptView = r => (!r ? '' : r.level === 'flow' ? `flow:${r.file}@${r.name || r.line}` : href(r));
+
+  function keepNew(key) {
+    const ev = T.at != null ? T.steps[T.at] : null;
+    if (!ev) return;
+    const v = keptView(S.route);
+    if (!KEPT.has(ev.seq)) KEPT.set(ev.seq, new Map());
+    const views = KEPT.get(ev.seq);
+    if (!views.has(v)) views.set(v, new Set());
+    views.get(v).add(key);
+    if (KEPT.size > KEPT_MAX) {
+      const held = new Set(T.steps.map(s => s.seq));
+      for (const seq of KEPT.keys()) if (!held.has(seq)) KEPT.delete(seq);
+    }
+  }
+
+  // the additions of the collection on show, up to the step on show, green on the scene
+  function showKept() {
+    for (const el of document.querySelectorAll('.kept-new')) el.classList.remove('kept-new');
+    if (!S.scene || T.at == null) return;
+    const v = keptView(S.route);
+    const kept = new Set();
+    for (const i of shownSteps()) {
+      if (i > T.at) break;
+      for (const k of KEPT.get(T.steps[i].seq)?.get(v) || []) kept.add(k);
+    }
+    if (!kept.size) return;
+    const small = S.scene.nodes.length <= MOTION_MAX;
+    for (const n of S.scene.nodes) {
+      const mk = morphKey(n);
+      if (kept.has('node:' + mk)) n.el.classList.add('kept-new');
+      if (small && n.el.classList.contains('bp')) for (const p of pinsOf(n)) if (kept.has(`pin:${mk}|${p.key}`)) p.el.classList.add('kept-new');
+    }
+    const keyOf = id => (S.byId.has(id) ? morphKey(S.byId.get(id)) : String(id));
+    for (const e of S.scene.edges) if (e.path && kept.has('wire:' + wireKey(e, keyOf))) e.path.classList.add('kept-new');
+  }
+
+  // ------------------------------------------------------------- motion
+
+  // motion is for those who want it
+  const calm = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+  // a scene past this many nodes changes in a cut - moving thousands of
+  // elements at once is a stall, not an animation
+  const MOTION_MAX = 600;
+  // and past this many coming and going, they simply appear
+  const MOTION_CROWD = 150;
+  const EASE = 'cubic-bezier(.2, .7, .2, 1)';
+  const MOVE_MS = 480;
+  const DEPTH = { system: 0, containers: 1, components: 2, code: 3, flow: 4 };
+  // words on a node that, changed, are pointed out
+  const WORDS = ['.head .t', '.head .q', '.body', '.chain', '.name', '.tech'];
+
+  // a node as the next scene knows it again
+  const morphKey = n => n.mkey || n.key || n.id;
+
+  // The same view drawn again - a step's other side, a function after an
+  // edit, the map after a save - rather than a move to another.
+  function sameView(a, b) {
+    if (!a || !b || a.level !== b.level) return false;
+    if (a.level === 'flow') return a.file === b.file && (a.name ? a.name === b.name : a.line === b.line);
+    return href(a) === href(b);
+  }
+
+  // a parameter is its name - `n: i32` is still `n` whatever its type becomes
+  const pinName = label => label.split(':')[0].trim();
+
+  // a node's pins as the eye reads them: the side, what each says, how far down
+  function pinsOf(n) {
+    const out = [];
+    const seen = new Map();
+    const top = n.el.getBoundingClientRect().top;
+    for (const p of n.el.querySelectorAll('.rows > .pin')) {
+      const label = p.querySelector('.lbl')?.textContent || '';
+      if (p.style.visibility === 'hidden' || (!label && !p.dataset.pin)) continue;
+      const side = p.classList.contains('in') ? 'in' : 'out';
+      const base = `${side}:${p.classList.contains('ret') ? 'ret' : pinName(label) || p.dataset.pin}`;
+      const k = seen.get(base) || 0;
+      seen.set(base, k + 1);
+      out.push({ key: `${base}#${k}`, label, side, el: p, top: (p.getBoundingClientRect().top - top) / S.zoom });
+    }
+    return out;
+  }
+
+  const wordsOf = el => new Map(WORDS.map(s => [s, el.querySelector(s)?.textContent ?? null]));
+
+  // a wire by the nodes it joins, as the next scene knows them again
+  function wireKey(e, keyOf) {
+    const pin = S.scene.layout === 'flow' ? e.fromPin || '' : '';
+    return `${keyOf(e.from)}:${pin}>${keyOf(e.to)}|${e.cls || ''}`;
+  }
+
+  // what the canvas shows now, for the scene that follows to move on from
+  function remember() {
+    if (!S.scene || !S.shownRoute || calm()) return null;
+    const size = S.scene.nodes.length;
+    const nodes = new Map();
+    const small = size <= MOTION_MAX;
+    for (const n of S.scene.nodes) {
+      nodes.set(morphKey(n), { n, x: n.x, y: n.y, pins: small && n.el.classList.contains('bp') ? pinsOf(n) : [], words: small ? wordsOf(n.el) : null });
+    }
+    const keyOf = id => (S.byId.has(id) ? morphKey(S.byId.get(id)) : String(id));
+    const wires = new Map();
+    if (small) for (const e of S.scene.edges) if (e.path) wires.set(wireKey(e, keyOf), { d: e.path.getAttribute('d'), from: keyOf(e.from), to: keyOf(e.to) });
+    return { route: S.shownRoute, size, nodes, wires, view: { zoom: S.zoom, panX: S.panX, panY: S.panY } };
+  }
+
+  // an animation that tidies up after itself, and is no promise of one
+  function animate(el, frames, opts, after) {
+    const a = el.animate(frames, opts);
+    if (after) a.finished.then(after, after);
+    return a;
+  }
+
+  // a class put on for the length of its animation, again if it was already
+  function flash(el, cls) {
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+    el.addEventListener('animationend', () => el.classList.remove(cls), { once: true });
+  }
+
+  const cameraOf = v => `translate(${v.panX}px, ${v.panY}px) scale(${v.zoom})`;
+  const gridOf = v => ({ backgroundSize: `${20 * v.zoom}px ${20 * v.zoom}px`, backgroundPosition: `${v.panX}px ${v.panY}px` });
+
+  // the camera carried from where it was to where it is now
+  function carryCamera(from) {
+    const to = { zoom: S.zoom, panX: S.panX, panY: S.panY };
+    if (Math.abs(from.zoom - to.zoom) < 1e-3 && Math.abs(from.panX - to.panX) < 0.5 && Math.abs(from.panY - to.panY) < 0.5) return;
+    $('viewport').classList.remove('glide');
+    for (const a of $('surface').getAnimations()) a.cancel();
+    animate($('surface'), [{ transform: cameraOf(from) }, { transform: cameraOf(to) }], { duration: MOVE_MS, easing: EASE });
+    animate($('viewport'), [gridOf(from), gridOf(to)], { duration: MOVE_MS, easing: EASE });
+  }
+
+  // The same view drawn again: what stayed glides to where it sits now, what
+  // came grows in, what went fades where it was, and the pins and words of a
+  // node that changed say so - a parameter, a return type, a call.
+  function morph(was) {
+    carryCamera(was.view);
+    const now = S.scene.nodes;
+    if (now.length > MOTION_MAX || was.size > MOTION_MAX) return;
+    const kept = new Set(now.map(morphKey).filter(k => was.nodes.has(k)));
+    const crowd = now.length - kept.size + was.nodes.size - kept.size > MOTION_CROWD;
+    // pins stamped so far, so each lands after the one before
+    let stamped = 0;
+    for (const n of now) {
+      const old = was.nodes.get(morphKey(n));
+      if (!old) {
+        keepNew('node:' + morphKey(n));
+        if (!crowd) enter(n.el);
+        continue;
+      }
+      const dx = old.x - n.x;
+      const dy = old.y - n.y;
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) animate(n.el, [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: MOVE_MS, easing: EASE });
+      if (old.pins.length || n.el.classList.contains('bp')) stamped = morphPins(n, old.pins, stamped);
+      if (old.words) morphWords(n.el, old.words);
+    }
+    if (!crowd) for (const [k, old] of was.nodes) if (!kept.has(k)) leave(old.n.el);
+    morphWires(was.wires);
+  }
+
+  // a node that was not there before grows in, and glows a moment
+  function enter(el) {
+    animate(el, [{ opacity: 0, transform: 'scale(.86)' }, { opacity: 1, transform: 'none' }], { duration: 420, delay: 140, easing: EASE, fill: 'backwards' });
+    flash(el, 'arrived');
+  }
+
+  // a node gone from the scene fades out where it was
+  function leave(el) {
+    if (el.isConnected) return;
+    el.classList.add('leaving');
+    el.classList.remove('selected', 'hit', 'faded');
+    delete el.dataset.id;
+    $('nodes').append(el);
+    animate(el, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.86)' }], { duration: 520, easing: EASE, fill: 'forwards' }, () => el.remove());
+  }
+
+  // when the first pin is stamped - once the nodes have settled - the gap
+  // to the next, how many land one by one before the rest land together,
+  // and how long a stamp's ink takes to dry
+  const STAMP_AT = 340;
+  const STAMP_GAP = 170;
+  const STAMP_RUN = 10;
+  const STAMP_MS = 1700;
+
+  // A node's pins against what they were. One that came, or whose words
+  // changed, is stamped onto the node, one after another; one that went
+  // slides off the node struck through. `stamped` is how many landed before
+  // this node's, and the count is handed on.
+  function morphPins(n, before, stamped) {
+    const was = new Map(before.map(p => [p.key, p]));
+    const now = new Set();
+    for (const p of pinsOf(n)) {
+      now.add(p.key);
+      const old = was.get(p.key);
+      if (old && old.label === p.label) continue;
+      if (!old) keepNew(`pin:${morphKey(n)}|${p.key}`);
+      stamp(p.el, STAMP_AT + Math.min(stamped++, STAMP_RUN) * STAMP_GAP, old ? old.label : null);
+    }
+    for (const p of before) if (!now.has(p.key)) pinLeave(n, p);
+    return stamped;
+  }
+
+  // A pin pressed onto its node `at` ms from now: it lands from above, presses
+  // in and leaves a ring of ink - green for one that came, amber for one
+  // whose words changed. Those old words stay put until the stamp comes
+  // down, and lift off as it lands.
+  function stamp(pin, at, old) {
+    pin.style.setProperty('--stamp-at', at + 'ms');
+    pin.classList.toggle('changed', old != null);
+    pin.classList.add('stamp');
+    setTimeout(() => pin.classList.remove('stamp', 'changed'), at + STAMP_MS);
+    const lbl = old != null && pin.querySelector('.lbl');
+    if (!lbl) return;
+    const ghost = h('span', 'lbl-was', old);
+    ghost.style.left = lbl.offsetLeft + 'px';
+    ghost.style.top = lbl.offsetTop + 'px';
+    pin.append(ghost);
+    animate(ghost, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(7px) scale(.9)' }], { duration: 260, delay: Math.max(0, at - 120), easing: 'ease-in', fill: 'both' }, () => ghost.remove());
+  }
+
+  function pinLeave(n, p) {
+    const g = p.el;
+    if (g.isConnected) return;
+    g.classList.add('pin-out');
+    g.removeAttribute('data-pin');
+    g.style.top = Math.max(0, Math.min(p.top, n.el.offsetHeight - 22)) + 'px';
+    g.style[p.side === 'in' ? 'left' : 'right'] = '0';
+    n.el.append(g);
+    const off = p.side === 'in' ? -28 : 28;
+    animate(g, [{ opacity: 1, transform: 'none' }, { opacity: 1, transform: 'none', offset: 0.35 }, { opacity: 0, transform: `translateX(${off}px)` }], { duration: 900, easing: EASE, fill: 'forwards' }, () => g.remove());
+  }
+
+  function morphWords(el, before) {
+    for (const [sel, old] of before) {
+      const x = el.querySelector(sel);
+      if (x && old != null && x.textContent !== old) flash(x, 'txt-change');
+    }
+  }
+
+  // The wires settle in once the nodes have, the old fading as they go. A
+  // wire that came draws itself in, with both its ends kept in sight; one
+  // that went fades red, and a node it leaves that nothing on show still
+  // reaches fades back after it.
+  function morphWires(before) {
+    const keyOf = id => (S.byId.has(id) ? morphKey(S.byId.get(id)) : String(id));
+    const now = new Map();
+    for (const e of S.scene.edges) if (e.path) now.set(wireKey(e, keyOf), e);
+    const svg = $('wires');
+    const old = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    old.setAttribute('class', 'ghost-wires');
+    const byKey = new Map(S.scene.nodes.map(n => [morphKey(n), n]));
+    for (const [k, w] of before) {
+      const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      p.setAttribute('d', w.d);
+      p.setAttribute('class', 'wire' + (now.has(k) ? '' : ' gone'));
+      old.append(p);
+      if (now.has(k)) continue;
+      for (const end of [w.from, w.to]) {
+        const n = byKey.get(end);
+        if (n && n.el.classList.contains('faded')) animate(n.el, [{ opacity: 1 }, { opacity: 1, offset: 0.4 }, { opacity: 0.2 }], { duration: 900, easing: 'ease-out' });
+      }
+    }
+    svg.insertBefore(old, $('wire-layer'));
+    animate(old, [{ opacity: 1 }, { opacity: 0 }], { duration: 360, easing: 'ease-out', fill: 'forwards' }, () => old.remove());
+    animate($('wire-layer'), [{ opacity: 0 }, { opacity: 0, offset: 0.55 }, { opacity: 1 }], { duration: MOVE_MS + 260 });
+    const fresh = [...now].filter(([k]) => !before.has(k));
+    for (const [k, e] of fresh) {
+      keepNew('wire:' + k);
+      // both ends of a new connection stay in sight, however the step is seen
+      e.path.classList.remove('faded');
+      for (const id of [e.from, e.to]) {
+        const n = S.byId.get(id);
+        if (!n) continue;
+        S.alsoLit.add(id);
+        n.el.classList.remove('faded');
+      }
+    }
+    if (!before.size || fresh.length > MOTION_CROWD) return;
+    for (const [, e] of fresh) {
+      const len = e.path.getTotalLength();
+      animate(e.path, [{ strokeDasharray: `${len}`, strokeDashoffset: `${len}` }, { strokeDasharray: `${len}`, strokeDashoffset: '0' }], { duration: 520, delay: MOVE_MS, easing: EASE, fill: 'backwards' });
+      flash(e.path, 'wire-new');
+    }
+  }
+
+  // the view on show lifted off the canvas as one picture - one move at a
+  // time, so a move made before the last one finished cuts it short
+  function lift(was) {
+    for (const g of document.querySelectorAll('.ghost')) g.remove();
+    for (const a of $('surface').getAnimations()) a.cancel();
+    if (was.size > MOTION_MAX) return null;
+    const ghost = h('div', 'ghost');
+    ghost.style.transform = $('surface').style.transform;
+    for (const id of ['frames', 'wires', 'labels', 'nodes', 'groups', 'group-wires']) {
+      const c = $(id).cloneNode(true);
+      c.removeAttribute('id');
+      for (const x of c.querySelectorAll('[id]')) x.removeAttribute('id');
+      ghost.append(c);
+    }
+    // folded as it was - the rules that fold its groups go with the next scene
+    for (const i of S.collapsed || []) {
+      for (const x of ghost.querySelectorAll(`.cg-${i}, .gframe-${i}`)) x.remove();
+      for (const x of ghost.querySelectorAll(`.gcard-${i}`)) x.style.display = 'flex';
+    }
+    $('viewport').append(ghost);
+    return ghost;
+  }
+
+  // From one view to another. Going in, the old view swells through what was
+  // opened as the new one grows out of it; coming back up, the old view
+  // shrinks into where it sits in the new. Elsewhere, one fades into the other.
+  function travel(was, ghost, via) {
+    const vp = $('viewport').getBoundingClientRect();
+    const surface = $('surface');
+    const final = surface.style.transform;
+    const from = ghost.style.transform;
+    const done = () => ghost.remove();
+    const deeper = (DEPTH[S.route.level] ?? 0) > (DEPTH[was.route.level] ?? 0);
+    let at = deeper ? via : null;
+    if (!deeper && (DEPTH[S.route.level] ?? 0) < (DEPTH[was.route.level] ?? 0)) {
+      // the node in this view that opens the one left
+      const back = S.scene.nodes.find(n => n.drill && sameView(n.drill, was.route));
+      if (back) at = { left: vp.left + S.panX + back.x * S.zoom, top: vp.top + S.panY + back.y * S.zoom, width: back.w * S.zoom, height: back.h * S.zoom };
+    }
+    $('viewport').classList.remove('glide');
+    if (!at || !at.width || !at.height) {
+      animate(ghost, [{ opacity: 1 }, { opacity: 0 }], { duration: 260, easing: 'ease-out', fill: 'forwards' }, done);
+      animate(surface, [{ opacity: 0, transform: `translateY(8px) ${final}` }, { opacity: 1, transform: final }], { duration: 360, delay: 80, easing: EASE, fill: 'backwards' });
+      return;
+    }
+    const cx = at.left + at.width / 2 - vp.left;
+    const cy = at.top + at.height / 2 - vp.top;
+    // how small the whole view is, held within the node
+    const k = clamp(Math.max(at.width / vp.width, at.height / vp.height), 0.12, 0.9);
+    const about = (s, t) => `translate(${cx}px, ${cy}px) scale(${s}) translate(${-cx}px, ${-cy}px) ${t}`;
+    const big = Math.min(1 / k, 4);
+    if (deeper) {
+      animate(ghost, [{ opacity: 1, transform: from }, { opacity: 0, transform: about(big, from) }], { duration: MOVE_MS, easing: EASE, fill: 'forwards' }, done);
+      animate(surface, [{ opacity: 0, transform: about(k, final) }, { opacity: 1, transform: final }], { duration: MOVE_MS, easing: EASE });
+    } else {
+      animate(ghost, [{ opacity: 1, transform: from }, { opacity: 0, transform: about(k, from) }], { duration: MOVE_MS, easing: EASE, fill: 'forwards' }, done);
+      animate(surface, [{ opacity: 0, transform: about(Math.min(big, 1.6), final) }, { opacity: 1, transform: final }], { duration: MOVE_MS, easing: EASE });
+    }
   }
 
   // a step's scene past this many nodes keeps only what it touched and what
@@ -1235,14 +2051,27 @@
   function drawFrames() {
     const host = $('frames');
     host.textContent = '';
+    // each group's outline holds the outlines of the groups in it
+    for (const t of S.scene.tops || []) clusterBox(t);
     for (const f of S.scene.frames || []) {
       const members = f.members.map(id => S.byId.get(id)).filter(Boolean);
       if (!members.length) continue;
-      const x0 = Math.min(...members.map(n => n.x)) - 28;
-      const y0 = Math.min(...members.map(n => n.y)) - 28;
-      const x1 = Math.max(...members.map(n => n.x + n.w)) + 28;
-      const y1 = Math.max(...members.map(n => n.y + n.h)) + 56;
+      let x0 = Math.min(...members.map(n => n.x)) - 28;
+      let y0 = Math.min(...members.map(n => n.y)) - 28;
+      let x1 = Math.max(...members.map(n => n.x + n.w)) + 28;
+      let y1 = Math.max(...members.map(n => n.y + n.h)) + 56;
+      const g = f.group && f.group.box;
+      if (g) [x0, y0, x1, y1] = [g.x, g.y, g.x + g.w, g.y + g.h];
+      else {
+        // and an outline round groups holds them whole
+        const mine = new Set(f.members);
+        for (const t of S.scene.tops || []) {
+          if (!t.box || !t.members.some(id => mine.has(id))) continue;
+          [x0, y0, x1, y1] = [Math.min(x0, t.box.x - 28), Math.min(y0, t.box.y - 28), Math.max(x1, t.box.x + t.box.w + 28), Math.max(y1, t.box.y + t.box.h + 56)];
+        }
+      }
       const box = h('div', 'frame' + (f.cls ? ' ' + f.cls : ''));
+      if (f.group) box.classList.add('gframe-' + f.group.i, ...chainOf(f.group).slice(0, -1).map(x => 'cg-' + x.i));
       Object.assign(box.style, { left: x0 + 'px', top: y0 + 'px', width: x1 - x0 + 'px', height: y1 - y0 + 'px' });
       const title = h('div', 'title', f.title);
       if (f.sub) title.append(h('small', null, `[${f.sub}]`));
@@ -1287,8 +2116,25 @@
     return curve(p1, p2);
   }
 
+  // the reach of each bend of a wire that runs along a floor, and the least run worth drawing between them
+  const BEND = 64;
+  const FLOOR_RUN = 48;
+
+  // Down to a floor below what lies between, along it, and up into the
+  // target. Too close for a run along the floor, the two bends would fold
+  // back over each other - so they meet level at the lowest point instead,
+  // one smooth dip.
   function below(p1, p2, yb) {
-    return `M${p1.x} ${p1.y} C${p1.x + 34} ${p1.y} ${p1.x + 34} ${yb} ${p1.x + 64} ${yb} L${p2.x - 64} ${yb} C${p2.x - 34} ${yb} ${p2.x - 34} ${p2.y} ${p2.x} ${p2.y}`;
+    const span = p2.x - p1.x;
+    if (span >= 2 * BEND + FLOOR_RUN) {
+      return `M${p1.x} ${p1.y} C${p1.x + 34} ${p1.y} ${p1.x + 34} ${yb} ${p1.x + BEND} ${yb} L${p2.x - BEND} ${yb} C${p2.x - 34} ${yb} ${p2.x - 34} ${p2.y} ${p2.x} ${p2.y}`;
+    }
+    const mx = (p1.x + p2.x) / 2;
+    // which way the dip runs along its floor, and how level it lies there
+    const dir = span < 0 ? -1 : 1;
+    const level = Math.max(12, Math.abs(span) / 4);
+    const lead = clamp(Math.abs(span) / 2, 24, 40);
+    return `M${p1.x} ${p1.y} C${p1.x + lead} ${p1.y} ${mx - dir * level} ${yb} ${mx} ${yb} C${mx + dir * level} ${yb} ${p2.x - lead} ${p2.y} ${p2.x} ${p2.y}`;
   }
 
   function backTo(p1, n, yb) {
@@ -1335,6 +2181,10 @@
       wires.append(path, hit);
       e.path = path;
       e.hit = hit;
+      // a wire at a grouped node goes while a group of its stands in for it
+      e.groups = [...new Set([...groupClasses(S.scene, e.from), ...groupClasses(S.scene, e.to)])];
+      path.classList.add(...e.groups);
+      hit.classList.add(...e.groups);
       if (c4 && e.label && e.mid) {
         const lab = h('div', 'elabel' + (e.cls === 'declared' ? ' declared' : ''), e.label);
         lab.style.left = e.mid.x + 'px';
@@ -1345,6 +2195,7 @@
           ev.stopPropagation();
           selectEdge(e);
         });
+        lab.classList.add(...e.groups);
         labels.append(lab);
         e.labelEl = lab;
       }
@@ -1365,40 +2216,99 @@
         e.labelEl.style.top = e.mid.y + 'px';
       }
     }
+    // the lit copies follow the wires they copy
+    if (S.lit && S.lit.edges.some(e => e.from === id || e.to === id)) highlight(S.lit.id);
   }
 
+  // the wires at each node of the scene, gathered the first time they are asked for
+  function touching(id) {
+    const sc = S.scene;
+    if (!sc.touching) {
+      sc.touching = new Map();
+      for (const e of sc.edges) {
+        for (const end of new Set([e.from, e.to])) {
+          if (!sc.touching.has(end)) sc.touching.set(end, []);
+          sc.touching.get(end).push(e);
+        }
+      }
+    }
+    return (sc.touching.get(id) || []).filter(e => e.path);
+  }
+
+  // A node's wires lit and the rest dimmed. The scene's wires are one drawing,
+  // dimmed whole and never redrawn; the lit ones are copies on a layer of
+  // their own - so a pointer moving over thousands of wires redraws a handful.
   function highlight(id) {
     if (!S.scene) return;
     const c4 = S.scene.kind === 'c4';
-    const near = new Set();
-    for (const e of S.scene.edges) {
-      if (!e.path) continue;
-      const hot = id != null && (e.from === id || e.to === id);
-      e.path.classList.toggle('hot', hot);
-      e.path.classList.toggle('dim', id != null && !hot);
-      if (c4) e.path.setAttribute('marker-end', hot ? 'url(#arrow-hot)' : 'url(#arrow)');
-      if (e.labelEl) {
-        e.labelEl.classList.toggle('dim', id != null && !hot);
-        if (S.scene.quietLabels) e.labelEl.style.display = hot ? '' : 'none';
-      }
-      if (hot) {
-        near.add(e.from);
-        near.add(e.to);
-      }
+    const quiet = S.scene.quietLabels;
+    const was = S.lit || { edges: [], nodes: [] };
+    for (const e of was.edges) {
+      if (!e.labelEl) continue;
+      e.labelEl.classList.remove('hot');
+      if (quiet) e.labelEl.style.display = 'none';
     }
-    for (const n of S.scene.nodes) n.el.classList.toggle('hit', id != null && n.id !== id && near.has(n.id));
+    for (const n of was.nodes) n.el.classList.remove('hit');
+    const edges = id == null ? [] : touching(id);
+    const lit = $('lit-wires');
+    lit.textContent = '';
+    const near = new Set();
+    for (const e of edges) {
+      const copy = e.path.cloneNode(false);
+      copy.classList.add('hot');
+      if (c4) copy.setAttribute('marker-end', 'url(#arrow-hot)');
+      lit.append(copy);
+      if (e.labelEl) {
+        e.labelEl.classList.add('hot');
+        if (quiet) e.labelEl.style.display = '';
+      }
+      near.add(e.from);
+      near.add(e.to);
+    }
+    near.delete(id);
+    const nodes = [...near].map(n => S.byId.get(n)).filter(Boolean);
+    for (const n of nodes) n.el.classList.add('hit');
+    S.lit = { id, edges, nodes };
+    $('wires').classList.toggle('dimming', id != null);
+    $('labels').classList.toggle('dimming', id != null);
+  }
+
+  // Hover lights a node's wires a moment after the pointer reaches it, and
+  // lets them go a little later, so a pointer crossing the gaps between nodes
+  // never flashes the whole scene.
+  let hoverTimer = 0;
+  function hoverSoon() {
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => S.selected == null && highlight(S.hover), S.hover == null ? 150 : 30);
   }
 
   // ------------------------------------------------------------- view
 
+  // The camera: the surface moved and scaled as one layer, and the grid with
+  // it - set on those two alone, never as a property the thousands of nodes
+  // below would inherit and each be styled again for.
   function applyView() {
     const vp = $('viewport');
-    vp.style.setProperty('--zoom', S.zoom);
-    vp.style.setProperty('--pan-x', S.panX);
-    vp.style.setProperty('--pan-y', S.panY);
+    $('surface').style.transform = `translate(${S.panX}px, ${S.panY}px) scale(${S.zoom})`;
+    vp.style.backgroundSize = `${20 * S.zoom}px ${20 * S.zoom}px`;
+    vp.style.backgroundPosition = `${S.panX}px ${S.panY}px`;
     // at 30% and below the grid goes - see `.viewport.far`
     vp.classList.toggle('far', S.zoom <= 0.3);
-    $('zoom-level').textContent = Math.round(S.zoom * 100) + '%';
+    // far out, a whole percent would read 0
+    const pct = S.zoom * 100;
+    $('zoom-level').textContent = (pct >= 10 ? Math.round(pct) : pct >= 1 ? pct.toFixed(1) : pct.toPrecision(2)) + '%';
+    // a big scene zoomed out reads as its groups, and zoomed back in as its nodes
+    regroup();
+  }
+
+  // the camera once a frame, however many pointer or wheel events the frame brings
+  let viewFrame = 0;
+  function viewSoon() {
+    if (viewFrame) return;
+    viewFrame = requestAnimationFrame(() => {
+      viewFrame = 0;
+      applyView();
+    });
   }
 
   function bounds() {
@@ -1421,12 +2331,19 @@
   // and is often far wider than the screen: past the point where its text
   // stops being legible it opens on the entry node instead. `whole` forces
   // the full view.
+  // as far out as the camera goes: as far as wanted - the floor only keeps
+  // the zoom from reaching nothing
+  const MIN_ZOOM = 1e-6;
+  const minZoom = () => MIN_ZOOM;
+
   function fit(whole) {
+    // fitted whole, a big scene reads as its top groups again
+    if (S.opened) S.opened.clear();
     const vp = $('viewport');
     const b = bounds();
     const vw = vp.clientWidth;
     const vh = vp.clientHeight;
-    const z = clamp(Math.min((vw - 96) / b.w, (vh - 150) / b.h), 0.08, 1.15);
+    const z = clamp(Math.min((vw - 96) / b.w, (vh - 150) / b.h), minZoom(), 1.15);
     const entry = S.scene && S.scene.entry;
     if (whole !== true && entry && z < 0.55) {
       S.zoom = clamp((vh - 150) / b.h, 0.55, 1);
@@ -1441,11 +2358,11 @@
   }
 
   function zoomAt(mx, my, factor) {
-    const z = clamp(S.zoom * factor, 0.08, 3);
+    const z = clamp(S.zoom * factor, minZoom(), 3);
     S.panX = mx - ((mx - S.panX) * z) / S.zoom;
     S.panY = my - ((my - S.panY) * z) / S.zoom;
     S.zoom = z;
-    applyView();
+    viewSoon();
   }
 
   function zoomBy(factor) {
@@ -1460,6 +2377,8 @@
     S.selected = id;
     highlight(id);
     if (id == null) return hidePanel();
+    // a node a folded group stands in for is gone to, near enough to see it
+    if (hiddenByGroup(id)) flyTo([S.byId.get(id)]);
     showPanelFor(S.byId.get(id));
     clearOfPanel(S.byId.get(id));
   }
@@ -1485,7 +2404,10 @@
   }
 
   function drill(n) {
-    if (n && n.drill) go(n.drill);
+    if (!n || !n.drill) return;
+    // where the view opened from, for it to grow out of
+    S.via = n.el.getBoundingClientRect();
+    go(n.drill);
   }
 
   function hidePanel() {
@@ -1836,7 +2758,7 @@
           const id = nodeEl ? nodeEl.dataset.id : null;
           if (id !== S.hover) {
             S.hover = id;
-            highlight(id);
+            hoverSoon();
           }
         }
         return;
@@ -1854,7 +2776,7 @@
       if (drag.mode === 'pan') {
         S.panX = drag.px + dx;
         S.panY = drag.py + dy;
-        applyView();
+        viewSoon();
         return;
       }
       const n = drag.n;
@@ -1910,7 +2832,7 @@
         } else {
           S.panX -= e.deltaX;
           S.panY -= e.deltaY;
-          applyView();
+          viewSoon();
         }
       },
       { passive: false }
@@ -1984,7 +2906,7 @@
       else if (e.key === 'Enter' && S.selected) drill(S.byId.get(S.selected));
       else if (e.key === ',' || e.key === '<') stepBy(-1);
       else if (e.key === '.' || e.key === '>') stepBy(1);
-      else if (e.key === 'l' || e.key === 'L') followLive();
+      else if (e.key === 'l' || e.key === 'L') toggleFollow();
       else if (e.key === '[') groupBy(-1);
       else if (e.key === ']') groupBy(1);
     });
@@ -2032,10 +2954,10 @@
     pumping: false,
     // the step shown last while following, and when
     shown: null,
+    // the step controls opened by hand while following
+    unfolded: false,
     // each step on show is seen alone: what it touched in full, the rest faded
     focus: store.get('focus', true),
-    // the agent session on show - one at a time, and undefined for the latest
-    session: undefined,
   };
   const MAX_TIMELINE = 200;
   const STATUS = {
@@ -2044,7 +2966,7 @@
     reverted: 'reverted - put back',
     discarded: 'discarded - dropped unwritten',
     edited: 'edited by hand - saved outside ccc’s edit tools',
-    read: 'read - an agent looked at it through ccc’s tools',
+    inspect: 'inspect - an agent read it, through ccc’s read tools or its own',
   };
 
   const sameFn = (t, f) => t.file === f.file && t.name === f.name && (t.owner || null) === (f.owner || null);
@@ -2096,6 +3018,8 @@
     A.of = new Map();
     A.groups.forEach((g, i) => g.steps.forEach(seq => A.of.set(seq, i)));
     drawTimeline();
+    // which steps make up the collection on show may have just been learned
+    showKept();
     if (S.asksPanel) panelAsks();
   }
 
@@ -2109,7 +3033,7 @@
   function summary(ev) {
     const fn = ev.focus && ev.focus.level === 'flow' ? ev.focus.name : null;
     const files = ev.files.length === 1 ? base(ev.files[0].path) : plural(ev.files_total, 'file');
-    if (ev.status === 'read') return `looked at ${fn || files}`;
+    if (ev.status === 'inspect') return `inspected ${fn || files}`;
     const added = ev.files.reduce((n, f) => n + f.added, 0);
     const removed = ev.files.reduce((n, f) => n + f.removed, 0);
     // one part of a step: the definition it is about, and which part of how many
@@ -2151,10 +3075,11 @@
         const fn = S.scene.entry && S.scene.entry.data.function;
         const t = fn && ev.functions.find(x => sameFn(x, fn));
         if (!t || layoutOnly(t)) return null;
-        if (n.kind === 'entry') return t.change === 'modified' ? null : t.change;
         const lines = t['lines_' + side] || [];
+        // the entry stands for the signature: marked when a change reaches its first line
+        if (n.kind === 'entry') return t.change !== 'modified' ? t.change : t[side] && within(t[side].start, lines) ? 'modified' : null;
         const hit = n.kind === 'calls' ? d.calls.some(c => within(c.line, lines)) : within(d.line, lines);
-        return hit ? (t.change === 'added' || t.change === 'read' ? t.change : 'modified') : null;
+        return hit ? (t.change === 'added' || t.change === 'inspect' ? t.change : 'modified') : null;
       }
       case 'code': {
         if (n.kind !== 'function' && n.kind !== 'proxy') return null;
@@ -2174,8 +3099,8 @@
     }
   }
 
-  // how a level above the code took part: looked at, or changed
-  const touched = ev => (ev.status === 'read' ? 'read' : 'modified');
+  // how a level above the code took part: inspected, or changed
+  const touched = ev => (ev.status === 'inspect' ? 'inspect' : 'modified');
 
   // A change with no step of its own - lines removed, a statement that calls
   // nothing - is marked on the step it lands after, or on the entry.
@@ -2206,7 +3131,7 @@
       hit.push(n);
     };
     for (const n of S.scene.nodes) {
-      n.el.classList.remove('chg', 'chg-added', 'chg-modified', 'chg-removed', 'chg-pending', 'chg-read');
+      n.el.classList.remove('chg', 'chg-added', 'chg-modified', 'chg-removed', 'chg-pending', 'chg-inspect');
       const how = m ? changeOf(n, m.ev, m.side) : null;
       if (how) mark(n, how);
     }
@@ -2215,6 +3140,7 @@
       if (near) mark(near, 'modified');
     }
     fade(hit);
+    markGroups();
     return hit;
   }
 
@@ -2223,7 +3149,8 @@
   // into the canvas.
   function fade(hit) {
     const on = !!(S.scene && S.focusing && hit.length);
-    const keep = new Set(hit.map(n => n.id));
+    // what the step touched, and what a connection it made reaches
+    const keep = new Set([...hit.map(n => n.id), ...(S.alsoLit || [])]);
     for (const n of S.scene ? S.scene.nodes : []) n.el.classList.toggle('faded', on && !keep.has(n.id));
     for (const e of S.scene ? S.scene.edges : []) {
       const lit = keep.has(e.from) || keep.has(e.to);
@@ -2242,7 +3169,8 @@
   }
 
   // glide the camera onto the marked nodes, near enough to read them
-  function flyTo(nodes) {
+  // `now` - straight there, as the motion of a new scene carries the camera
+  function flyTo(nodes, now) {
     const vp = $('viewport');
     const bar = $('timeline');
     const x0 = Math.min(...nodes.map(n => n.x));
@@ -2251,11 +3179,12 @@
     const y1 = Math.max(...nodes.map(n => n.y + n.h));
     const vw = vp.clientWidth - ($('panel').hidden ? 0 : 352);
     const vh = vp.clientHeight - (bar.hidden ? 0 : bar.offsetHeight + 12);
-    const floor = S.route && S.route.level === 'flow' ? 0.6 : 0.3;
+    // near enough a grouped scene that its nodes are back
+    const floor = S.route && S.route.level === 'flow' ? 0.6 : S.scene && S.scene.groups ? GROUP_SHOW + 0.05 : 0.3;
     S.zoom = clamp(Math.min((vw - 120) / Math.max(1, x1 - x0), (vh - 120) / Math.max(1, y1 - y0)), floor, 1.1);
     S.panX = vw / 2 - ((x0 + x1) / 2) * S.zoom;
     S.panY = vh / 2 - ((y0 + y1) / 2) * S.zoom;
-    glide();
+    if (!now) glide();
     applyView();
   }
 
@@ -2266,6 +3195,9 @@
     clearTimeout(glideTimer);
     glideTimer = setTimeout(() => vp.classList.remove('glide'), 700);
   }
+
+  // how long a write is shown as it was before it becomes what it is
+  const BEFORE_MS = 650;
 
   // a step just landed: show it where it happened, as the map holds it now
   async function arrive(ev) {
@@ -2291,8 +3223,18 @@
     }
     // a step not written yet: draw the map as it would leave it, to look over
     if (ev.status === 'staged' && ev.snapshot && ev.focus) return replay(T.at, 'after', true);
-    // a look moved nothing, so the overview on show still holds
-    if (ev.status !== 'staged' && ev.status !== 'read') S.overview = null;
+    // A write to one function or file seen from elsewhere: shown first as it
+    // was, a moment, then becoming what it is - its pins, calls and words
+    // moving to their new places.
+    const near = ev.focus && (ev.focus.level === 'flow' || ev.focus.level === 'code');
+    const was = focusRoute(ev, 'before');
+    if (near && was && ev.snapshot && ['applied', 'reverted', 'edited'].includes(ev.status) && !calm() && !sameView(S.shownRoute, was)) {
+      await replay(T.at, 'before', true);
+      await sleep(BEFORE_MS / T.speed);
+      if (T.steps[T.at] !== ev || !T.follow) return;
+    }
+    // an inspect moved nothing, so the overview on show still holds
+    if (ev.status !== 'staged' && ev.status !== 'inspect') S.overview = null;
     try {
       await ensureOverview();
     } catch {
@@ -2300,9 +3242,41 @@
     }
     S.marks = { ev, side: ev.on_disk };
     S.fly = true;
-    const route = focusRoute(ev, ev.on_disk);
+    // A step in a file the map does not hold - a stylesheet, a README - is seen
+    // where the latest step before it that the map holds happened, never
+    // wherever the view was left: following goes on from the latest point.
+    if (!focusRoute(ev, ev.on_disk)) S.offMapStep = ev;
+    const route = focusRoute(ev, ev.on_disk) || placeBefore(T.at);
     if (route) go(route);
     else render(true);
+  }
+
+  // A step in files the map does not draw - a stylesheet, a README - shown
+  // by what it changed, in the panel, once the view it is seen from is up;
+  // never over the list of asks.
+  function showOffMap() {
+    const ev = S.offMapStep;
+    S.offMapStep = null;
+    if (ev && !S.asksPanel) panelEvent(ev);
+  }
+
+  // where on the map the latest step before `i` happened, if any did
+  function placeBefore(i) {
+    for (let j = Math.min(i, T.steps.length) - 1; j >= 0; j--) {
+      const r = focusRoute(T.steps[j], T.steps[j].on_disk);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  // The follow switch: on, each live change is shown as it lands; off, the
+  // step on show stays.
+  function toggleFollow() {
+    if (!(T.follow && (!T.replay || T.replay.live))) return followLive();
+    stopPlay();
+    T.follow = false;
+    T.queue = [];
+    drawTimeline();
   }
 
   // the live map again, the newest step shown as if it had just landed, and
@@ -2310,10 +3284,11 @@
   function followLive() {
     stopPlay();
     T.follow = true;
-    // live is now, whatever was still waiting its turn, in the latest session
+    // the step controls fold away again
+    T.unfolded = false;
+    // live is now, whatever was still waiting its turn, in the latest ask
     T.queue = [];
     T.shown = null;
-    T.session = undefined;
     endReplay();
     const last = T.steps[T.steps.length - 1];
     if (!last || last.status === 'discarded') {
@@ -2351,8 +3326,6 @@
         T.queue.shift();
         if (!T.steps.includes(ev)) continue;
         T.shown = { ev, at: Date.now() };
-        // following is the latest session
-        T.session = undefined;
         await arrive(ev);
       }
     } finally {
@@ -2412,9 +3385,14 @@
       } catch {
         return;
       }
-      const route = focusRoute(ev, ev.on_disk);
+      // a step the map has no place for shows what it changed in the panel
+      if (!focusRoute(ev, ev.on_disk)) S.offMapStep = ev;
+      const route = focusRoute(ev, ev.on_disk) || placeBefore(i);
       if (route) go(route);
-      else drawTimeline();
+      else {
+        drawTimeline();
+        showOffMap();
+      }
       return;
     }
     const snap = full[side];
@@ -2463,7 +3441,7 @@
     drawTimeline();
   }
 
-  // the step before or after the one on show, within the session on show
+  // the step before or after the one on show, within the ask on show
   function stepBy(d) {
     const shown = shownSteps();
     if (!shown.length) return;
@@ -2501,38 +3479,44 @@
     drawTimeline();
   }
 
-  // Runs of asks by the agent session they came from. Changes made by hand,
-  // and steps no transcript explains, go with the session they fall in.
-  function sessionSpans() {
-    const spans = [];
-    for (const [gi, g] of A.groups.entries()) {
-      const s = g.ask ? g.ask.session : null;
-      let cur = spans[spans.length - 1];
-      if (!cur || (s && cur.session && cur.session !== s)) spans.push((cur = { session: s, groups: new Set() }));
-      else if (s && !cur.session) cur.session = s;
-      cur.groups.add(gi);
-    }
-    return spans;
+  // The collection a group of steps belongs to: every step of one ask,
+  // wherever they fall, or one run of changes made by hand, or of steps no
+  // transcript explains. The timeline holds one collection at a time.
+  const collectionOf = gi => (A.groups[gi]?.ask ? 'ask:' + A.groups[gi].ask.id : 'run:' + gi);
+
+  // the collection of the step on show - undefined while its ask is not known yet
+  const collectionAt = () => {
+    const gi = T.at != null ? A.of.get(T.steps[T.at]?.seq) : undefined;
+    return gi === undefined ? undefined : collectionOf(gi);
+  };
+
+  // The collections on the timeline in the order they began, each with the
+  // numbers of its steps.
+  function collections() {
+    const out = new Map();
+    A.groups.forEach((g, gi) => {
+      const key = collectionOf(gi);
+      if (!out.has(key)) out.set(key, { key, group: g, steps: [] });
+      out.get(key).steps.push(...g.steps);
+    });
+    return [...out.values()];
   }
 
-  // The steps of the session on show, as indices into `steps` - the latest
-  // unless one was picked. A step no ask is known for yet is the newest, so
-  // it goes with the latest.
+  // The steps of the collection on show, as indices into `steps`: that of the
+  // step on show, else the latest - so following, each new ask starts the
+  // timeline afresh. A step no ask is known for yet is the newest, so it goes
+  // with the latest.
   function shownSteps() {
-    const spans = sessionSpans();
-    if (spans.length < 2) return T.steps.map((_, i) => i);
-    const latest = spans[spans.length - 1];
-    const want = (T.session !== undefined && spans.find(s => s.session === T.session)) || latest;
+    if (!A.groups.length) return T.steps.map((_, i) => i);
+    const latest = collectionOf(A.groups.length - 1);
+    const want = collectionAt() || latest;
     const out = [];
     T.steps.forEach((ev, i) => {
       const gi = A.of.get(ev.seq);
-      if (gi === undefined ? want === latest : want.groups.has(gi)) out.push(i);
+      if (gi === undefined ? want === latest : collectionOf(gi) === want) out.push(i);
     });
     return out;
   }
-
-  // the session a group of steps belongs to
-  const sessionOf = gi => (sessionSpans().find(s => s.groups.has(gi)) || {}).session;
 
   function drawTimeline() {
     const bar = $('timeline');
@@ -2544,16 +3528,11 @@
     document.body.classList.toggle('with-tl-switches', !n);
     const ticks = $('tl-ticks');
     ticks.textContent = '';
-    let run;
-    // one session at a time - a long history drawn whole is what lags
+    // one collection at a time - scrubbing stays inside it, and a long history drawn whole is what lags
     const shown = shownSteps();
-    shown.forEach((i, k) => {
+    shown.forEach(i => {
       const ev = T.steps[i];
-      const gi = A.of.get(ev.seq);
-      // each ask's steps sit together, set off from the next
-      if (k > 0 && gi !== run) ticks.append(h('b', 'tl-sep'));
-      run = gi;
-      const g = A.groups[gi];
+      const g = A.groups[A.of.get(ev.seq)];
       const t = h('i', `tick ${ev.status}${byHand(ev) ? ' human' : ''}${layoutOnly(ev) ? ' ws' : ''}${i === T.at ? ' at' : ''}`);
       t.title = `${g ? groupText(g) + '\n' : ''}#${ev.seq} ${ev.status} · ${ev.tool} · ${summary(ev)}${why(ev) ? ' · ' + why(ev) : ''}`;
       t.dataset.i = i;
@@ -2570,11 +3549,15 @@
     const g = groupOf(ev);
     const chip = $('tl-ask');
     chip.hidden = !A.groups.length;
-    chip.replaceChildren(...(g ? [groupIcon(g)] : []), h('span', 'ask-label', g ? groupText(g) : 'Asks'));
-    chip.title = `${g ? groupText(g) + '\n\n' : ''}Every ask and what it changed - [ and ] step between them`;
-    const cur = ev ? A.of.get(ev.seq) : undefined;
-    for (const row of document.querySelectorAll('#panel .ask-row')) row.classList.toggle('at', +row.dataset.g === cur);
     const k = shown.indexOf(T.at);
+    chip.replaceChildren(
+      ...(g ? [groupIcon(g)] : []),
+      h('span', 'ask-label', g ? groupText(g) : 'Asks'),
+      ...(g && k >= 0 ? [h('span', 'ask-n', `${k + 1} / ${shown.length}`)] : [])
+    );
+    chip.title = `${g ? groupText(g) + '\n\n' : ''}Every ask and what it changed - [ and ] step between them`;
+    const cur = collectionAt();
+    for (const row of document.querySelectorAll('#panel .ask-row')) row.classList.toggle('at', row.dataset.c === cur);
     $('tl-prev').disabled = !shown.length || k === 0;
     $('tl-next').disabled = !shown.length || T.at == null || k >= shown.length - 1;
     $('tl-play').disabled = !n;
@@ -2587,20 +3570,38 @@
       b.disabled = !(full && full[b.dataset.side]);
     }
     const live = T.follow && (!T.replay || T.replay.live);
-    $('tl-follow').setAttribute('aria-pressed', String(live));
+    $('tl-follow').setAttribute('aria-checked', String(live));
     // slowed, following runs behind by the steps still waiting their turn
-    $('tl-follow').textContent = live ? (T.queue.length ? `Following · ${T.queue.length} behind` : 'Following') : 'Follow';
+    $('tl-behind').replaceChildren(...(live && T.queue.length ? [` · ${T.queue.length}`, h('span', 'tl-behind', ' behind')] : []));
+    // Following, the step controls fold away to the left behind an arrow
+    // that opens them - and stopping opens them too.
+    const folded = live && !T.unfolded;
+    const controls = $('tl-controls');
+    controls.classList.toggle('folded', folded);
+    controls.inert = folded;
+    const unfold = $('tl-unfold');
+    unfold.hidden = !live;
+    unfold.textContent = folded ? '»' : '«';
+    unfold.title = folded ? 'Show the step controls' : 'Fold the step controls away';
+    unfold.setAttribute('aria-label', unfold.title.toLowerCase());
+    unfold.setAttribute('aria-expanded', String(!folded));
     $('tl-ws').setAttribute('aria-pressed', String(T.ws));
     $('tl-speed').textContent = SPEED_LABEL[T.speed];
     $('tl-focus').setAttribute('aria-pressed', String(T.focus));
     const badge = $('replay-badge');
-    badge.hidden = !T.replay || !ev;
+    // a step only in files the map does not draw - a stylesheet, a README -
+    // moves nothing on it, so it says so whether replayed or just landed
+    const offMap = !!ev && !!S.overview && ev.status !== 'inspect' && ev.files.length > 0 && !focusRoute(ev, ev.on_disk);
+    badge.hidden = !ev || !(T.replay || offMap);
     if (!badge.hidden) {
       badge.replaceChildren(
         ...(byHand(ev) ? [person()] : []),
-        T.replay.live
-          ? `Proposed · step #${ev.seq}${why(ev) ? ' · ' + why(ev) : ' - staged, not written yet'}`
-          : `Replay · step #${ev.seq} ${ev.status} · ${T.side} it${why(ev) ? ' · ' + why(ev) : ''}`,
+        !T.replay
+          ? `Step #${ev.seq} ${ev.status}${why(ev) ? ' · ' + why(ev) : ''}`
+          : T.replay.live
+            ? `Proposed · step #${ev.seq}${why(ev) ? ' · ' + why(ev) : ' - staged, not written yet'}`
+            : `Replay · step #${ev.seq} ${ev.status} · ${T.side} it${why(ev) ? ' · ' + why(ev) : ''}`,
+        ...(offMap ? [h('span', 'off-map', ` · ${ev.files.map(f => base(f.path)).join(', ')} not on the map`)] : []),
       );
       badge.title = (ev.intent || []).join('\n');
     }
@@ -2625,11 +3626,19 @@
 
   function panelEvent(ev) {
     select(null);
-    const look = ev.status === 'read';
-    panel((look ? 'Look #' : 'Edit step #') + ev.seq, `${ev.status} · ${ev.tool}`, body => {
-      const by = byHand(ev) ? 'a person, by hand' : look ? 'an agent, through ccc’s read tools' : 'an agent, through ccc’s edit tools';
+    const look = ev.status === 'inspect';
+    // a read an agent took with its own tool names the call, found in its transcript
+    const own = look && !!ev.call;
+    panel((look ? 'Inspect #' : 'Edit step #') + ev.seq, `${ev.status} · ${ev.tool}`, body => {
+      const by = byHand(ev)
+        ? 'a person, by hand'
+        : own
+          ? `an agent, with its own ${ev.tool} tool`
+          : look
+            ? 'an agent, through ccc’s read tools'
+            : 'an agent, through ccc’s edit tools';
       const rows = [['status', STATUS[ev.status]], ['by', by]];
-      if (ev.intent && ev.intent.length) rows.push([look ? 'asked' : 'why', ev.intent.join(' · ')]);
+      if (ev.intent && ev.intent.length) rows.push([own ? 'read' : look ? 'asked' : 'why', ev.intent.join(' · ')]);
       if (ev.part) rows.push(['part', `${ev.part.index + 1} of ${ev.part.of} - ${ev.part.kind} ${ev.part.change}`]);
       const g = groupOf(ev);
       if (g && g.ask) rows.push(['ask', g.ask.prompt]);
@@ -2644,7 +3653,7 @@
           row.append(h('span', 'chg-tag ' + (t.whitespace ? 'ws' : t.change), t.whitespace ? 'layout' : t.change), goBtn(`${t.owner ? t.owner + '::' : ''}${t.name}  ${base(t.file)}`, route));
           return row;
         });
-        section(body, look ? 'Looked at' : 'Functions', list(rows));
+        section(body, look ? 'Inspected' : 'Functions', list(rows));
       }
       if (ev.ops.length) section(body, 'Operations', list(ev.ops.map(o => h('code', null, o))));
       if (look) section(body, 'Files', list(ev.files.map(f => goBtn(f.path, { level: 'code', file: f.path }))));
@@ -2653,17 +3662,20 @@
     S.stepPanel = true;
   }
 
-  // Every ask the timeline holds, in order, under the session it was made in:
-  // pick one to walk through its steps, or play a whole session through.
+  // Every collection the timeline holds - each ask, each run of changes by
+  // hand - in order, under the session it was made in: pick one and the
+  // timeline holds its steps alone, or play a whole session through.
   function panelAsks() {
     const keep = S.asksPanel ? $('panel-body').scrollTop : 0;
     select(null);
-    const asks = new Set(A.groups.filter(g => g.ask).map(g => g.ask.id)).size;
+    const all = collections();
+    const asks = all.filter(c => c.group.ask).length;
     panel('Asks', `${plural(asks, 'ask')} · ${plural(T.steps.length, 'step')}`, body => {
-      if (!A.groups.length) body.append(h('p', 'hint', 'No steps yet - each ask an agent works on lands here, and every change made by hand'));
-      const cur = A.of.get(T.steps[T.at]?.seq);
+      if (!all.length) body.append(h('p', 'hint', 'No steps yet - each ask an agent works on lands here, and every change made by hand'));
+      const cur = collectionAt();
       let session;
-      A.groups.forEach((g, gi) => {
+      for (const c of all) {
+        const g = c.group;
         if (g.ask && g.ask.session !== session) {
           session = g.ask.session;
           const s = session;
@@ -2675,18 +3687,18 @@
           head.append(all);
           body.append(head);
         }
-        const row = h('div', 'ask-row' + (gi === cur ? ' at' : ''));
-        row.dataset.g = gi;
+        const row = h('div', 'ask-row' + (c.key === cur ? ' at' : ''));
+        row.dataset.c = c.key;
         const go = h('button', 'ask-go');
-        go.append(groupIcon(g), h('span', 'ask-text', groupText(g)), h('span', 'ask-n', plural(g.steps.length, 'step')));
+        go.append(groupIcon(g), h('span', 'ask-text', groupText(g)), h('span', 'ask-n', plural(c.steps.length, 'step')));
         go.title = groupText(g);
-        go.addEventListener('click', () => goGroup(gi));
+        go.addEventListener('click', () => goCollection(c));
         const one = h('button', 'ask-play', '▶');
         one.title = 'Replay this ask’s steps';
-        one.addEventListener('click', () => play(indicesOf(g.steps)));
+        one.addEventListener('click', () => play(indicesOf(c.steps)));
         row.append(go, one);
         body.append(row);
-      });
+      }
     });
     S.asksPanel = true;
     $('panel-body').scrollTop = keep;
@@ -2695,22 +3707,21 @@
   // where steps sit on the timeline, by their numbers
   const indicesOf = seqs => seqs.map(seq => T.steps.findIndex(e => e.seq === seq)).filter(i => i >= 0);
 
-  // a group, from its first step
-  function goGroup(gi) {
-    const g = A.groups[gi];
-    const [i] = g ? indicesOf(g.steps) : [];
+  // a collection, from its first step - the timeline then holds it alone
+  function goCollection(c) {
+    const [i] = c ? indicesOf(c.steps) : [];
     if (i == null) return;
     stopPlay();
-    T.session = sessionOf(gi);
     replay(i, 'after');
   }
 
-  // the ask before or after the one on show
+  // the collection before or after the one on show
   function groupBy(d) {
-    if (!A.groups.length) return;
-    const cur = A.of.get(T.steps[T.at]?.seq);
-    const from = cur == null ? (d > 0 ? -1 : A.groups.length) : cur;
-    goGroup(clamp(from + d, 0, A.groups.length - 1));
+    const all = collections();
+    if (!all.length) return;
+    const k = all.findIndex(c => c.key === collectionAt());
+    const from = k < 0 ? (d > 0 ? -1 : all.length) : k;
+    goCollection(all[clamp(from + d, 0, all.length - 1)]);
   }
 
   // every step from a session's first ask to its last, changes by hand between them included
@@ -2718,11 +3729,22 @@
     const at = A.groups.map((g, i) => (g.ask && g.ask.session === session ? i : -1)).filter(i => i >= 0);
     if (!at.length) return;
     stopPlay();
-    T.session = session;
     play(indicesOf(A.groups.slice(at[0], at[at.length - 1] + 1).flatMap(g => g.steps)));
   }
 
+  // how far the timeline's top sits from the window's foot, for what keeps clear of it
+  function clearOfTimeline() {
+    const bar = $('timeline');
+    const set = () => {
+      const top = bar.hidden ? 0 : Math.ceil(window.innerHeight - bar.getBoundingClientRect().top);
+      document.body.style.setProperty('--tl-top', top + 'px');
+    };
+    new ResizeObserver(set).observe(bar);
+    window.addEventListener('resize', set);
+  }
+
   function bindTimeline() {
+    clearOfTimeline();
     const track = $('tl-track');
     let scrubbing = false;
     let timer = 0;
@@ -2764,7 +3786,11 @@
     $('tl-prev').addEventListener('click', () => stepBy(-1));
     $('tl-next').addEventListener('click', () => stepBy(1));
     $('tl-play').addEventListener('click', () => play());
-    $('tl-follow').addEventListener('click', () => followLive());
+    $('tl-follow').addEventListener('click', () => toggleFollow());
+    $('tl-unfold').addEventListener('click', () => {
+      T.unfolded = !T.unfolded;
+      drawTimeline();
+    });
     $('tl-speed').addEventListener('click', e => {
       // shift steps back up through the speeds
       const i = SPEEDS.indexOf(T.speed);
@@ -2814,9 +3840,9 @@
       }
       const fresh = r.events || [];
       T.steps.push(...fresh);
-      // past the cap a look goes before an edit does, as on the server
+      // past the cap an inspect goes before an edit does, as on the server
       while (T.steps.length > MAX_TIMELINE) {
-        const look = T.steps.slice(0, T.steps.length >> 1).findIndex(e => e.status === 'read');
+        const look = T.steps.slice(0, T.steps.length >> 1).findIndex(e => e.status === 'inspect');
         const cut = look < 0 ? 0 : look;
         T.steps.splice(cut, 1);
         if (T.at != null && T.at > cut) T.at--;

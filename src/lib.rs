@@ -8,6 +8,7 @@ pub mod extract;
 pub mod externals;
 pub mod html;
 pub mod insights;
+pub mod inspect;
 pub mod instance;
 pub mod languages;
 pub mod model;

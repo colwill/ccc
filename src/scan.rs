@@ -116,7 +116,25 @@ pub fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
 
 // parse every discovered file into a `FileCache`, sorted by path
 pub fn build_caches(root: &Path, files: &[PathBuf]) -> Vec<FileCache> {
-    let mut caches = parse_all(root, files);
+    build_caches_reusing(root, files, |_| None)
+}
+
+// The caches for `files`, each that `held` still has for a file - one that
+// has not changed since - taken from there rather than parsed again.
+pub fn build_caches_reusing(root: &Path, files: &[PathBuf], held: impl Fn(&PathBuf) -> Option<FileCache>) -> Vec<FileCache> {
+    let mut caches = Vec::with_capacity(files.len());
+    let mut fresh = Vec::new();
+    for f in files {
+        match held(f) {
+            Some(mut c) => {
+                // named afresh below, against whatever else is here now
+                c.cache_name = naming::cache_name(&c.rel_path);
+                caches.push(c);
+            }
+            None => fresh.push(f.clone()),
+        }
+    }
+    caches.extend(parse_all(root, &fresh));
     caches.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     disambiguate_cache_names(&mut caches);
     caches

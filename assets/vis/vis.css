@@ -3,6 +3,7 @@
    purple for selection, slate lines. Dark is derived from the same roles. */
 
 :root {
+  --foot: 12px;
   --paper: #fbfcfd;
   --grid: rgba(0, 0, 0, .06);
   --surface: #ffffff;
@@ -254,8 +255,8 @@ button, input { font: inherit; color: inherit; }
   background-image:
     linear-gradient(to right, var(--grid) 1px, transparent 1px),
     linear-gradient(to bottom, var(--grid) 1px, transparent 1px);
-  background-size: calc(20px * var(--zoom, 1)) calc(20px * var(--zoom, 1));
-  background-position: calc(var(--pan-x, 0) * 1px) calc(var(--pan-y, 0) * 1px);
+  /* the grid's size and position follow the camera - see `applyView` */
+  background-size: 20px 20px;
   touch-action: none;
 }
 .viewport.panning { cursor: grabbing; }
@@ -279,7 +280,8 @@ button, input { font: inherit; color: inherit; }
   left: 0;
   top: 0;
   transform-origin: 0 0;
-  transform: translate(calc(var(--pan-x, 0) * 1px), calc(var(--pan-y, 0) * 1px)) scale(var(--zoom, 1));
+  /* moved as one layer, so a pan or zoom repaints none of what it holds */
+  will-change: transform;
 }
 .surface > * { position: absolute; left: 0; top: 0; }
 .wires { overflow: visible; width: 1px; height: 1px; pointer-events: none; }
@@ -304,6 +306,44 @@ button, input { font: inherit; color: inherit; }
 .frame.group { border-style: solid; border-width: 1px; border-radius: 10px; }
 .frame.group > .title { top: 8px; bottom: auto; font-size: 12px; font-weight: 600; }
 
+.group-card {
+  position: absolute;
+  box-sizing: border-box;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .35em;
+  padding: 1em 1.4em;
+  font-size: min(calc(13px * var(--gz, 1)), calc(var(--w, 400px) / 16), calc(var(--h, 300px) / 7));
+  text-align: center;
+  background: var(--surface);
+  border: calc(2px * var(--gz, 1)) solid var(--border);
+  border-radius: calc(12px * var(--gz, 1));
+  box-shadow: var(--shadow);
+  cursor: zoom-in;
+  overflow: hidden;
+  transition: border-color .15s;
+}
+.group-card:hover { border-color: var(--primary); }
+.group-card .g-what { font-size: .8em; letter-spacing: .06em; color: var(--muted); overflow-wrap: anywhere; }
+.group-card .g-title { font-size: 1.8em; font-weight: 650; line-height: 1.15; color: var(--text); overflow-wrap: anywhere; }
+.group-card .g-sub { color: var(--muted); }
+.group-card .g-mark { margin-top: .3em; padding: .15em .8em; border-radius: 1em; background: var(--chg); color: #fff; font-size: .9em; }
+.group-card .g-mark[hidden] { display: none; }
+.group-card.chg {
+  --chg: var(--primary);
+  border-color: var(--chg);
+  box-shadow: var(--shadow), 0 0 0 calc(5px * var(--gz, 1)) color-mix(in srgb, var(--chg) 28%, transparent);
+}
+.group-card.chg-added { --chg: var(--green); }
+.group-card.chg-removed { --chg: var(--red); }
+.group-card.chg-inspect { --chg: var(--blue); }
+.group-wires path { pointer-events: none; }
+.group-wires .gwire { fill: none; stroke: var(--edge); }
+.group-wires .ghead { fill: var(--edge); }
+.group-wires text { fill: var(--muted); stroke: var(--paper); paint-order: stroke; text-anchor: middle; dominant-baseline: central; font-weight: 600; }
+
 /* ---------- C4 nodes (doc canvas cards) ---------- */
 
 .node {
@@ -324,10 +364,12 @@ button, input { font: inherit; color: inherit; }
 .node.dragging { box-shadow: var(--shadow-lift); cursor: grabbing; z-index: 5; transition: none; }
 .node.dim { opacity: .35; }
 .node.hit { box-shadow: var(--shadow), 0 0 0 4px var(--primary-glow); border-color: var(--primary); }
+/* a node's insides never move the layout around it */
+.node { contain: layout style; }
 
-.card { width: 240px; padding: 10px 12px 10px 16px; }
+.card { width: 240px; padding: 10px 12px calc(10px + var(--foot)) 16px; }
 .card.wide { width: 300px; }
-.card.system { width: 340px; padding: 16px 18px 16px 22px; }
+.card.system { width: 340px; padding: 16px 18px calc(16px + var(--foot)) 22px; }
 .card .stripe {
   position: absolute;
   left: -2px;
@@ -389,7 +431,7 @@ button, input { font: inherit; color: inherit; }
   pointer-events: auto;
   cursor: pointer;
 }
-.elabel.dim { opacity: .3; }
+.dimming .elabel:not(.hot) { opacity: .3; }
 .elabel.declared { border-style: dashed; }
 
 /* ---------- wires ---------- */
@@ -399,7 +441,12 @@ button, input { font: inherit; color: inherit; }
 .wire.data { stroke-width: 1.5; stroke-dasharray: 4 3; }
 .wire.back { stroke-dasharray: 6 4; opacity: .6; }
 .wire.declared { stroke-dasharray: 6 4; }
-.wire.dim { opacity: .2; }
+/* the scene's wires dimmed as one drawing, the lit ones copied above it - see `highlight` */
+#wires { transition: opacity .12s; }
+#wires.dimming { opacity: .2; }
+.wires.lit path { pointer-events: none; }
+/* what the collection on show added stays green while it is on show - see `showKept` */
+.wire.kept-new { stroke: var(--green); }
 .wire.hot { stroke: var(--primary); stroke-width: 2.75; opacity: 1; }
 .arrowhead { fill: var(--edge); }
 .arrowhead.hot { fill: var(--primary); }
@@ -409,7 +456,7 @@ button, input { font: inherit; color: inherit; }
 .bp {
   min-width: 170px;
   max-width: 340px;
-  padding: 0 0 6px;
+  padding: 0 0 calc(6px + var(--foot));
   overflow: visible;
 }
 .bp .head {
@@ -449,6 +496,8 @@ button, input { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 .bp .pin.in { grid-column: 1; }
+/* rules what a function returns off from what it takes */
+.bp .rows .sep { grid-column: 1 / -1; border-top: 1px solid var(--edge); margin: 4px 0; }
 .bp .pin.out { grid-column: 2; justify-content: flex-end; text-align: right; }
 .bp .pin .lbl { overflow: hidden; text-overflow: ellipsis; max-width: 170px; }
 .bp .pin.data .lbl { font-family: var(--mono); font-size: 11px; color: var(--muted); }
@@ -472,7 +521,7 @@ button, input { font: inherit; color: inherit; }
 .bp .pin.in i { margin-left: -18px; }
 .bp .pin.out i { margin-right: -18px; order: 2; }
 .bp .body { padding: 2px 12px 2px; font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; max-width: 320px; }
-.bp.compact { min-width: 0; border-radius: 16px; padding: 0; }
+.bp.compact { min-width: 0; border-radius: 16px; padding: 0 0 var(--foot); }
 .bp.compact .rows { display: flex; align-items: center; }
 .bp.compact .pin { padding: 0 10px; min-height: 28px; }
 .bp.compact .chain { font: 11px var(--mono); color: var(--muted); padding: 5px 0; max-width: 260px; overflow-wrap: anywhere; }
@@ -642,13 +691,22 @@ button, input { font: inherit; color: inherit; }
 }
 .message[hidden] { display: none; }
 .message b { color: var(--text); display: block; margin-bottom: 4px; }
-.note-bar {
+/* the view's note, and under it the step on show's, centred at the top */
+.top-notes {
   position: fixed;
   left: 50%;
   top: 64px;
   z-index: 12;
   transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
   max-width: 70vw;
+  pointer-events: none;
+}
+.top-notes > * { pointer-events: auto; max-width: 100%; }
+.note-bar {
   padding: 6px 12px;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -665,15 +723,36 @@ button, input { font: inherit; color: inherit; }
    written yet is dashed amber */
 .node.chg {
   --chg: var(--primary);
+  --chg-label: 'Modified';
   border-color: var(--chg);
   box-shadow: var(--shadow), 0 0 0 3px color-mix(in srgb, var(--chg) 30%, transparent);
   animation: chg-pulse 1.4s ease-out 2;
 }
-.node.chg-added { --chg: var(--green); }
-.node.chg-removed { --chg: var(--red); opacity: .85; }
-.node.chg-pending { --chg: var(--orange); border-style: dashed; }
+.node.chg-added { --chg: var(--green); --chg-label: 'Added'; }
+.node.chg-removed { --chg: var(--red); --chg-label: 'Removed'; opacity: .85; }
+.node.chg-pending { --chg: var(--orange); --chg-label: 'Proposed'; border-style: dashed; }
 /* what an agent looked at, rather than changed */
-.node.chg-read { --chg: var(--blue); }
+.node.chg-inspect { --chg: var(--blue); --chg-label: 'Inspected'; }
+/* what happened to a node, in a word on a label across its foot */
+.node.chg::after,
+.node.kept-new::after,
+.node.leaving::after {
+  content: var(--chg-label, '');
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translate(-50%, 50%);
+  padding: 1px 12px 2px;
+  border: 1.5px solid var(--chg);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--chg) 16%, var(--surface));
+  color: color-mix(in srgb, var(--chg) 85%, var(--text));
+  font: 600 12px/1.35 var(--font);
+  letter-spacing: .02em;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 3;
+}
 @keyframes chg-pulse {
   0% { box-shadow: var(--shadow), 0 0 0 0 color-mix(in srgb, var(--chg) 60%, transparent); }
   70% { box-shadow: var(--shadow), 0 0 0 16px color-mix(in srgb, var(--chg) 0%, transparent); }
@@ -682,6 +761,78 @@ button, input { font: inherit; color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   .node.chg { animation: none; }
   .viewport.glide .surface { transition: none !important; }
+  .node.arrived, .pin.stamp, .pin.stamp::after, .pin.stamp .lbl, .pin.stamp i, .txt-change, .wire.wire-new { animation: none !important; }
+}
+
+/* ---------- motion: see `morph` and `travel` ---------- */
+/* the view left behind, lifted off as one picture */
+.ghost { position: absolute; left: 0; top: 0; transform-origin: 0 0; pointer-events: none; will-change: transform, opacity; }
+.ghost > * { position: absolute; left: 0; top: 0; }
+.node.leaving { --chg: var(--red); --chg-label: 'Removed'; pointer-events: none; border-color: var(--red); }
+/* a node that came into a view drawn again */
+.node.arrived:not(.chg) { animation: arrived 1.2s ease-out 1; }
+@keyframes arrived {
+  0%, 30% { box-shadow: var(--shadow), 0 0 0 3px color-mix(in srgb, var(--green) 55%, transparent); border-color: var(--green); }
+}
+.node.kept-new:not(.chg) { --chg: var(--green); --chg-label: 'Added'; border-color: var(--green); }
+/* a node the ask added, marked by a step that reached it, is an addition still */
+.node.kept-new.chg-modified:not(.chg-pending) { --chg: var(--green); --chg-label: 'Added'; }
+.bp .pin.kept-new { background: color-mix(in srgb, var(--green) 14%, transparent); }
+.bp .pin.kept-new .lbl { color: color-mix(in srgb, var(--green) 75%, var(--text)); }
+/* A pin that came, or whose words changed, stamped onto its node - see
+   `stamp`: the words land from above and press in, the pin's dot pops on,
+   and a ring of ink spreads from where it struck - green for one that came,
+   amber for one that changed - as the mark it leaves fades. */
+.bp .pin.stamp { --ink: var(--green); animation: stamp-mark 1.5s ease-out var(--stamp-at, 0s) 1 backwards; }
+.bp .pin.stamp.changed { --ink: var(--orange); }
+.bp .pin.stamp .lbl { animation: stamp-press .5s cubic-bezier(.3, 1.5, .55, 1) var(--stamp-at, 0s) 1 backwards; }
+.bp .pin.stamp i { animation: stamp-dot .35s cubic-bezier(.3, 1.6, .55, 1) var(--stamp-at, 0s) 1 backwards; }
+.bp .pin.stamp::after {
+  content: '';
+  position: absolute;
+  inset: 1px 8px;
+  border: 2px solid var(--ink);
+  border-radius: 5px;
+  opacity: 0;
+  pointer-events: none;
+  animation: stamp-ink .75s ease-out calc(var(--stamp-at, 0s) + .2s) 1;
+}
+@keyframes stamp-press {
+  0% { opacity: 0; transform: scale(1.9) translateY(-3px); filter: blur(1.5px); }
+  55% { opacity: 1; transform: scale(.92); filter: none; }
+  80% { transform: scale(1.03); }
+}
+@keyframes stamp-dot {
+  0% { transform: scale(0); }
+}
+@keyframes stamp-ink {
+  0% { opacity: .95; transform: scale(.94); }
+  100% { opacity: 0; transform: scale(1.16, 1.5); }
+}
+@keyframes stamp-mark {
+  0% { background: transparent; }
+  20%, 45% { background: color-mix(in srgb, var(--ink) 24%, transparent); }
+}
+@keyframes words-change {
+  0%, 35% { background: color-mix(in srgb, var(--orange) 28%, transparent); }
+}
+.bp .pin .lbl-was {
+  position: absolute;
+  font: 11px var(--mono);
+  color: var(--red);
+  text-decoration: line-through;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.bp .pin.pin-out { position: absolute; pointer-events: none; }
+.bp .pin.pin-out .lbl { color: var(--red); text-decoration: line-through; }
+.txt-change { animation: words-change 1.2s ease-out 1; border-radius: 3px; }
+/* the wires of a view drawn again: the old fade, a gone one red, a new one green */
+.ghost-wires .wire { opacity: .7; }
+.ghost-wires .wire.gone { stroke: var(--red); opacity: 1; }
+.wire.wire-new { animation: wire-new 1.6s ease-out 1; }
+@keyframes wire-new {
+  0%, 45% { stroke: var(--green); }
 }
 .viewport.glide .surface { transition: transform .6s cubic-bezier(.2, .7, .2, 1); }
 .viewport.glide { transition: background-size .6s, background-position .6s; }
@@ -707,11 +858,17 @@ button, input { font: inherit; color: inherit; }
 /* no edits yet: only the switches for what comes stay, in the corner */
 .timeline.empty { left: auto; }
 .timeline.empty > :not(.tl-ws):not(.tl-follow):not(.tl-speed):not(.tl-focus) { display: none; }
-body.with-tl-switches .zoom { bottom: 62px; }
-body.with-timeline .legend { bottom: 62px; }
-body.with-timeline .zoom { bottom: 62px; }
-body.with-timeline .panel { bottom: 62px; }
-.tl-controls { display: flex; gap: 2px; }
+/* what sits above the timeline keeps clear of it, however many rows it wraps
+   to - `--tl-top` is how far its top is from the window's foot */
+body.with-tl-switches .zoom,
+body.with-timeline .legend,
+body.with-timeline .zoom,
+body.with-timeline .panel { bottom: calc(var(--tl-top, 52px) + 10px); }
+.tl-controls { display: flex; flex: none; gap: 2px; max-width: 120px; overflow: hidden; transition: max-width .2s ease, opacity .2s ease; }
+/* following, folded away to the left - the flex gap after them goes too */
+.tl-controls.folded { max-width: 0; opacity: 0; margin-right: -8px; }
+.timeline .tl-unfold { min-width: 22px; padding: 0 4px; color: var(--muted); font-weight: 400; }
+.timeline .tl-unfold[hidden] { display: none; }
 .timeline button {
   height: 28px;
   min-width: 28px;
@@ -723,6 +880,8 @@ body.with-timeline .panel { bottom: 62px; }
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
+  /* a switch keeps the width its words need - the track, the ask and the step give way instead */
+  flex: none;
 }
 .timeline button:hover:not(:disabled) { background: var(--hover); color: var(--tool-active); }
 .timeline button:disabled { opacity: .4; cursor: default; }
@@ -745,7 +904,7 @@ body.with-timeline .panel { bottom: 62px; }
 .tl-ticks .tick.reverted { background: var(--red); }
 .tl-ticks .tick.discarded { background: var(--grey); opacity: .45; }
 .tl-ticks .tick.edited { background: var(--blue); }
-.tl-ticks .tick.read { background: var(--primary); opacity: .4; height: 30%; }
+.tl-ticks .tick.inspect { background: var(--primary); opacity: .4; height: 30%; }
 .tl-ticks .tick.at { height: 100%; opacity: 1; box-shadow: 0 0 0 2px var(--primary); }
 /* a change made by hand is a little person: the tick its body, this its head */
 .tl-ticks .tick.human { position: relative; height: 40%; }
@@ -771,7 +930,6 @@ body.with-timeline .panel { bottom: 62px; }
 .tl-step .person, .replay-badge .person, .tl-ask .person, .ask-row .person { color: var(--blue); }
 .tl-ask .glyph, .ask-row .glyph { color: var(--primary); }
 /* where one ask's steps end and the next one's begin */
-.tl-ticks .tl-sep { flex: none; align-self: stretch; width: 2px; margin: 0 2px; border-radius: 1px; background: var(--border); }
 .timeline .tl-ask {
   flex: 0 1 auto;
   min-width: 0;
@@ -783,6 +941,8 @@ body.with-timeline .panel { bottom: 62px; }
   font-weight: 400;
   font-size: 12px;
 }
+.timeline .tl-ask:not([hidden]) { display: inline-flex; align-items: center; gap: 6px; }
+.timeline .tl-ask .ask-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .timeline .tl-ask[hidden] { display: none; }
 .panel .ask-session {
   display: flex;
@@ -822,6 +982,7 @@ body.with-timeline .panel { bottom: 62px; }
   overflow: hidden;
 }
 .panel .ask-n { flex: none; color: var(--muted); font-size: 11px; }
+.timeline .tl-ask .ask-n { flex: none; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .panel .ask-play { flex: none; border: 0; background: none; color: var(--tool); cursor: pointer; }
 .panel .ask-play:hover { color: var(--primary); }
 .timeline .tl-step {
@@ -835,18 +996,56 @@ body.with-timeline .panel { bottom: 62px; }
   color: var(--muted);
 }
 .timeline .tl-step:disabled { opacity: 1; }
-.tl-side { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.tl-side { display: flex; flex: none; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .tl-side[hidden] { display: none; }
 .timeline .tl-side button { border-radius: 0; font-weight: 400; font-size: 12px; }
 .timeline .tl-side button[aria-pressed="true"] { background: var(--primary-soft); color: var(--primary); }
-.timeline .tl-follow { border: 1px solid var(--border); border-radius: 14px; font-weight: 400; }
-.timeline .tl-follow[aria-pressed="true"] { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+/* the follow switch: green while it follows live changes, grey while it does not */
+.timeline .tl-follow {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  font-weight: 400;
+  color: var(--muted);
+}
+.tl-follow .switch {
+  position: relative;
+  flex: none;
+  width: 26px;
+  height: 15px;
+  border-radius: 8px;
+  background: var(--grey);
+  opacity: .6;
+  transition: background .15s, opacity .15s;
+}
+.tl-follow .switch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / .25);
+  transition: transform .15s;
+}
+.timeline .tl-follow[aria-checked="true"] {
+  border-color: var(--green);
+  color: color-mix(in srgb, var(--green) 80%, var(--text));
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+}
+.timeline .tl-follow[aria-checked="true"]:hover:not(:disabled) {
+  color: color-mix(in srgb, var(--green) 80%, var(--text));
+  background: color-mix(in srgb, var(--green) 20%, transparent);
+}
+.tl-follow[aria-checked="true"] .switch { background: var(--green); opacity: 1; }
+.tl-follow[aria-checked="true"] .switch::after { transform: translateX(11px); }
 
 .replay-badge {
-  position: fixed;
-  left: 12px;
-  top: 64px;
-  z-index: 12;
   padding: 4px 10px;
   border: 1px solid var(--orange);
   border-radius: 14px;
@@ -854,12 +1053,12 @@ body.with-timeline .panel { bottom: 62px; }
   color: var(--text);
   font-size: 12px;
   box-shadow: var(--shadow-bar);
-  max-width: calc(100vw - 24px);
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
 .replay-badge[hidden] { display: none; }
+.replay-badge .off-map { color: var(--muted); }
 
 .panel .chg-row { display: flex; align-items: baseline; gap: 8px; }
 .panel .chg-tag {
@@ -872,7 +1071,7 @@ body.with-timeline .panel { bottom: 62px; }
 }
 .panel .chg-tag.added { background: var(--green); }
 .panel .chg-tag.removed { background: var(--red); }
-.panel .chg-tag.read { background: var(--blue); }
+.panel .chg-tag.inspect { background: var(--blue); }
 .panel .diff-file { margin: 8px 0 2px; font: 12px var(--mono); }
 .panel .diff-file span { color: var(--muted); }
 .panel .diff pre {
@@ -894,8 +1093,7 @@ body.with-timeline .panel { bottom: 62px; }
   .search input { width: 160px; }
   .panel { width: auto; left: 12px; top: auto; height: 45vh; }
   .panel:not([hidden]) ~ .zoom { right: 12px; bottom: calc(45vh + 24px); }
-  body.with-timeline .panel { bottom: 62px; }
-  body.with-timeline .panel:not([hidden]) ~ .zoom { bottom: calc(45vh + 74px); }
+  body.with-timeline .panel:not([hidden]) ~ .zoom { bottom: calc(45vh + var(--tl-top, 52px) + 22px); }
 }
 
 /* a VS Code side bar: one column - the crumbs get a row of their own above
@@ -910,11 +1108,22 @@ body.with-timeline .panel { bottom: 62px; }
   .search svg { top: 8px; }
   .tools .chip { padding: 0 6px; font-size: 11px; }
   .viewport { top: 84px; }
-  .panel, .note-bar, .replay-badge { top: 94px; }
+  .panel, .top-notes { top: 94px; }
+  .panel { left: 6px; right: 6px; }
+}
+
+/* too narrow for the track beside every switch: it takes a row of its own,
+   rather than a switch being pushed out of the bar */
+@media (max-width: 720px) {
   .timeline { flex-wrap: wrap; left: 6px; right: 6px; bottom: 6px; }
   .tl-track { order: 5; flex-basis: 100%; }
   .timeline .tl-step { flex: 1 1 0; max-width: none; }
   .timeline .tl-ask { max-width: 12ch; }
-  body.with-timeline .zoom, body.with-timeline .panel { bottom: 88px; }
-  .panel { left: 6px; right: 6px; }
+  /* `Following · 12`, the word left to the tooltip */
+  .tl-follow .tl-behind { display: none; }
+}
+
+@media (max-width: 560px) {
+  /* `Follow`, the rest of its name left to the tooltip */
+  .tl-follow .tl-follow-more { display: none; }
 }

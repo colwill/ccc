@@ -189,11 +189,18 @@ as in the editor:
 - **A definition at a time.** An edit is split into the definitions it touches - imports first,
   then what it adds, then what it changes, then what it removes - so a replay builds the change up
   one function, type or constant at a time, in the order the agent staged it.
-- **Looks too.** `find`, `references`, `file` and `dependencies` calls land as looks at what they
-  named, so you can see what an agent read before it wrote anything.
+- **Inspects too.** What an agent reads lands as an inspect of what it read, so you can see what
+  it looked at before it wrote anything: `find`, `references`, `file` and `dependencies` calls as
+  ccc answers them, and its own reads - Claude Code's `Read`, a `cat`, `sed -n` or `grep` of a
+  file in its shell, a subagent's too - from its transcript, as it writes them.
+- **Follow live changes.** The switch on the right is green while each change is shown as it lands
+  (`L` turns it on and off). While it is on, the step controls fold away to the left behind `»`,
+  and they open again by themselves once it is off.
 - **At your pace.** Live keeps the time between steps as it was; ½×, ¼×, ⅛× and ⅒× stretch it, and
   following runs behind by however many steps are still waiting.
-- **One step on its own.** While a step is on show (◎), what it did not touch fades back, and a big
+- **Big views in groups.** A view of 50 or more components or functions is laid out a group at a
+  time
+- **Granular Changes.** While a step is on show (◎), what it did not touch fades back, and a big
   scene draws only what is wired to it, laid out together to fit the screen. Click the canvas to
   bring the rest back.
 

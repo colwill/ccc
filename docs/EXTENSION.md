@@ -63,7 +63,8 @@ steps along its foot. While an agent edits through ccc's tools, it flies to each
 and marks it, and any step can be replayed before and after. A staged change is drawn as
 **Proposed** - the code as it would be - before anything is written, beside the one-line intent the
 agent gave for it. Changes saved by hand land on the timeline too, marked with a person. Each edit
-plays a definition at a time and an agent's reads land as looks, at the pace the speed button sets -
+plays a definition at a time and an agent's reads land as inspects - through ccc or with its own
+tools - one ask at a time, at the pace the speed button sets -
 it is the same page as in a browser, so it behaves the same there (see the
 [README](../README.md#architecture-visualiser)). A change
 that only moves whitespace or wraps lines is not marked unless ¶ is on. Its title-bar buttons open the same

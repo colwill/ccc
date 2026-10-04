@@ -1314,7 +1314,7 @@ pub fn look(at_ms: u64, tool: &str, what: &str, sites: &[(String, usize, bool)],
                     file: path.clone(),
                     name: f.name.clone(),
                     owner: f.owner.clone(),
-                    change: "read",
+                    change: "inspect",
                     before: None,
                     after: Some(span),
                     lines_before: Vec::new(),
@@ -1342,14 +1342,14 @@ pub fn look(at_ms: u64, tool: &str, what: &str, sites: &[(String, usize, bool)],
         "at": at_ms,
         "tool": tool,
         "changeset": Value::Null,
-        "status": "read",
+        "status": "inspect",
         "by": "agent",
         "intent": [asked],
         "on_disk": "after",
         "ops": [],
         "files": files
             .iter()
-            .map(|p| json!({"path": p, "change": "read", "added": 0, "removed": 0, "hunks": [], "diff": [], "diff_truncated": false, "whitespace": false}))
+            .map(|p| json!({"path": p, "change": "inspect", "added": 0, "removed": 0, "hunks": [], "diff": [], "diff_truncated": false, "whitespace": false}))
             .collect::<Vec<_>>(),
         "files_total": files.len(),
         "whitespace": false,
@@ -2906,8 +2906,8 @@ f :: proc(x: int) -> int {
         let sites = [("src/pay.rs".to_string(), 1, true), ("src/pay.rs".to_string(), 4, false)];
         let ev = look(0, "references", "charge", &sites, &caches).expect("a look");
         let Focus::Flow(t) = &ev.focus else { panic!("{:?}", ev.focus) };
-        assert_eq!((t.name.as_str(), t.change), ("charge", "read"));
-        assert_eq!(ev.json["status"], "read");
+        assert_eq!((t.name.as_str(), t.change), ("charge", "inspect"));
+        assert_eq!(ev.json["status"], "inspect");
         assert_eq!(ev.json["intent"], json!(["references charge"]));
         let names: Vec<&str> = ev.json["functions"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["charge", "refund"]);

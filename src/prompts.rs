@@ -207,7 +207,7 @@ fn home() -> Option<PathBuf> {
 
 // the directory claude code keeps its transcripts in
 // ccc:skip
-fn claude_root() -> Option<PathBuf> {
+pub(crate) fn claude_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         return Some(PathBuf::from(dir).join("projects"));
     }
@@ -237,7 +237,7 @@ fn transcript_cwd(path: &Path) -> Option<String> {
 }
 
 // ccc:skip
-fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -253,7 +253,7 @@ fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
 // transcripts for this project: the slug first, then any other project
 // directory whose sessions actually ran here
 // ccc:skip
-fn claude_transcripts(root: &Path) -> (Vec<PathBuf>, String) {
+pub(crate) fn claude_transcripts(root: &Path) -> (Vec<PathBuf>, String) {
     let Some(base) = claude_root() else {
         return (Vec::new(), "<no home directory>".into());
     };
@@ -415,6 +415,10 @@ fn truncate(s: &str, cap: usize) -> String {
 // harness metadata and slash-command expansions are not requests
 // ccc:skip
 fn user_prompt_text(rec: &Value) -> Option<String> {
+    if let Some(raw) = queued_text(rec) {
+        let condensed = condense(&raw);
+        return (!condensed.is_empty()).then_some(condensed);
+    }
     if rec.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
     }
@@ -448,6 +452,32 @@ fn user_prompt_text(rec: &Value) -> Option<String> {
     }
     let condensed = condense(&raw);
     (!condensed.is_empty()).then_some(condensed)
+}
+
+// A message the user sent while the agent worked: the harness queues it and
+// hands it over mid-turn, as an attachment rather than a turn of its own - a
+// request all the same, and what the agent does after it answers it.
+fn queued_text(rec: &Value) -> Option<String> {
+    if rec.get("type").and_then(|t| t.as_str()) != Some("attachment") {
+        return None;
+    }
+    let a = rec.get("attachment")?;
+    let is = |k: &str, want: &str| a.get(k).and_then(|v| v.as_str()).is_none_or(|v| v == want);
+    let human = a.get("origin").and_then(|o| o.get("kind")).and_then(|k| k.as_str()).is_none_or(|k| k == "human");
+    if a.get("type").and_then(|t| t.as_str()) != Some("queued_command") || !is("commandMode", "prompt") || !human {
+        return None;
+    }
+    match a.get("prompt")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
 }
 
 // the longest distinctive line of what a tool wrote, for finding it again
@@ -1317,6 +1347,36 @@ mod tests {
         assert_eq!(turns[0].edits[0].path, "src/pay.rs", "paths are repo-relative");
         assert_eq!(turns[0].edits[0].tool, "Edit");
         assert!(turns[0].edits[0].anchor.is_some());
+    }
+
+    // A message sent while the agent worked reaches it queued, mid-turn - a
+    // request of its own, the edits after it its own - while a task's note
+    // to the agent is no one's request.
+    #[test]
+    fn a_message_queued_mid_turn_is_a_request_of_its_own() {
+        let dir = tempdir::Dir::new("prompt-queued");
+        let queued = |uuid: &str, parent: &str, ts: &str, prompt: Value, origin: &str| {
+            serde_json::json!({
+                "type": "attachment", "uuid": uuid, "parentUuid": parent, "timestamp": ts, "cwd": "/proj",
+                "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": "prompt", "origin": {"kind": origin}},
+            })
+        };
+        let edit = |text: &str| tool_use("Edit", serde_json::json!({"file_path": "/proj/src/net.rs", "new_string": text}));
+        let file = write(
+            dir.path(),
+            "s9.jsonl",
+            &[
+                user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("rename the port field")),
+                assistant("a1", "u1", "2026-08-20T10:00:01Z", serde_json::json!([edit("    pub listen_port: u16,")])),
+                queued("q1", "a1", "2026-08-20T10:00:02Z", serde_json::json!([{"type": "text", "text": "and the host field"}]), "human"),
+                assistant("a2", "q1", "2026-08-20T10:00:03Z", serde_json::json!([edit("    pub listen_host: String,")])),
+                queued("q2", "a2", "2026-08-20T10:00:04Z", serde_json::json!("a background task finished"), "task"),
+            ],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        let got: Vec<(&str, usize)> = turns.iter().map(|t| (t.prompt.as_str(), t.edits.len())).collect();
+        assert_eq!(got, [("rename the port field", 1), ("and the host field", 1)]);
+        assert_eq!(turns[1].id, "claude:s9:q1");
     }
 
     #[test]
