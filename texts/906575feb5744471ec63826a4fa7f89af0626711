@@ -1,0 +1,30 @@
+//! What agents read with their own tools - a `Read`, a `cat` or a `sed -n` in
+//! a shell - taken from their transcripts as they are written. ccc's read tools
+//! put their looks on the timeline as they answer; these are the rest, so the
+//! visualiser shows an agent inspecting code whichever way it looked.
+//!
+//! Claude Code's transcripts only, a session's subagents with it: Copilot's
+//! chat log keeps no record of the files its tools read.
+
+use crate::model::FileCache;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+
+// transcripts are looked for again this often - a new session, a subagent
+const FOUND_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+// and this often when claude keeps no directory for the project, where
+// finding them means opening every other project's
+const FOUND_SLOW: std::time::Duration = std::time::Duration::from_secs(600);
+// the sites one read names past the file itself
+const READ_SITES: usize = 59;
+
+// commands that read the files they name and write none
+const READERS: &[&str] = &[
+    "cat", "head", "tail", "sed", "awk", "nl", "less", "more", "bat", "batcat", "view", "grep", "egrep", "fgrep", "rg", "ag",
+    "wc", "cut", "sort", "uniq", "diff", "strings", "xxd", "od", "jq",
+];
+// readers whose first word is a pattern or a script rather than a file
+const PATTERNED: &[&str] = &["sed", "awk", "grep", "egrep", "fgrep", "rg", "ag", "jq"];
+// words ahead of a command that only change how it runs
+const WRAPPERS: &[&str] = &["sudo", "env", "time", "command", "nohup", "exec", "nice"];

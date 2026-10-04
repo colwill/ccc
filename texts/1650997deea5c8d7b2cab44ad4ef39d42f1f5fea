@@ -1,0 +1,12 @@
+//! What agents read with their own tools - a `Read`, a `cat` or a `sed -n` in
+//! a shell - taken from their transcripts as they are written. ccc's read tools
+//! put their looks on the timeline as they answer; these are the rest, so the
+//! visualiser shows an agent inspecting code whichever way it looked.
+//!
+//! Claude Code's transcripts only, a session's subagents with it: Copilot's
+//! chat log keeps no record of the files its tools read.
+
+use crate::model::FileCache;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};

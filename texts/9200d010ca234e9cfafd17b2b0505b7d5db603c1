@@ -1,0 +1,596 @@
+//! Replays: the timeline of what agents did on a branch, kept in the
+//! repository so a team can play it back. A branch's replay lives under a ref
+//! of its own, `refs/ccc/replay/<branch>`, beside the branches rather than in
+//! them - so no branch's files carry it, and a merge can never bring one to
+//! the default branch. A pre-push hook saves it as the branch is pushed.
+
+use crate::edit::FileText;
+use crate::prompts::{Asks, Turn};
+use anyhow::{bail, Context, Result};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+// a branch's replay, beside the branches rather than in them
+pub const REF_PREFIX: &str = "refs/ccc/replay/";
+// what a fetch takes as well, so a teammate's `git fetch` brings the replays
+const FETCH_SPEC: &str = "+refs/ccc/replay/*:refs/ccc/replay/*";
+// marks a pre-push hook as the one ccc wrote
+const HOOK_MARK: &str = "# ccc: save the replay of each branch pushed";
+// the format a session file declares on its first line
+const FORMAT: u64 = 1;
+// an ask's request kept on its steps, cut past this
+const PROMPT_CHARS: usize = 2000;
+// asks are looked for this long before a replay's first new step
+const ASK_LEAD_SECS: i64 = 4 * 3600;
+// the session of steps no ask accounts for, before any that one does
+const UNATTRIBUTED: &str = "unattributed";
+
+// git in `root`, its output trimmed - none when it fails
+fn git(root: &Path, args: &[&str]) -> Option<String> {
+    git_raw(root, args).map(|s| s.trim().to_string())
+}
+
+// git in `root`, its output as it came
+fn git_raw(root: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git").arg("-C").arg(root).args(args).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// git fed `input`, with `env` set - an error carries what git said
+fn git_in(root: &Path, args: &[&str], input: &[u8], env: &[(&str, &str)]) -> Result<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running git")?;
+    child.stdin.take().context("git's stdin")?.write_all(input)?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+// is `root` inside a git work tree
+pub fn is_repo(root: &Path) -> bool {
+    git(root, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
+}
+
+// the branch checked out in `root` - none when HEAD is detached
+pub fn branch_of(root: &Path) -> Option<String> {
+    git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).filter(|b| !b.is_empty())
+}
+
+// What each side of a step's files held, as git objects, so a saved replay
+// draws any side again without the working tree. `kept` holds the texts
+// already stored - the parts of one step share their sides.
+pub(crate) fn texts_of(root: &Path, files: &[FileText], kept: &mut HashMap<u64, String>) -> Value {
+    let mut id = |text: &Option<String>| -> Option<String> {
+        let text = text.as_deref()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(text, &mut h);
+        let key = std::hash::Hasher::finish(&h);
+        if let Some(id) = kept.get(&key) {
+            return Some(id.clone());
+        }
+        let id = git_in(root, &["hash-object", "-w", "--stdin"], text.as_bytes(), &[]).ok()?;
+        kept.insert(key, id.clone());
+        Some(id)
+    };
+    json!(files
+        .iter()
+        .map(|f| json!({"path": f.path, "before": id(&f.before), "after": id(&f.after)}))
+        .collect::<Vec<_>>())
+}
+
+// every turn by the changesets its calls named
+pub(crate) fn by_changeset(turns: &[Turn]) -> BTreeMap<&str, Vec<&Turn>> {
+    let mut named: BTreeMap<&str, Vec<&Turn>> = BTreeMap::new();
+    for t in turns {
+        for c in &t.changesets {
+            named.entry(c.as_str()).or_default().push(t);
+        }
+    }
+    named
+}
+
+// The ask a step answers: the one whose calls named its changeset - the
+// latest made before it, as a changeset can be staged under one ask and
+// applied under the next - or, for a look, which names none, the ask made
+// last before it, in its own session where it names one. A change made by
+// hand answers none.
+pub(crate) fn ask_of<'t>(
+    human: bool,
+    changeset: Option<&str>,
+    session: Option<&str>,
+    at_ms: u64,
+    turns: &'t [Turn],
+    named: &BTreeMap<&str, Vec<&'t Turn>>,
+) -> Option<&'t Turn> {
+    // a transcript's clock and the server's can sit a moment apart
+    let made_before = |t: &&Turn| t.epoch * 1000 <= at_ms as i64 + 5000;
+    match (human, changeset) {
+        (true, _) => None,
+        (_, Some(c)) => named.get(c).and_then(|ts| ts.iter().rev().find(|t| made_before(t)).or(ts.first()).copied()),
+        (_, None) => {
+            let latest = |s: Option<&str>| turns.iter().filter(made_before).filter(|t| s.is_none_or(|s| t.session == s)).max_by_key(|t| t.epoch);
+            session.and_then(|s| latest(Some(s))).or_else(|| latest(None))
+        }
+    }
+}
+
+// the remote a branch tracks, else `origin`, else the first there is
+fn remote_for(root: &Path, branch: &str) -> Option<String> {
+    let tracked = git(root, &["config", "--get", &format!("branch.{branch}.remote")]).filter(|r| !r.is_empty() && r != ".");
+    tracked.or_else(|| {
+        let all = git(root, &["remote"])?;
+        let names: Vec<&str> = all.lines().collect();
+        names.iter().find(|r| **r == "origin").or(names.first()).map(|r| r.to_string())
+    })
+}
+
+// the branch a remote's HEAD names, else `init.defaultBranch`, else `main` or
+// `master` - whichever the repository has
+fn default_branch(root: &Path, remote: Option<&str>) -> Option<String> {
+    if let Some(r) = remote {
+        if let Some(head) = git(root, &["symbolic-ref", "--quiet", "--short", &format!("refs/remotes/{r}/HEAD")]) {
+            return Some(head.strip_prefix(&format!("{r}/")).unwrap_or(&head).to_string());
+        }
+    }
+    let has = |b: &str| {
+        git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_some()
+            || remote.is_some_and(|r| git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{r}/{b}")]).is_some())
+    };
+    let configured = git(root, &["config", "--get", "init.defaultBranch"]).filter(|b| has(b));
+    configured.or_else(|| ["main", "master"].into_iter().find(|b| has(b)).map(str::to_string))
+}
+
+// a teammate's `git fetch` from `remote` brings the replays along
+fn share(root: &Path, remote: &str) {
+    let key = format!("remote.{remote}.fetch");
+    let specs = git(root, &["config", "--get-all", &key]).unwrap_or_default();
+    if !specs.lines().any(|s| s == FETCH_SPEC) {
+        let _ = git(root, &["config", "--add", &key, FETCH_SPEC]);
+    }
+}
+
+// who a replay commit is by - the repository's own identity, or ccc's where it has none
+fn identity(root: &Path) -> Vec<(&'static str, &'static str)> {
+    if git(root, &["config", "user.email"]).is_some_and(|e| !e.is_empty()) {
+        return Vec::new();
+    }
+    vec![
+        ("GIT_AUTHOR_NAME", "ccc"),
+        ("GIT_AUTHOR_EMAIL", "ccc@localhost"),
+        ("GIT_COMMITTER_NAME", "ccc"),
+        ("GIT_COMMITTER_EMAIL", "ccc@localhost"),
+    ]
+}
+
+// a step as a replay knows it, so one saved twice is kept once - a change by
+// hand, which every server on the project finds, by what it changed
+fn key_of(v: &Value) -> String {
+    if v["by"] == "human" {
+        return format!("hand:{}", v["texts"]);
+    }
+    format!("{}:{}", v["server"].as_str().unwrap_or_default(), v["seq"])
+}
+
+// a session id as a file name
+fn file_safe(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
+#[derive(Debug, Default)]
+pub struct SaveOptions {
+    // the branch whose replay is saved - the one checked out when none
+    pub branch: Option<String>,
+    // where it is pushed - the branch's upstream remote, else `origin`
+    pub remote: Option<String>,
+    pub push: bool,
+    // save it for the default branch too, which is left out unless asked for
+    pub default_branch: bool,
+}
+
+// what a save did
+#[derive(Debug, Default)]
+pub struct Saved {
+    pub branch: String,
+    // the steps added, and the sessions they went to
+    pub steps: usize,
+    pub sessions: Vec<String>,
+    // why nothing was saved, when nothing was
+    pub skipped: Option<String>,
+    // the remote the replay went to, or why it did not
+    pub pushed: Option<Result<String, String>>,
+}
+
+impl Saved {
+    fn skip(branch: &str, why: &str) -> Saved {
+        Saved { branch: branch.to_string(), skipped: Some(why.to_string()), ..Default::default() }
+    }
+
+    pub fn describe(&self) -> String {
+        let mut out = match &self.skipped {
+            Some(why) => format!("ccc: replay of {} not saved - {why}", if self.branch.is_empty() { "this checkout" } else { &self.branch }),
+            None => format!(
+                "ccc: replay of {} saved to {REF_PREFIX}{} - {} step(s) in {}",
+                self.branch,
+                self.branch,
+                self.steps,
+                self.sessions.join(", ")
+            ),
+        };
+        match &self.pushed {
+            Some(Ok(remote)) => out.push_str(&format!(", pushed to {remote}")),
+            Some(Err(e)) => out.push_str(&format!("\nccc: the replay was not pushed: {e}")),
+            None => {}
+        }
+        out
+    }
+}
+
+// Save a branch's replay: the steps the project's feed holds for it that the
+// replay does not, filed by the agent session behind them, committed to the
+// branch's replay ref and pushed beside it. The default branch keeps none
+// unless asked to.
+pub fn save(root: &Path, opts: &SaveOptions) -> Result<Saved> {
+    if !is_repo(root) {
+        return Ok(Saved::skip("", "not a git repository"));
+    }
+    let Some(branch) = opts.branch.clone().filter(|b| !b.is_empty()).or_else(|| branch_of(root)) else {
+        return Ok(Saved::skip("", "HEAD is on no branch"));
+    };
+    let remote = opts.remote.clone().filter(|r| !r.is_empty()).or_else(|| remote_for(root, &branch));
+    let allowed = opts.default_branch || git(root, &["config", "--bool", "ccc.replay.defaultBranch"]).as_deref() == Some("true");
+    if !allowed && default_branch(root, remote.as_deref()).as_deref() == Some(branch.as_str()) {
+        return Ok(Saved::skip(
+            &branch,
+            "it is the default branch, which keeps no replay unless asked to \
+             (--default-branch, or `git config ccc.replay.defaultBranch true`)",
+        ));
+    }
+    let refname = format!("{REF_PREFIX}{branch}");
+    // what a teammate already pushed is built on, where it runs on from this
+    if let (true, Some(r)) = (opts.push, &remote) {
+        let _ = git(root, &["fetch", "--quiet", "--no-tags", r, &format!("{refname}:{refname}")]);
+    }
+    let base = git(root, &["rev-parse", "--verify", "--quiet", &format!("{refname}^{{commit}}")]);
+
+    // the session files the replay holds so far, and every step in them
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    let mut have: BTreeSet<String> = BTreeSet::new();
+    if let Some(b) = &base {
+        for name in git(root, &["ls-tree", "-r", "--name-only", b, "sessions"]).unwrap_or_default().lines() {
+            let text = git_raw(root, &["cat-file", "blob", &format!("{b}:{name}")]).unwrap_or_default();
+            let steps = text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v.get("status").is_some());
+            have.extend(steps.map(|v| key_of(&v)));
+            files.insert(name.to_string(), text);
+        }
+    }
+
+    // the steps the feed holds for this branch that the replay does not
+    let feed = std::fs::read_to_string(crate::serve::feed_path(root)).unwrap_or_default();
+    let mut steps: Vec<Value> = feed
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["branch"].as_str() == Some(branch.as_str()))
+        .filter(|v| have.insert(key_of(v)))
+        .collect();
+    let mut saved = Saved { branch: branch.clone(), ..Default::default() };
+    if steps.is_empty() {
+        saved.skipped = Some("nothing new since it was last saved".into());
+    } else {
+        steps.sort_by_key(|v| v["at"].as_u64().unwrap_or(0));
+        let first = steps[0]["at"].as_u64().unwrap_or(0) as i64 / 1000;
+        let turns = Asks::default().since(root, first - ASK_LEAD_SECS);
+        let named = by_changeset(&turns);
+        let mut changed = BTreeSet::new();
+        let mut texts = BTreeSet::new();
+        let mut added: BTreeMap<String, usize> = BTreeMap::new();
+        // a step no ask accounts for goes with the session it falls in
+        let mut session: Option<String> = None;
+        for mut v in steps {
+            let ask = ask_of(v["by"] == "human", v["changeset"].as_str(), v["session"].as_str(), v["at"].as_u64().unwrap_or(0), &turns, &named);
+            if let Some(t) = ask {
+                session = Some(t.session.clone());
+            }
+            let s = session.clone().unwrap_or_else(|| UNATTRIBUTED.to_string());
+            v["ask"] = ask.map_or(Value::Null, |t| {
+                json!({
+                    "id": t.id,
+                    "agent": t.agent,
+                    "model": t.model,
+                    "at": t.epoch * 1000,
+                    "prompt": t.prompt.chars().take(PROMPT_CHARS).collect::<String>(),
+                })
+            });
+            for t in v["texts"].as_array().into_iter().flatten() {
+                texts.extend(["before", "after"].iter().filter_map(|side| t[*side].as_str().map(str::to_string)));
+            }
+            let name = format!("sessions/{}.jsonl", file_safe(&s));
+            let file = files
+                .entry(name.clone())
+                .or_insert_with(|| format!("{}\n", json!({"ccc_replay": FORMAT, "branch": branch, "session": s})));
+            file.push_str(&v.to_string());
+            file.push('\n');
+            changed.insert(name);
+            *added.entry(s).or_default() += 1;
+        }
+        commit(root, &refname, base.as_deref(), &files, &changed, &texts, added.values().sum())?;
+        saved.steps = added.values().sum();
+        saved.sessions = added.into_keys().collect();
+    }
+    // a replay saved but never pushed goes along now too
+    let local = git(root, &["rev-parse", "--verify", "--quiet", &refname]);
+    if let (true, Some(r), Some(_)) = (opts.push, &remote, local) {
+        share(root, r);
+        // the hook's own push - `--no-verify` keeps it from running the hook again
+        let pushed = git_in(root, &["push", "--quiet", "--no-verify", r, &format!("{refname}:{refname}")], b"", &[]);
+        saved.pushed = Some(pushed.map(|_| r.clone()).map_err(|e| e.to_string()));
+    }
+    Ok(saved)
+}
+
+// The replay's next commit: the session files that gained steps, and every
+// text those steps name, over what the ref held - built in an index of its
+// own, so the working tree and the user's index are never touched.
+fn commit(
+    root: &Path,
+    refname: &str,
+    base: Option<&str>,
+    files: &BTreeMap<String, String>,
+    changed: &BTreeSet<String>,
+    texts: &BTreeSet<String>,
+    steps: usize,
+) -> Result<()> {
+    let index = git(root, &["rev-parse", "--git-path", "ccc-replay.index"]).context("finding the git directory")?;
+    let index = root.join(index);
+    let _ = std::fs::remove_file(&index);
+    let index_env = index.to_string_lossy().into_owned();
+    let env = [("GIT_INDEX_FILE", index_env.as_str())];
+    let built = (|| -> Result<String> {
+        match base {
+            Some(b) => git_in(root, &["read-tree", b], b"", &env)?,
+            None => git_in(root, &["read-tree", "--empty"], b"", &env)?,
+        };
+        let mut info = String::new();
+        for name in changed {
+            let id = git_in(root, &["hash-object", "-w", "--stdin"], files[name].as_bytes(), &[])?;
+            info.push_str(&format!("100644 blob {id}\t{name}\n"));
+        }
+        // a text git let go of before it was saved is left out, not an error
+        let ids: String = texts.iter().map(|t| format!("{t}\n")).collect();
+        let found = git_in(root, &["cat-file", "--batch-check"], ids.as_bytes(), &[])?;
+        for line in found.lines().filter(|l| l.ends_with(|c: char| c.is_ascii_digit()) && l.contains(" blob ")) {
+            let id = line.split(' ').next().unwrap_or_default();
+            info.push_str(&format!("100644 blob {id}\ttexts/{id}\n"));
+        }
+        git_in(root, &["update-index", "--add", "--index-info"], info.as_bytes(), &env)?;
+        let tree = git_in(root, &["write-tree"], b"", &env)?;
+        let message = format!("ccc replay: {} - {steps} step(s)", refname.trim_start_matches(REF_PREFIX));
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", message.as_str()];
+        if let Some(b) = base {
+            args.extend(["-p", b]);
+        }
+        git_in(root, &args, b"", &identity(root))
+    })();
+    let _ = std::fs::remove_file(&index);
+    let commit = built?;
+    let mut args = vec!["update-ref", "-m", "ccc replay save", refname, commit.as_str()];
+    if let Some(b) = base {
+        args.push(b);
+    }
+    git_in(root, &args, b"", &[])?;
+    Ok(())
+}
+
+// where ccc's pre-push hook stands
+#[derive(Debug)]
+pub enum Hook {
+    // written now
+    Installed(PathBuf),
+    // already there, brought up to date
+    Present(PathBuf),
+    // a hook ccc did not write is there, and is left alone
+    Foreign(PathBuf),
+    // turned off with `git config ccc.replay false`
+    Off,
+    NotRepo,
+}
+
+impl Hook {
+    pub fn describe(&self) -> String {
+        match self {
+            Hook::Installed(p) => format!("ccc: each branch pushed now saves its replay (hook at {})", p.display()),
+            Hook::Present(p) => format!("ccc: each branch pushed saves its replay (hook at {})", p.display()),
+            Hook::Foreign(p) => format!(
+                "ccc: {} is not ccc's, so it was left alone - add `ccc replay save --branch <branch> --remote \"$1\"` to it to keep replays",
+                p.display()
+            ),
+            Hook::Off => "ccc: replays are turned off here (`git config ccc.replay false`)".into(),
+            Hook::NotRepo => "ccc: not a git repository - there is no push to save a replay with".into(),
+        }
+    }
+}
+
+// The pre-push hook: it saves the replay of each branch pushed, beside it,
+// and never stops the push. It calls the ccc that wrote it, else the one on
+// the PATH.
+fn hook_script() -> String {
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().replace('\'', r"'\''")).unwrap_or_default();
+    format!(
+        r#"#!/bin/sh
+{HOOK_MARK}, to refs/ccc/replay/<branch> beside it.
+# Written by ccc, and it never stops a push; `git config ccc.replay false` turns it off.
+[ "$(git config --bool ccc.replay)" = "false" ] && exit 0
+ccc='{exe}'
+[ -x "$ccc" ] || ccc="$(command -v ccc)" || exit 0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_ref" in refs/heads/*) ;; *) continue ;; esac
+  # a branch being deleted has nothing to save
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+  "$ccc" replay save --branch "${{local_ref#refs/heads/}}" --remote "$1" --quiet </dev/null || true
+done
+exit 0
+"#
+    )
+}
+
+// Install the pre-push hook that saves a replay with every push - unless
+// replays are turned off, or a hook ccc did not write is there already.
+pub fn install_hook(root: &Path) -> Result<Hook> {
+    if !is_repo(root) {
+        return Ok(Hook::NotRepo);
+    }
+    if git(root, &["config", "--bool", "ccc.replay"]).as_deref() == Some("false") {
+        return Ok(Hook::Off);
+    }
+    let hooks = root.join(git(root, &["rev-parse", "--git-path", "hooks"]).context("finding git's hooks")?);
+    let file = hooks.join("pre-push");
+    let state = match std::fs::read_to_string(&file) {
+        Ok(text) if !text.contains(HOOK_MARK) => return Ok(Hook::Foreign(file)),
+        // rewritten when ccc moves, so it calls the ccc that runs now
+        Ok(text) if text == hook_script() => return Ok(Hook::Present(file)),
+        Ok(_) => Hook::Present(file.clone()),
+        Err(_) => Hook::Installed(file.clone()),
+    };
+    std::fs::create_dir_all(&hooks)?;
+    std::fs::write(&file, hook_script())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
+    }
+    if let Some(r) = branch_of(root).and_then(|b| remote_for(root, &b)) {
+        share(root, &r);
+    }
+    Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // a repository with a branch off `main`, and a bare remote both were pushed to
+    struct Repo {
+        dir: PathBuf,
+        work: PathBuf,
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn sh(dir: &Path, args: &[&str]) -> String {
+        git(dir, args).unwrap_or_else(|| panic!("git {args:?} failed in {}", dir.display()))
+    }
+
+    fn repo(tag: &str) -> Repo {
+        let dir = std::env::temp_dir().join(format!("ccc-replay-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        sh(&dir, &["init", "--quiet", "--bare", "remote.git"]);
+        sh(&work, &["init", "--quiet", "-b", "main"]);
+        sh(&work, &["config", "user.name", "t"]);
+        sh(&work, &["config", "user.email", "t@example.com"]);
+        fs::write(work.join("a.rs"), "fn a() {}\n").unwrap();
+        sh(&work, &["add", "."]);
+        sh(&work, &["commit", "--quiet", "-m", "start"]);
+        sh(&work, &["remote", "add", "origin", dir.join("remote.git").to_str().unwrap()]);
+        sh(&work, &["push", "--quiet", "-u", "origin", "main"]);
+        sh(&work, &["remote", "set-head", "origin", "main"]);
+        sh(&work, &["checkout", "--quiet", "-b", "feature"]);
+        Repo { dir, work }
+    }
+
+    // steps onto the project's feed, as servers write them
+    fn feed(work: &Path, steps: &[Value]) {
+        let path = crate::serve::feed_path(work);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text = fs::read_to_string(&path).unwrap_or_default();
+        for s in steps {
+            text.push_str(&format!("{s}\n"));
+        }
+        fs::write(path, text).unwrap();
+    }
+
+    fn step(seq: u64, branch: &str, status: &str, texts: Value) -> Value {
+        json!({"server": "s1", "seq": seq, "at": seq * 1000, "branch": branch, "status": status,
+               "by": "agent", "tool": "edit_text", "changeset": "c1-x", "files": [], "texts": texts})
+    }
+
+    fn lines(work: &Path, spec: &str) -> usize {
+        sh(work, &["cat-file", "blob", spec]).lines().count()
+    }
+
+    // A pushed branch carries its replay beside it - under a ref of its own,
+    // on the remote too, and in no branch's files - and a replay saved again
+    // keeps each step once.
+    #[test]
+    fn a_pushed_branch_carries_its_replay_beside_it_never_in_it() {
+        let r = repo("save");
+        let text = texts_of(&r.work, &[FileText { path: "a.rs".into(), before: Some("fn a() {}\n".into()), after: Some("fn a() { b(); }\n".into()) }], &mut HashMap::new());
+        let id = text[0]["after"].as_str().unwrap().to_string();
+        feed(&r.work, &[step(1, "feature", "staged", text.clone()), step(2, "feature", "applied", text), step(3, "main", "applied", json!([]))]);
+        let push = SaveOptions { push: true, ..Default::default() };
+
+        let saved = save(&r.work, &push).unwrap();
+        assert_eq!((saved.steps, saved.skipped.as_deref()), (2, None), "{saved:?}");
+        assert!(matches!(&saved.pushed, Some(Ok(remote)) if remote == "origin"), "{saved:?}");
+        let theirs = sh(&r.dir, &["--git-dir", "remote.git", "for-each-ref", "--format=%(refname)"]);
+        assert!(theirs.lines().any(|l| l == "refs/ccc/replay/feature"), "{theirs}");
+        let files = sh(&r.work, &["ls-tree", "-r", "--name-only", "refs/ccc/replay/feature"]);
+        assert!(files.contains("sessions/unattributed.jsonl") && files.contains(&format!("texts/{id}")), "{files}");
+        assert!(!sh(&r.work, &["ls-tree", "-r", "--name-only", "feature"]).contains("sessions"), "never in the branch");
+        assert_eq!(lines(&r.work, "refs/ccc/replay/feature:sessions/unattributed.jsonl"), 3, "a header and two steps");
+        // a teammate's fetch brings replays along
+        assert!(sh(&r.work, &["config", "--get-all", "remote.origin.fetch"]).contains(FETCH_SPEC));
+
+        assert_eq!(save(&r.work, &push).unwrap().steps, 0, "nothing new");
+        feed(&r.work, &[step(4, "feature", "read", json!([]))]);
+        assert_eq!(save(&r.work, &push).unwrap().steps, 1);
+        assert_eq!(lines(&r.work, "refs/ccc/replay/feature:sessions/unattributed.jsonl"), 4);
+        assert_eq!(sh(&r.work, &["rev-list", "--count", "refs/ccc/replay/feature"]), "2");
+
+        // the default branch keeps none unless asked to
+        sh(&r.work, &["checkout", "--quiet", "main"]);
+        let main = save(&r.work, &SaveOptions::default()).unwrap();
+        assert!(main.skipped.as_deref().is_some_and(|s| s.contains("default branch")), "{main:?}");
+        let asked = save(&r.work, &SaveOptions { default_branch: true, ..Default::default() }).unwrap();
+        assert_eq!(asked.steps, 1);
+    }
+
+    // the hook goes in once, follows ccc as it moves, never over a hook ccc
+    // did not write, and not at all once replays are turned off
+    #[test]
+    fn the_hook_is_ccc_s_own_or_left_alone() {
+        let r = repo("hook");
+        let Hook::Installed(file) = install_hook(&r.work).unwrap() else { panic!("not installed") };
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(text.contains(HOOK_MARK) && text.contains("replay save --branch"), "{text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(fs::metadata(&file).unwrap().permissions().mode() & 0o111, 0, "executable");
+        }
+        assert!(matches!(install_hook(&r.work).unwrap(), Hook::Present(_)));
+        fs::write(&file, "#!/bin/sh\necho mine\n").unwrap();
+        assert!(matches!(install_hook(&r.work).unwrap(), Hook::Foreign(_)));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "#!/bin/sh\necho mine\n");
+        sh(&r.work, &["config", "ccc.replay", "false"]);
+        assert!(matches!(install_hook(&r.work).unwrap(), Hook::Off));
+    }
+}

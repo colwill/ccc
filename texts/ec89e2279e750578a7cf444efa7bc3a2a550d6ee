@@ -1,0 +1,3562 @@
+// ccc vis - the architecture visualiser behind `ccc run --vis`.
+//
+// Five levels, each read from the server's map: the system and what it talks
+// to, its containers, one container's components, one component's code, and
+// one function's logic drawn as a node graph. The page knows no language -
+// every level arrives language-agnostic from /vis.json, /vis/code and
+// /vis/flow - and keeps nothing the server does not, beyond where you dragged
+// things and which toggles you left on.
+//
+// Below the canvas runs a timeline of every step ccc's edit tools take. It
+// follows them as they land - the canvas flies to the change and marks it -
+// and replays any of them on either side, scrubbed like a video.
+//
+// The same page runs inside the VS Code extension as a webview: there it
+// asks the extension for data instead of fetching it, and asks it to open
+// files instead of following vscode:// links.
+
+(() => {
+  'use strict';
+
+  // ------------------------------------------------------------- helpers
+
+  const $ = id => document.getElementById(id);
+
+  function h(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function sv(tag, attrs) {
+    const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [k, v] of Object.entries(attrs || {})) if (v != null) e.setAttribute(k, v);
+    return e;
+  }
+
+  // set inside the VS Code extension's webview, where the extension is the host
+  const vscode = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
+
+  // the webview's own state inside VS Code, browser storage elsewhere; either
+  // can be missing or refuse writes, and nothing depends on it
+  const store = {
+    get(key, fallback) {
+      try {
+        if (vscode) {
+          const all = vscode.getState() || {};
+          return key in all ? all[key] : fallback;
+        }
+        const v = localStorage.getItem('ccc-vis:' + key);
+        return v == null ? fallback : JSON.parse(v);
+      } catch {
+        return fallback;
+      }
+    },
+    set(key, value) {
+      try {
+        if (vscode) vscode.setState({ ...(vscode.getState() || {}), [key]: value });
+        else localStorage.setItem('ccc-vis:' + key, JSON.stringify(value));
+      } catch {
+        // not kept - the page still works
+      }
+    },
+  };
+
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const base = p => p.split('/').pop();
+
+  function fmt(n) {
+    if (n >= 100000) return Math.round(n / 1000) + 'k';
+    if (n >= 10000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    return String(n);
+  }
+
+  const plural = (n, one, many) => `${fmt(n)} ${n === 1 ? one : many || one + 's'}`;
+
+  // the complexity band `model::FuncMetrics::complexity_score` draws
+  function band(c) {
+    if (c <= 1) return 1;
+    if (c <= 3) return c;
+    if (c <= 5) return 4;
+    if (c <= 7) return 5;
+    if (c <= 10) return 6;
+    if (c <= 15) return 7;
+    if (c <= 20) return 8;
+    if (c <= 30) return 9;
+    return 10;
+  }
+
+  const LANGS = {
+    rust: ['Rust', 'var(--orange)'],
+    python: ['Python', 'var(--blue)'],
+    javascript: ['JavaScript', 'var(--yellow)'],
+    typescript: ['TypeScript', 'var(--teal)'],
+    tsx: ['TSX', 'var(--teal)'],
+    go: ['Go', 'var(--green)'],
+    c: ['C', 'var(--purple)'],
+    cpp: ['C++', 'var(--purple)'],
+    csharp: ['C#', 'var(--pink)'],
+    zig: ['Zig', 'var(--red)'],
+    odin: ['Odin', 'var(--slate)'],
+    proto: ['Protobuf', 'var(--grey)'],
+  };
+  const langName = l => (LANGS[l] || [l])[0];
+  const langColour = l => (LANGS[l] || [null, 'var(--grey)'])[1];
+
+  // a stable colour per type name, for data pins
+  const PIN_COLOURS = ['var(--blue)', 'var(--teal)', 'var(--green)', 'var(--orange)', 'var(--pink)', 'var(--purple)', 'var(--yellow)', 'var(--red)'];
+  function typeColour(t) {
+    let x = 0;
+    for (const ch of String(t)) x = (x * 31 + ch.charCodeAt(0)) >>> 0;
+    return PIN_COLOURS[x % PIN_COLOURS.length];
+  }
+
+  // in a webview every request goes through the extension, which reaches the
+  // server wherever it runs - over ssh, in a container - where the page cannot
+  const waiting = new Map();
+  let asked = 0;
+
+  if (vscode) {
+    window.addEventListener('message', e => {
+      const m = e.data || {};
+      if (m.type === 'res' && waiting.has(m.id)) {
+        waiting.get(m.id)(m);
+        waiting.delete(m.id);
+      }
+    });
+  }
+
+  function viaHost(url) {
+    return new Promise((resolve, reject) => {
+      const id = ++asked;
+      // longer than the extension waits on the analyser, so its answer - an
+      // error saying why - comes first
+      const timer = setTimeout(() => {
+        waiting.delete(id);
+        reject(new Error('the extension did not answer'));
+      }, 65000);
+      waiting.set(id, m => {
+        clearTimeout(timer);
+        resolve(m);
+      });
+      vscode.postMessage({ type: 'get', id, url });
+    });
+  }
+
+  async function getJSON(url) {
+    let status;
+    let reason = '';
+    let text;
+    if (vscode) {
+      const m = await viaHost(url);
+      if (m.error) throw new Error(m.error);
+      status = m.status;
+      text = m.body;
+    } else {
+      const r = await fetch(url, { cache: 'no-store' });
+      status = r.status;
+      reason = r.statusText;
+      text = await r.text();
+    }
+    let body = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // not json - the status says enough
+    }
+    if (status < 200 || status >= 300) throw new Error((body && body.error) || `${status} ${reason}`.trim());
+    return body;
+  }
+
+  // ------------------------------------------------------------- state
+
+  const S = {
+    overview: null,
+    generated: null,
+    route: null,
+    scene: null,
+    byId: new Map(),
+    selected: null,
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    // library calls in a flow: folded into one node, drawn one by one, or left out
+    lib: store.get('lib', 'compact'),
+    tests: store.get('tests', false),
+    // light unless the viewer chose otherwise; `auto` follows the system
+    theme: store.get('theme', 'light'),
+    // the edit step whose changes are marked on the canvas, and which side of it
+    marks: null,
+    // the next mount glides the camera onto what it marks
+    fly: false,
+    // the overview on show is a past step's snapshot, not the live map
+    overviewReplay: false,
+    // the panel holds an edit step, so a replay keeps it open on the next one
+    stepPanel: false,
+    // the step on show is seen alone - see `fade`
+    focusing: false,
+  };
+
+  const LEVELS = {
+    system: 'Context',
+    containers: 'Containers',
+    components: 'Components',
+    code: 'Code',
+    flow: 'Logic',
+  };
+
+  // ------------------------------------------------------------- routing
+
+  function parseRoute() {
+    const parts = location.hash.replace(/^#\/?/, '').split('/');
+    const arg = parts[1] != null ? decodeURIComponent(parts.slice(1).join('/')) : '';
+    switch (parts[0]) {
+      case 'containers':
+        return { level: 'containers' };
+      case 'container':
+        return { level: 'components', container: arg };
+      case 'code':
+        return { level: 'code', file: arg };
+      case 'flow': {
+        const m = arg.match(/^(.*)@(\d+)(?:@(.*))?$/);
+        return m ? { level: 'flow', file: m[1], line: +m[2], name: m[3] || null } : { level: 'system' };
+      }
+      default:
+        return { level: 'system' };
+    }
+  }
+
+  function href(r) {
+    switch (r.level) {
+      case 'containers':
+        return '#/containers';
+      case 'components':
+        return '#/container/' + encodeURIComponent(r.container);
+      case 'code':
+        return '#/code/' + encodeURIComponent(r.file);
+      case 'flow':
+        return '#/flow/' + encodeURIComponent(`${r.file}@${r.line}${r.name ? '@' + r.name : ''}`);
+      default:
+        return '#/';
+    }
+  }
+
+  function go(r) {
+    const target = href(r);
+    if (location.hash === target) render(false);
+    else location.hash = target;
+  }
+
+  const containerOf = file => (S.overview?.components.find(c => c.id === file) || {}).container;
+
+  function up() {
+    const r = S.route;
+    if (!r) return;
+    if (r.level === 'flow') go({ level: 'code', file: r.file });
+    else if (r.level === 'code') {
+      const c = containerOf(r.file);
+      go(c ? { level: 'components', container: c } : { level: 'containers' });
+    } else if (r.level === 'components') go({ level: 'containers' });
+    else if (r.level === 'containers') go({ level: 'system' });
+  }
+
+  // ------------------------------------------------------------- render
+
+  let renderSeq = 0;
+
+  async function ensureOverview() {
+    if (!S.overview) {
+      S.overview = await getJSON('/vis.json');
+      S.generated = S.overview.generated;
+    }
+  }
+
+  // a level that timed out, rather than one that could not be drawn
+  const busy = e => /did not answer|timed out/.test(e.message || '');
+
+  // the live map at the route in the address - any replay ends here; a level
+  // the analyser was too busy to answer for is asked for once more
+  async function render(keepView, again) {
+    const seq = ++renderSeq;
+    endReplay();
+    const route = parseRoute();
+    const same = S.route && href(S.route) === href(route);
+    S.route = route;
+    // a webview forgets its address when it is reloaded
+    if (vscode) store.set('hash', location.hash);
+    try {
+      await ensureOverview();
+      let scene;
+      if (route.level === 'containers') scene = sceneContainers();
+      else if (route.level === 'components') scene = sceneComponents(route.container);
+      else if (route.level === 'code') {
+        scene = sceneCode(await getJSON('/vis/code?file=' + encodeURIComponent(route.file)));
+      } else if (route.level === 'flow') {
+        const q = `file=${encodeURIComponent(route.file)}&line=${route.line}` + (route.name ? '&name=' + encodeURIComponent(route.name) : '');
+        const flow = await getJSON('/vis/flow?' + q);
+        if (seq !== renderSeq) return;
+        // the function moved since this address was written - follow it there
+        if (flow.function.line !== route.line) {
+          route.line = flow.function.line;
+          history.replaceState(null, '', href(route));
+          if (vscode) store.set('hash', location.hash);
+        }
+        scene = sceneFlow(flow);
+      } else scene = sceneSystem();
+      if (seq !== renderSeq) return; // a later navigation won
+      mount(scene, keepView && same);
+    } catch (e) {
+      if (seq !== renderSeq) return;
+      clearCanvas();
+      if (!again && busy(e)) {
+        showMessage('Still drawing this level', 'the analyser is busy - asking again');
+        setTimeout(() => seq === renderSeq && render(keepView, true), 1500);
+        return;
+      }
+      showMessage('Could not draw this level', e.message);
+    }
+    crumbs();
+  }
+
+  // ------------------------------------------------------------- node builders
+
+  // a C4 element, drawn the way the doc canvas draws a box
+  function card({ what, name, tech, note, accent, langs, cls, badge }) {
+    const n = h('div', 'node card' + (cls ? ' ' + cls : ''));
+    if (accent) {
+      n.style.setProperty('--accent', accent);
+      n.append(h('i', 'stripe'));
+    }
+    const top = h('div', 'row');
+    top.append(h('span', 'what', what));
+    if (badge) top.append(badge);
+    n.append(top, h('div', 'name', name));
+    if (tech) n.append(h('div', 'tech', tech));
+    if (note) n.append(h('div', 'note', note));
+    if (langs && langs.length) {
+      const bar = h('div', 'langs');
+      const total = langs.reduce((a, l) => a + l.n, 0) || 1;
+      for (const l of langs) {
+        const seg = h('i');
+        seg.style.width = (100 * l.n) / total + '%';
+        seg.style.background = langColour(l.language);
+        seg.title = `${langName(l.language)}: ${fmt(l.n)}`;
+        bar.append(seg);
+      }
+      n.append(bar);
+    }
+    return n;
+  }
+
+  function badge(cls, text, title) {
+    const b = h('span', 'badge ' + cls, text);
+    if (title) b.title = title;
+    return b;
+  }
+
+  const cxBadge = c => badge('cx' + band(c), String(c), `complexity ${c} - one path plus one per branch and loop`);
+
+  function pinEl(p, side) {
+    if (!p) {
+      // keeps the two pin columns aligned row by row
+      const gap = h('div', 'pin ' + side);
+      gap.style.visibility = 'hidden';
+      return gap;
+    }
+    const e = h('div', `pin ${side} ${p.data ? 'data' : p.more ? 'more' : 'exec'}${p.ret ? ' ret' : ''}`);
+    if (p.pin) e.dataset.pin = p.pin;
+    if (p.colour) e.style.setProperty('--pin', p.colour);
+    if (p.title) e.title = p.title;
+    e.append(h('i'), h('span', 'lbl', p.label || ''));
+    return e;
+  }
+
+  // the pin for what a function returns
+  const returnsPin = (type, pin) => ({ ret: true, data: true, label: 'Returns ' + type, title: 'returns ' + type, colour: typeColour(type), pin });
+
+  // a node in the blueprint style: a header in the node's colour, then rows of
+  // input pins on the left and output pins on the right - what it returns
+  // last, ruled off from the rest
+  function bp({ accent, k, t, q, badges, ins, outs, body, cls }) {
+    const n = h('div', 'node bp' + (cls ? ' ' + cls : ''));
+    n.style.setProperty('--accent', accent || 'var(--grey)');
+    const head = h('div', 'head');
+    if (k) head.append(h('span', 'k', k));
+    head.append(h('span', 't', t));
+    if (q) head.append(h('span', 'q', q));
+    if (badges && badges.length) {
+      const b = h('span', 'badges');
+      b.append(...badges);
+      head.append(b);
+    }
+    n.append(head);
+    if (body) n.append(h('div', 'body', body));
+    const rows = h('div', 'rows');
+    const left = ins || [];
+    const right = (outs || []).filter(p => !p.ret);
+    const returns = (outs || []).filter(p => p.ret);
+    for (let i = 0; i < Math.max(left.length, right.length); i++) rows.append(pinEl(left[i], 'in'), pinEl(right[i], 'out'));
+    if (returns.length) {
+      rows.append(h('div', 'sep'));
+      for (const p of returns) rows.append(pinEl(null, 'in'), pinEl(p, 'out'));
+    }
+    n.append(rows);
+    return n;
+  }
+
+  // ------------------------------------------------------------- level 1: context
+
+  function externalNodes(o) {
+    const out = [];
+    for (const p of o.peers || []) {
+      out.push({
+        id: 'peer:' + p.name,
+        kind: 'peer',
+        data: p,
+        side: 'out',
+        el: card({
+          what: 'Peer repository',
+          name: p.name,
+          cls: 'external dashed',
+          accent: 'var(--grey)',
+          tech: p.language ? langName(p.language) : p.repo || '',
+          note: p.resolved ? `provides ${p.provides} · consumes ${p.consumes}` : p.error ? `not resolved: ${p.error}` : 'not resolved',
+        }),
+      });
+    }
+    for (const g of o.outside || []) {
+      const inbound = g.direction === 'in';
+      out.push({
+        id: g.id,
+        kind: 'outside',
+        data: g,
+        side: inbound ? 'in' : 'out',
+        el: card({
+          what: inbound ? 'Callers outside this map' : 'Endpoints outside this map',
+          name: g.transport === 'unspecified' ? 'unnamed transport' : g.transport.toUpperCase(),
+          cls: 'external',
+          accent: 'var(--grey)',
+          note: `${plural(g.key_count, 'key')}: ${g.keys.join(', ')}${g.key_count > g.keys.length ? ', …' : ''}`,
+        }),
+      });
+    }
+    return out;
+  }
+
+  function systemCard(sys) {
+    return card({
+      what: 'Software system',
+      name: sys.name,
+      cls: 'system',
+      accent: langColour(sys.languages[0] && sys.languages[0].language),
+      tech: sys.languages.slice(0, 5).map(l => langName(l.language)).join(' · '),
+      note: `${plural(sys.files, 'file')} · ${plural(sys.lines, 'line')}\n${plural(sys.functions, 'function')} · ${plural(sys.edges, 'resolved call')}`,
+      langs: sys.languages.map(l => ({ language: l.language, n: l.lines })),
+    });
+  }
+
+  function sceneSystem() {
+    const o = S.overview;
+    const nodes = [{ id: 'system', kind: 'system', data: o.system, el: systemCard(o.system), drill: { level: 'containers' } }];
+    const edges = [];
+    const ext = externalNodes(o);
+    nodes.push(...ext);
+    for (const x of ext) {
+      if (x.kind === 'outside') {
+        const label = `${x.data.transport} ×${x.data.key_count}`;
+        edges.push(x.side === 'in' ? { from: x.id, to: 'system', label, data: x.data } : { from: 'system', to: x.id, label, data: x.data });
+      }
+    }
+    // calls into a peer, whichever container makes them, are the system's
+    const toPeer = new Map();
+    for (const e of o.container_edges) {
+      if (!e.external) continue;
+      const t = toPeer.get(e.to) || { count: 0, transports: new Set(), declared: false, detected: false };
+      t.count += e.count || 0;
+      e.transports.forEach(x => t.transports.add(x));
+      t.declared ||= e.declared;
+      t.detected ||= e.detected;
+      toPeer.set(e.to, t);
+    }
+    for (const [peer, t] of toPeer) {
+      edges.push({
+        from: 'system',
+        to: 'peer:' + peer,
+        label: t.detected ? [...t.transports].join(', ') || `calls ×${t.count}` : 'declared',
+        cls: t.detected ? '' : 'declared',
+        data: { from: o.system.name, to: peer, ...t, transports: [...t.transports] },
+      });
+    }
+    return {
+      key: 'system',
+      kind: 'c4',
+      layout: 'context',
+      nodes,
+      edges,
+      note: ext.length
+        ? null
+        : 'Nothing in the map crosses this system’s boundary. Mark calls that leave the process with `ccc:calls <transport> <key>` and their handlers with `ccc:serves`, or name peer repositories under `externals` in .ccc/map.json.',
+      legend: c4Legend(),
+    };
+  }
+
+  // ------------------------------------------------------------- level 2: containers
+
+  function sceneContainers() {
+    const o = S.overview;
+    const shown = o.containers.filter(c => S.tests || !(c.files > 0 && c.tests === c.files));
+    const ids = new Set(shown.map(c => c.id));
+    const nodes = shown.map(c => ({
+      id: 'c:' + c.id,
+      kind: 'container',
+      data: c,
+      drill: { level: 'components', container: c.id },
+      el: card({
+        what: 'Container',
+        name: c.name === '(unassigned)' ? 'unassigned files' : c.name,
+        cls: 'dashed',
+        accent: langColour(c.languages[0] && c.languages[0].language),
+        tech: c.languages.map(l => langName(l.language)).join(' · ') || 'no source files',
+        note: `${plural(c.files, 'file')} · ${plural(c.funcs, 'function')}` + (c.entries ? `\n${plural(c.entries, 'entry point')}` : ''),
+        langs: c.languages.map(l => ({ language: l.language, n: l.files })),
+      }),
+    }));
+    const ext = externalNodes(o).map(x => ({ ...x, pin: x.side === 'in' ? 'first' : 'last' }));
+    nodes.push(...ext);
+    const extIds = new Set(ext.map(x => x.id));
+    const edges = [];
+    for (const e of o.container_edges) {
+      const from = 'c:' + e.from;
+      const to = e.external ? 'peer:' + e.to : 'c:' + e.to;
+      if (!ids.has(e.from) || !(ids.has(e.to) || extIds.has(to))) continue;
+      edges.push({
+        from,
+        to,
+        label: e.detected ? (e.transports.length ? e.transports.join(', ') : `calls ×${e.count}`) : 'declared',
+        title: e.symbols.join(', '),
+        cls: e.detected ? '' : 'declared',
+        data: e,
+      });
+    }
+    for (const g of o.outside || []) {
+      for (const c of g.containers) {
+        if (!ids.has(c.container)) continue;
+        const label = `${g.transport} ×${c.count}`;
+        edges.push(g.direction === 'in' ? { from: g.id, to: 'c:' + c.container, label, data: g } : { from: 'c:' + c.container, to: g.id, label, data: g });
+      }
+    }
+    return {
+      key: 'containers',
+      kind: 'c4',
+      layout: 'layered',
+      nodes,
+      edges,
+      persist: true,
+      frames: [{ title: o.system.name, sub: 'software system', members: nodes.filter(n => n.kind === 'container').map(n => n.id) }],
+      note:
+        shown.length === 1
+          ? `One container holds everything (${o.system.grouping}). Name your services with \`services\` in .ccc/map.json - \`ccc init\` writes a starter.`
+          : `containers: ${o.system.grouping}`,
+      legend: c4Legend(),
+    };
+  }
+
+  // ------------------------------------------------------------- level 3: components
+
+  function sceneComponents(name) {
+    const o = S.overview;
+    const container = o.containers.find(c => c.id === name);
+    if (!container) throw new Error(`there is no container called “${name}” in the map`);
+    const comps = o.components.filter(c => c.container === name && (S.tests || !c.test));
+    const mine = new Set(comps.map(c => c.id));
+    const where = new Map(o.components.map(c => [c.id, c.container]));
+    const nodes = comps.map(c => ({
+      id: 'm:' + c.id,
+      kind: 'component',
+      data: c,
+      group: c.dir,
+      drill: { level: 'code', file: c.id },
+      el: card({
+        what: c.dir || './',
+        name: c.name,
+        cls: c.test ? 'test' : '',
+        accent: langColour(c.language),
+        tech: langName(c.language) + (c.types ? ` · ${plural(c.types, 'type')}` : ''),
+        note: `${plural(c.funcs, 'function')} · ${plural(c.lines, 'line')}` + (c.entries ? ` · ${plural(c.entries, 'entry')}` : ''),
+        badge: c.max_complexity > 1 ? cxBadge(c.max_complexity) : null,
+      }),
+    }));
+    const edges = [];
+    // a call that leaves the container lands on the container it reaches, as C4 draws it
+    const outer = new Map();
+    const touch = (other, dir, e) => {
+      const x = outer.get(other) || { name: other, calls: 0, callers: 0, symbols: new Set() };
+      if (dir === 'out') x.calls += e.count;
+      else x.callers += e.count;
+      e.symbols.forEach(s => x.symbols.add(s));
+      outer.set(other, x);
+      return 'x:' + other;
+    };
+    const agg = new Map();
+    for (const e of o.component_edges) {
+      const a = mine.has(e.from);
+      const b = mine.has(e.to);
+      if (a && b) {
+        edges.push({ from: 'm:' + e.from, to: 'm:' + e.to, label: `×${e.count}`, title: e.symbols.join(', '), data: e });
+        continue;
+      }
+      if (!a && !b) continue;
+      const other = where.get(a ? e.to : e.from);
+      if (!other) continue;
+      const ext = touch(other, a ? 'out' : 'in', e);
+      const key = a ? `m:${e.from}>${ext}` : `${ext}>m:${e.to}`;
+      const g = agg.get(key) || { from: a ? 'm:' + e.from : ext, to: a ? ext : 'm:' + e.to, count: 0, symbols: [] };
+      g.count += e.count;
+      g.symbols.push(...e.symbols);
+      agg.set(key, g);
+    }
+    for (const g of agg.values()) edges.push({ from: g.from, to: g.to, label: `×${g.count}`, title: [...new Set(g.symbols)].join(', '), data: g });
+    for (const x of outer.values()) {
+      nodes.push({
+        id: 'x:' + x.name,
+        kind: 'outer',
+        data: x,
+        pin: x.calls ? 'last' : 'first',
+        drill: { level: 'components', container: x.name },
+        el: card({
+          what: 'Container',
+          name: x.name,
+          cls: 'external dashed',
+          accent: 'var(--grey)',
+          note: [x.calls && `called ×${x.calls}`, x.callers && `calls in ×${x.callers}`].filter(Boolean).join(' · '),
+        }),
+      });
+    }
+    return {
+      key: 'components:' + name,
+      kind: 'c4',
+      layout: 'layered',
+      nodes,
+      edges,
+      persist: true,
+      quietLabels: edges.length > 40,
+      order: n => (n.group || '') + '/' + n.id,
+      frames: [{ title: name, sub: 'container', members: nodes.filter(n => n.kind === 'component').map(n => n.id) }],
+      empty: comps.length ? null : ['No components here', S.tests ? 'This container has no mapped files.' : 'Every file here is a test - switch tests on to see them.'],
+      legend: c4Legend(),
+    };
+  }
+
+  function c4Legend() {
+    const langs = (S.overview.system.languages || []).map(l => [langName(l.language), langColour(l.language)]);
+    return [['container', 'var(--grey)', 'dash'], ['outside', 'var(--grey)', 'ext'], ['calls', 'var(--edge)', 'line'], ...langs];
+  }
+
+  // ------------------------------------------------------------- level 4: code
+
+  function fnAccent(f) {
+    if (f.module) return 'var(--purple)';
+    if (f.test) return 'var(--grey)';
+    if (f.entry) return 'var(--red)';
+    return 'var(--blue)';
+  }
+
+  function sceneCode(d) {
+    const fns = d.functions.filter(f => S.tests || !f.test);
+    const ids = new Set(fns.map(f => f.id));
+    const proxies = new Map(d.proxies.map(p => [p.id, p]));
+    const nodes = [];
+    const edges = [];
+    const usedProxy = new Map();
+
+    for (const f of fns) {
+      const calls = f.calls.filter(c => ids.has(c.to) || proxies.has(c.to));
+      const ins = [{ pin: 'in', label: f.callers_total ? `${f.callers_total} caller${f.callers_total === 1 ? '' : 's'}` : '' }];
+      for (const t of f.param_types) ins.push({ data: true, label: t, colour: typeColour(t) });
+      if (f.params > f.param_types.length) ins.push({ data: true, label: `+${f.params - f.param_types.length} untyped`, colour: 'var(--grey)' });
+      const outs = calls.map(c => {
+        const target = d.functions.find(x => x.id === c.to) || proxies.get(c.to);
+        return { pin: 'c' + c.to, label: target ? target.name : '?', title: `line ${c.line}` };
+      });
+      if (f.calls_total > calls.length) outs.push({ more: true, label: `+${f.calls_total - calls.length} more` });
+      if (f.ret) outs.push(returnsPin(f.ret, 'ret'));
+      const badges = [];
+      if (f.entry && !f.module && !f.test) badges.push(badge('mode entry', 'entry', 'nothing else in the map calls it'));
+      if (f.recursive) badges.push(badge('mode', '↻', 'calls itself'));
+      if (f.complexity > 1) badges.push(cxBadge(f.complexity));
+      nodes.push({
+        id: 'f' + f.id,
+        key: `${f.owner || ''}::${f.name}`,
+        kind: 'function',
+        data: f,
+        drill: { level: 'flow', file: f.file, line: f.line, name: f.name },
+        el: bp({
+          accent: fnAccent(f),
+          k: f.module ? 'top level' : f.owner ? f.owner + ' ::' : f.test ? 'test' : 'function',
+          t: f.module ? base(f.file) : f.name,
+          badges,
+          ins,
+          outs,
+        }),
+      });
+      for (const c of calls) {
+        edges.push({ from: 'f' + f.id, fromPin: 'c' + c.to, to: 'f' + c.to, toPin: 'in', cls: 'exec', data: { line: c.line } });
+        if (proxies.has(c.to)) usedProxy.set(c.to, (usedProxy.get(c.to) || '') + 'callee');
+      }
+      for (const c of f.callers) {
+        if (proxies.has(c)) {
+          edges.push({ from: 'f' + c, fromPin: 'out', to: 'f' + f.id, toPin: 'in', cls: 'exec' });
+          usedProxy.set(c, (usedProxy.get(c) || '') + 'caller');
+        }
+      }
+    }
+    for (const [id, how] of usedProxy) {
+      const p = proxies.get(id);
+      const callee = how.includes('callee');
+      const caller = how.includes('caller');
+      nodes.push({
+        id: 'f' + id,
+        key: `${p.file}::${p.owner || ''}::${p.name}`,
+        kind: 'proxy',
+        data: p,
+        pin: callee ? 'last' : 'first',
+        drill: { level: 'flow', file: p.file, line: p.line, name: p.name },
+        el: bp({
+          cls: 'proxy',
+          accent: 'var(--grey)',
+          k: p.file,
+          t: (p.owner ? p.owner + '::' : '') + (p.module ? 'top level' : p.name),
+          ins: callee ? [{ pin: 'in', label: '' }] : [],
+          outs: caller ? [{ pin: 'out', label: '' }] : [],
+        }),
+      });
+    }
+    const types = d.types.map(t => t.name);
+    return {
+      key: 'code:' + d.file,
+      kind: 'bp',
+      layout: 'layered',
+      gapX: 110,
+      nodes,
+      edges,
+      persist: true,
+      file: d,
+      note: `${d.file} · ${langName(d.language)} · ${plural(d.functions.length, 'function')}` + (types.length ? ` · types: ${types.slice(0, 8).join(', ')}${types.length > 8 ? ', …' : ''}` : '') + (d.proxies_truncated ? ' · outside callers trimmed' : ''),
+      empty: fns.length ? null : ['No functions here', d.functions.length ? 'Every function here is a test - switch tests on to see them.' : types.length ? `This file defines types only: ${types.join(', ')}.` : 'The map holds no functions for this file.'],
+      legend: [['entry point', 'var(--red)'], ['function', 'var(--blue)'], ['test', 'var(--grey)'], ['top level', 'var(--purple)'], ['outside this file', 'var(--grey)', 'dash'], ['exec wire', 'var(--faint)', 'line']],
+    };
+  }
+
+  // ------------------------------------------------------------- level 5: logic
+
+  const MODES = { await: 'await', defer: 'deferred', go: 'goroutine', try: '? propagates', new: 'constructs' };
+  const LOOPS = { for: 'For each', while: 'While', loop: 'Loop', do: 'Do while', comprehension: 'Comprehension' };
+
+  function sceneFlow(d) {
+    const f = d.function;
+    const nodes = [];
+    let seq = 0;
+    // a step is known again in the next drawing by what it is, not where it
+    // falls - its kind and words, and which of the same it is
+    const seen = new Map();
+    const add = (el, kind, data, drill) => {
+      const what = data ? `${data.qual ? data.qual + '.' : ''}${data.name || data.label || data.kind || ''}` : '';
+      const base = `${kind}:${what}`;
+      const k = seen.get(base) || 0;
+      seen.set(base, k + 1);
+      const n = { id: 'n' + seq++, mkey: `${base}#${k}`, kind, data, el, drill };
+      nodes.push(n);
+      return n;
+    };
+
+    const entryBadges = [];
+    if (f.complexity > 1) entryBadges.push(cxBadge(f.complexity));
+    const entry = add(
+      bp({
+        accent: fnAccent(f),
+        k: f.module ? 'top level' : (f.owner ? f.owner + ' :: ' : '') + (f.entry ? 'entry point' : 'function'),
+        t: f.module ? base(f.file) : f.name,
+        q: `${f.file}:${f.line}`,
+        badges: entryBadges,
+        body: d.callers_total ? `called by ${d.callers.slice(0, 3).map(c => c.name).join(', ')}${d.callers_total > 3 ? ` +${d.callers_total - 3}` : ''}` : f.module ? null : 'nothing in the map calls it',
+        outs: [{ pin: 'out', label: 'then' }, ...d.params.map((p, i) => ({ pin: 'p' + i, data: true, label: p, colour: typeColour(p.split(/[:\s]/).pop()) }))].concat(f.ret ? [returnsPin(f.ret)] : []),
+      }),
+      'entry',
+      { ...d, step: null }
+    );
+
+    function call(st) {
+      const resolved = !!st.target;
+      const badges = st.mode ? [badge('mode ' + st.mode, st.mode === 'try' ? '?' : st.mode, MODES[st.mode])] : [];
+      return add(
+        bp({
+          accent: resolved ? 'var(--blue)' : 'var(--grey)',
+          k: resolved ? (st.target.owner ? st.target.owner + ' ::' : 'call') : 'library call',
+          t: st.name,
+          q: st.qual || null,
+          badges,
+          ins: [{ pin: 'in', label: '' }, ...st.args.map(a => ({ data: true, label: a, colour: 'var(--grey)' }))],
+          outs: [{ pin: 'out', label: '' }],
+        }),
+        'call',
+        st,
+        resolved ? { level: 'flow', file: st.target.file, line: st.target.line, name: st.target.name } : null
+      );
+    }
+
+    function compact(run) {
+      const n = h('div', 'node bp compact');
+      n.style.setProperty('--accent', 'var(--grey)');
+      const rows = h('div', 'rows');
+      rows.append(pinEl({ pin: 'in' }, 'in'), h('span', 'chain', run.map(s => (s.mode === 'try' ? s.name + '?' : s.name)).join(' → ')), pinEl({ pin: 'out' }, 'out'));
+      n.append(rows);
+      n.title = run.map(s => `${s.qual ? s.qual + '.' : ''}${s.name}(${s.args.join(', ')})  line ${s.line}`).join('\n');
+      return add(n, 'calls', { t: 'calls', calls: run, line: run[0].line });
+    }
+
+    function branch(st) {
+      const many = st.kind !== 'if' && st.kind !== 'ternary';
+      const title = { try: 'Try', match: 'Match', select: 'Select', switch: 'Switch', ternary: 'Select', if: 'Branch' }[st.kind] || 'Branch';
+      const ins = [{ pin: 'in', label: '' }];
+      if (st.kind !== 'try') ins.push({ data: true, label: st.label, colour: many ? 'var(--teal)' : 'var(--red)', title: st.label });
+      const outs = st.arms.map((a, i) => ({ pin: 'a' + i, label: many ? a.label : a.label === 'true' ? 'True' : 'False', title: a.implicit ? 'no else written - carries straight on' : null }));
+      return add(bp({ accent: 'var(--slate)', k: many ? st.kind : 'branch', t: title, ins, outs }), 'branch', st);
+    }
+
+    const loop = st => add(bp({ accent: 'var(--teal)', k: 'loop', t: LOOPS[st.kind] || 'Loop', body: st.label, ins: [{ pin: 'in', label: '' }], outs: [{ pin: 'body', label: 'Loop body' }, { pin: 'done', label: 'Completed' }] }), 'loop', st);
+
+    function exit(st) {
+      const accent = { return: 'var(--purple)', throw: 'var(--red)', raise: 'var(--red)' }[st.kind] || 'var(--grey)';
+      const t = { return: 'Return', throw: 'Throw', raise: 'Raise', break: 'Break', continue: 'Continue' }[st.kind] || st.kind;
+      return add(bp({ cls: 'terminal', accent, k: st.kind === 'break' || st.kind === 'continue' ? 'jump' : 'exit', t, body: st.label === st.kind ? null : st.label, ins: [{ pin: 'in', label: '' }] }), 'exit', st);
+    }
+
+    const closure = st => add(bp({ accent: 'var(--pink)', k: 'closure', t: 'Closure', body: st.label.replace(/^closure\s*/, '') || null, ins: [{ pin: 'in', label: '' }], outs: [{ pin: 'body', label: 'Body' }, { pin: 'then', label: 'then' }] }), 'closure', st);
+
+    const def = st =>
+      add(bp({ accent: 'var(--green)', k: 'defines', t: st.label, ins: [{ pin: 'in', label: '' }], outs: [{ pin: 'out', label: '' }] }), 'def', st, st.target ? { level: 'flow', file: st.target.file, line: st.target.line, name: st.target.name } : null);
+
+    // steps into blocks: a node, or a node whose arms each hold a sequence
+    function blocks(steps) {
+      const out = [];
+      let run = [];
+      const flush = () => {
+        if (!run.length) return;
+        if (S.lib === 'compact') out.push({ node: compact(run) });
+        else if (S.lib === 'full') run.forEach(st => out.push({ node: call(st) }));
+        run = [];
+      };
+      for (const st of steps) {
+        if (st.t === 'call' && !st.target && S.lib !== 'full') {
+          run.push(st);
+          continue;
+        }
+        flush();
+        if (st.t === 'call') out.push({ node: call(st) });
+        else if (st.t === 'def') out.push({ node: def(st) });
+        else if (st.t === 'exit') out.push({ node: exit(st), terminal: true });
+        else if (st.t === 'branch') out.push({ node: branch(st), arms: st.arms.map((a, i) => ({ pin: 'a' + i, seq: blocks(a.steps) })) });
+        else if (st.t === 'loop') out.push({ node: loop(st), arms: [{ pin: 'body', seq: blocks(st.body), loops: true }], cont: 'done' });
+        else if (st.t === 'closure') out.push({ node: closure(st), arms: [{ pin: 'body', seq: blocks(st.body) }], cont: 'then' });
+      }
+      flush();
+      return out;
+    }
+
+    const tree = blocks(d.steps);
+    const end = add(bp({ cls: 'terminal', accent: 'var(--faint)', k: 'end', t: 'End of scope', ins: [{ pin: 'in', label: '' }] }), 'end', { t: 'end' });
+    return {
+      key: 'flow',
+      kind: 'bp',
+      layout: 'flow',
+      nodes,
+      edges: [],
+      entry,
+      end,
+      tree,
+      note:
+        `${f.file}:${f.start}-${f.end} · ${d.step_count} step${d.step_count === 1 ? '' : 's'}` +
+        (d.truncated ? ' · cut short: very long or deeply nested' : '') +
+        ' · read off the syntax tree, not a trace',
+      legend: [
+        ['call', 'var(--blue)'],
+        ['library call', 'var(--grey)'],
+        ['branch', 'var(--slate)'],
+        ['loop', 'var(--teal)'],
+        ['return', 'var(--purple)'],
+        ['throw', 'var(--red)'],
+        ['closure', 'var(--pink)'],
+        ['defines', 'var(--green)'],
+      ],
+    };
+  }
+
+  // ------------------------------------------------------------- layout
+
+  // Layered, left to right: callers before what they call. Cycles are broken
+  // for layering only, rows are ordered by barycentre sweeps, and a layer
+  // taller than `maxCol` wraps into several columns.
+  function layered(nodes, edges, opts) {
+    const gapX = opts.gapX || 90;
+    const gapY = opts.gapY || 26;
+    const maxCol = opts.maxCol || 18;
+    const N = nodes.length;
+    const index = new Map(nodes.map((n, i) => [n.id, i]));
+    const out = nodes.map(() => []);
+    const inn = nodes.map(() => []);
+    const seen = new Set();
+    for (const e of edges) {
+      const a = index.get(e.from);
+      const b = index.get(e.to);
+      if (a == null || b == null || a === b || seen.has(a * N + b)) continue;
+      seen.add(a * N + b);
+      out[a].push(b);
+      inn[b].push(a);
+    }
+    const pinned = v => nodes[v].pin;
+    const loose = [];
+    const placed = [];
+    for (let v = 0; v < N; v++) (out[v].length || inn[v].length || pinned(v) ? placed : loose).push(v);
+
+    const mark = new Uint8Array(N);
+    const back = new Set();
+    for (const s of placed) {
+      if (mark[s]) continue;
+      mark[s] = 1;
+      const stack = [[s, 0]];
+      while (stack.length) {
+        const top = stack[stack.length - 1];
+        const v = top[0];
+        if (top[1] < out[v].length) {
+          const w = out[v][top[1]++];
+          if (mark[w] === 1) back.add(v * N + w);
+          else if (!mark[w]) {
+            mark[w] = 1;
+            stack.push([w, 0]);
+          }
+        } else {
+          mark[v] = 2;
+          stack.pop();
+        }
+      }
+    }
+    const layer = new Int32Array(N);
+    const indeg = new Int32Array(N);
+    const fwd = out.map((o, v) => (pinned(v) ? [] : o.filter(w => !pinned(w) && !back.has(v * N + w))));
+    for (const v of placed) for (const w of fwd[v]) indeg[w]++;
+    const queue = placed.filter(v => !pinned(v) && !indeg[v]);
+    for (let qi = 0; qi < queue.length; qi++) {
+      const v = queue[qi];
+      for (const w of fwd[v]) {
+        layer[w] = Math.max(layer[w], layer[v] + 1);
+        if (--indeg[w] === 0) queue.push(w);
+      }
+    }
+    let maxL = 0;
+    for (const v of placed) if (!pinned(v)) maxL = Math.max(maxL, layer[v]);
+    for (const v of placed) {
+      if (pinned(v) === 'first') layer[v] = -1;
+      else if (pinned(v) === 'last') layer[v] = maxL + 1;
+    }
+    const byLayer = new Map();
+    for (const v of placed) {
+      if (!byLayer.has(layer[v])) byLayer.set(layer[v], []);
+      byLayer.get(layer[v]).push(v);
+    }
+    const layers = [...byLayer.keys()].sort((a, b) => a - b).map(k => byLayer.get(k));
+    const key = v => String(opts.order ? opts.order(nodes[v]) : nodes[v].id);
+    for (const l of layers) l.sort((a, b) => key(a).localeCompare(key(b)));
+
+    const pos = new Float64Array(N);
+    const index1 = l => l.forEach((v, i) => (pos[v] = l.length > 1 ? i / (l.length - 1) : 0.5));
+    layers.forEach(index1);
+    for (let it = 0; it < 8; it++) {
+      const down = it % 2 === 0;
+      for (const l of down ? layers : [...layers].reverse()) {
+        const bc = new Map();
+        for (const v of l) {
+          const nb = down ? inn[v] : out[v];
+          bc.set(v, nb.length ? nb.reduce((a, w) => a + pos[w], 0) / nb.length : pos[v]);
+        }
+        l.sort((a, b) => bc.get(a) - bc.get(b) || key(a).localeCompare(key(b)));
+        index1(l);
+      }
+    }
+
+    const cols = [];
+    for (const l of layers) for (let i = 0; i < l.length; i += maxCol) cols.push(l.slice(i, i + maxCol));
+    const colOf = new Int32Array(N);
+    const x = new Float64Array(N);
+    const y = new Float64Array(N);
+    let cx = 0;
+    cols.forEach((col, ci) => {
+      const w = Math.max(...col.map(v => nodes[v].w));
+      for (const v of col) {
+        colOf[v] = ci;
+        x[v] = cx;
+      }
+      cx += w + gapX;
+    });
+    const height = col => col.reduce((a, v) => a + nodes[v].h + gapY, -gapY);
+    const tallest = Math.max(0, ...cols.map(height));
+    for (const col of cols) {
+      let t = (tallest - height(col)) / 2;
+      for (const v of col) {
+        y[v] = t;
+        t += nodes[v].h + gapY;
+      }
+    }
+    const mid = v => y[v] + nodes[v].h / 2;
+    for (let it = 0; it < 8; it++) {
+      for (const col of it % 2 === 0 ? cols : [...cols].reverse()) {
+        const want = col.map(v => {
+          const nb = inn[v].concat(out[v]).filter(w => colOf[w] !== colOf[v]);
+          return nb.length ? nb.reduce((a, w) => a + mid(w), 0) / nb.length - nodes[v].h / 2 : y[v];
+        });
+        const top = want.slice();
+        for (let i = 1; i < col.length; i++) top[i] = Math.max(top[i], top[i - 1] + nodes[col[i - 1]].h + gapY);
+        for (let i = col.length - 2; i >= 0; i--) top[i] = Math.min(top[i], top[i + 1] - nodes[col[i]].h - gapY);
+        const drift = want.reduce((a, w, i) => a + (w - top[i]), 0) / col.length;
+        col.forEach((v, i) => (y[v] = top[i] + drift));
+      }
+    }
+
+    const result = new Map();
+    let bottom = 0;
+    let right = 0;
+    for (const v of placed) {
+      result.set(nodes[v].id, { x: x[v], y: y[v] });
+      bottom = Math.max(bottom, y[v] + nodes[v].h);
+      right = Math.max(right, x[v] + nodes[v].w);
+    }
+    // nodes nothing connects sit in a grid under the graph
+    if (loose.length) {
+      loose.sort((a, b) => key(a).localeCompare(key(b)));
+      const width = Math.max(right, 1100);
+      let lx = 0;
+      let ly = placed.length ? bottom + 90 : 0;
+      let row = 0;
+      for (const v of loose) {
+        if (lx && lx + nodes[v].w > width) {
+          lx = 0;
+          ly += row + gapY;
+          row = 0;
+        }
+        result.set(nodes[v].id, { x: lx, y: ly });
+        lx += nodes[v].w + 28;
+        row = Math.max(row, nodes[v].h);
+      }
+    }
+    return result;
+  }
+
+  // ------------------------------------------------------------- groups
+
+  // a scene with this many nodes reads, zoomed out, as its groups
+  const GROUP_MIN = 50;
+  // zoomed out to this the groups stand in for their nodes, and back in to
+  // this the nodes return - a gap between, so it never flickers
+  const GROUP_HIDE = 0.4;
+  const GROUP_SHOW = 0.5;
+  // room around a group's nodes for its outline - its title along the top
+  const GROUP_PAD = { left: 28, top: 40, right: 28, bottom: 28 };
+  const MARKS = ['added', 'removed', 'modified', 'inspect'];
+
+  // The groups a big scene's nodes fall into, each the context they share -
+  // a directory for a container's components, the type that owns them for a
+  // file's functions - or none for a scene small enough to read whole.
+  function groupScene(scene) {
+    const comps = scene.nodes.filter(n => n.kind === 'component');
+    const fns = scene.nodes.filter(n => n.kind === 'function');
+    let members;
+    let keyOf;
+    let unit;
+    if (comps.length >= GROUP_MIN) {
+      [members, keyOf, unit] = [comps, dirKey(comps), 'component'];
+    } else if (fns.length >= GROUP_MIN) {
+      [members, keyOf, unit] = [fns, n => (n.data.test ? 'tests' : n.data.module ? 'top level' : n.data.owner || 'free functions'), 'function'];
+    } else return null;
+    const groups = new Map();
+    for (const n of members) {
+      const key = keyOf(n);
+      if (!groups.has(key)) {
+        const cut = key.lastIndexOf('/');
+        groups.set(key, { key, title: key.slice(cut + 1), path: cut > 0 ? key.slice(0, cut + 1) : '', members: [], unit });
+      }
+      groups.get(key).members.push(n.id);
+    }
+    return [...groups.values()].sort((a, b) => a.key.localeCompare(b.key));
+  }
+
+  // how deep into its directories a container's components are grouped:
+  // the depth that splits them into about eight groups
+  function dirKey(nodes) {
+    const parts = n => (n.data.dir || '').split('/').filter(Boolean);
+    let best = null;
+    for (let d = 1; d <= 8; d++) {
+      const key = n => parts(n).slice(0, d).join('/') || './';
+      const count = new Set(nodes.map(key)).size;
+      const score = Math.abs(count - 8) + (count < 2 ? 50 : 0);
+      if (!best || score < best.score) best = { key, score };
+      if (count >= 8) break;
+    }
+    return best.key;
+  }
+
+  // A big scene laid out a group at a time: each group's nodes laid out
+  // together, then the groups laid out as nodes themselves - so each holds a
+  // region of its own, which zoomed out is one overview card.
+  function layeredGroups(scene) {
+    const byId = new Map(scene.nodes.map(n => [n.id, n]));
+    const opts = { gapX: scene.gapX, gapY: scene.gapY, order: scene.order, maxCol: 8 };
+    const parts = [];
+    for (const g of scene.groups) {
+      const members = g.members.map(id => byId.get(id)).filter(Boolean);
+      const inner = scene.edges.filter(e => scene.groupOf.get(e.from) === g && scene.groupOf.get(e.to) === g);
+      g.inner = layered(members, inner, opts);
+      let w = 0;
+      let h = 0;
+      for (const n of members) {
+        const p = g.inner.get(n.id) || { x: 0, y: 0 };
+        w = Math.max(w, p.x + n.w);
+        h = Math.max(h, p.y + n.h);
+      }
+      parts.push({ id: 'g:' + g.key, w: w + GROUP_PAD.left + GROUP_PAD.right, h: h + GROUP_PAD.top + GROUP_PAD.bottom, group: g });
+    }
+    for (const n of scene.nodes) if (!scene.groupOf.has(n.id)) parts.push(n);
+    const at = id => (scene.groupOf.has(id) ? 'g:' + scene.groupOf.get(id).key : id);
+    const edges = scene.edges.map(e => ({ from: at(e.from), to: at(e.to) })).filter(e => e.from !== e.to);
+    const outer = layered(parts, edges, { gapX: 120, gapY: 60, maxCol: 5, order: p => (p.group ? p.group.key : String(p.id)) });
+    const result = new Map();
+    for (const p of parts) {
+      const o = outer.get(p.id) || { x: 0, y: 0 };
+      if (!p.group) {
+        result.set(p.id, o);
+        continue;
+      }
+      for (const [id, q] of p.group.inner) result.set(id, { x: o.x + GROUP_PAD.left + q.x, y: o.y + GROUP_PAD.top + q.y });
+    }
+    return result;
+  }
+
+  // a group as one line: how much is in it
+  function groupSummary(g) {
+    const ms = g.members.map(id => S.byId.get(id)).filter(Boolean);
+    if (g.unit === 'component') {
+      const lines = ms.reduce((a, n) => a + (n.data.lines || 0), 0);
+      const langs = [...new Set(ms.map(n => langName(n.data.language)))].slice(0, 3).join(', ');
+      return `${plural(ms.length, 'component')} · ${plural(lines, 'line')}${langs ? ' · ' + langs : ''}`;
+    }
+    const entries = ms.filter(n => n.data.entry).length;
+    return plural(ms.length, 'function') + (entries ? ` · ${plural(entries, 'entry point')}` : '');
+  }
+
+  // Zoomed out or back in past the line: the groups stand in for their nodes,
+  // or the nodes come back.
+  function setGrouped(on) {
+    S.grouped = on;
+    $('surface').classList.toggle('grouped', on);
+    if (!on) return;
+    drawGroups();
+    drawGroupWires();
+  }
+
+  // Each group as one overview card over the region its nodes hold: what it
+  // is, how much is in it, and how much of it the step on show touched. A
+  // click zooms in until its nodes are back.
+  function drawGroups() {
+    const host = $('groups');
+    host.textContent = '';
+    for (const f of S.scene.frames || []) {
+      const g = f.group;
+      if (!g || !f.box) continue;
+      g.box = f.box;
+      const el = h('div', 'group-card');
+      Object.assign(el.style, { left: f.box.x + 'px', top: f.box.y + 'px', width: f.box.w + 'px', height: f.box.h + 'px' });
+      el.style.setProperty('--w', f.box.w + 'px');
+      el.style.setProperty('--h', f.box.h + 'px');
+      g.mark = h('div', 'g-mark');
+      g.mark.hidden = true;
+      const what = g.unit === 'component' ? g.path || 'components' : g.key === g.title && !['tests', 'top level', 'free functions'].includes(g.key) ? 'type' : 'functions';
+      el.append(h('div', 'g-what', what), h('div', 'g-title', g.title), h('div', 'g-sub', groupSummary(g)), g.mark);
+      el.title = `${g.key} - click, or zoom in, to see its ${g.unit}s`;
+      el.addEventListener('click', ev => {
+        ev.stopPropagation();
+        flyTo(g.members.map(id => S.byId.get(id)).filter(Boolean));
+      });
+      host.append(el);
+      g.el = el;
+    }
+    markGroups();
+  }
+
+  // a group whose nodes the step on show touched is marked as most of them are, and counts them
+  function markGroups() {
+    for (const g of (S.scene && S.scene.groups) || []) {
+      if (!g.el) continue;
+      const hows = [];
+      for (const id of g.members) {
+        const n = S.byId.get(id);
+        const how = n && MARKS.find(m => n.el.classList.contains('chg-' + m));
+        if (how) hows.push(how);
+      }
+      g.el.classList.remove('chg', ...MARKS.map(m => 'chg-' + m));
+      g.mark.hidden = !hows.length;
+      if (!hows.length) continue;
+      const most = MARKS.map(m => [m, hows.filter(x => x === m).length]).sort((p, q) => q[1] - p[1])[0][0];
+      g.el.classList.add('chg', 'chg-' + most);
+      g.mark.textContent = `${hows.length} ${most === 'inspect' ? 'inspected' : 'changed'}`;
+    }
+  }
+
+  // The wires between groups while they stand in for their nodes: one for
+  // each pair, as thick as the calls it carries and counted - drawn for the
+  // zoom, so they read the same however far out.
+  function drawGroupWires() {
+    const svg = $('group-wires');
+    svg.textContent = '';
+    const sc = S.scene;
+    if (!sc || !sc.groups || !S.grouped) return;
+    const z = 1 / S.zoom;
+    S.groupZoom = S.zoom;
+    $('groups').style.setProperty('--gz', String(z));
+    const all = new Map();
+    for (const e of sc.edges) {
+      const a = sc.groupOf.get(e.from);
+      const b = sc.groupOf.get(e.to);
+      if (!a && !b) continue;
+      const k = `${a ? 'g:' + a.key : e.from}>${b ? 'g:' + b.key : e.to}`;
+      if (a && a === b) continue;
+      if (!all.has(k)) all.set(k, { a: a ? a.box : S.byId.get(e.from), b: b ? b.box : S.byId.get(e.to), count: 0 });
+      all.get(k).count += (e.data && e.data.count) || 1;
+    }
+    const ns = 'http://www.w3.org/2000/svg';
+    const make = (tag, attrs) => {
+      const x = document.createElementNS(ns, tag);
+      for (const [k, v] of Object.entries(attrs)) x.setAttribute(k, v);
+      return x;
+    };
+    for (const { a, b, count } of all.values()) {
+      if (!a || !b || a.w == null || b.w == null) continue;
+      const [p1, p2] = sideAnchors(a, b);
+      const len = Math.hypot(p2.x - p1.x, p2.y - p1.y) || 1;
+      const ux = (p2.x - p1.x) / len;
+      const uy = (p2.y - p1.y) / len;
+      const s = 9 * z;
+      const bx = p2.x - ux * s;
+      const by = p2.y - uy * s;
+      svg.append(
+        make('path', { d: `M${p1.x} ${p1.y} L${bx} ${by}`, class: 'gwire', 'vector-effect': 'non-scaling-stroke', style: `stroke-width: ${1.5 + Math.min(4, Math.log2(count))}` }),
+        make('path', { d: `M${p2.x} ${p2.y} L${bx - uy * s * 0.55} ${by + ux * s * 0.55} L${bx + uy * s * 0.55} ${by - ux * s * 0.55} z`, class: 'ghead' }),
+        Object.assign(make('text', { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2, 'font-size': 12 * z, style: `stroke-width: ${4 * z}` }), { textContent: `×${count}` })
+      );
+    }
+  }
+
+  // the context level: the system in the middle, what calls in on its left,
+  // what it reaches on its right
+  function layoutContext(scene) {
+    const sys = scene.nodes.find(n => n.kind === 'system');
+    const result = new Map([[sys.id, { x: 0, y: 0 }]]);
+    const side = (list, x) => {
+      const total = list.reduce((a, n) => a + n.h + 30, -30);
+      let y = sys.h / 2 - total / 2;
+      for (const n of list) {
+        result.set(n.id, { x: x(n), y });
+        y += n.h + 30;
+      }
+    };
+    const ins = scene.nodes.filter(n => n.side === 'in');
+    const outs = scene.nodes.filter(n => n.side === 'out');
+    side(ins, n => -n.w - 180);
+    side(outs, () => sys.w + 180);
+    return result;
+  }
+
+  // A function's logic, laid out the way its code reads: one row per
+  // sequence, each arm of a branch on a band of its own to the right of it,
+  // and the code after a branch carrying on past its widest arm.
+  function layoutFlow(scene) {
+    const GX = 54;
+    const GY = 30;
+    const edges = [];
+    const wire = (p, to, extra) => edges.push({ from: p.node ? p.node.id : null, fromPin: p.pin, fromPt: p.pt, to: to.node ? to.node.id : null, toPin: to.pin, toPt: to.pt, cls: 'exec', route: p.below != null ? 'below' : 'run', below: p.below, ...extra });
+
+    function sequence(seq, x, y, ports) {
+      let cx = x;
+      let bottom = y;
+      for (const b of seq) {
+        const n = b.node;
+        n.x = cx;
+        n.y = y;
+        for (const p of ports) wire(p, { node: n, pin: 'in' });
+        if (!b.arms) {
+          cx += n.w + GX;
+          bottom = Math.max(bottom, y + n.h);
+          ports = b.terminal ? [] : [{ node: n, pin: 'out' }];
+          continue;
+        }
+        const armX = cx + n.w + GX;
+        let ay = y;
+        let armW = 0;
+        const ends = [];
+        for (const arm of b.arms) {
+          const start = { node: n, pin: arm.pin };
+          let r;
+          if (arm.seq.length) r = sequence(arm.seq, armX, ay, [start]);
+          else {
+            // an empty arm carries straight on along a band of its own
+            const pt = { pt: { x: armX, y: ay + 14 } };
+            wire(start, pt);
+            r = { w: 0, h: 28, ends: [pt] };
+          }
+          if (arm.loops) {
+            const floor = ay + r.h + 18;
+            for (const e of r.ends) edges.push({ from: e.node ? e.node.id : null, fromPin: e.pin, fromPt: e.pt, to: n.id, toPt: null, toPin: null, cls: 'exec back', route: 'back', below: floor });
+          } else ends.push(...r.ends);
+          armW = Math.max(armW, r.w);
+          ay += Math.max(r.h, 28) + GY;
+        }
+        const blockBottom = Math.max(y + n.h, ay - GY);
+        // a loop's "completed", a closure's "then": past the arms, routed under them
+        if (b.cont) ends.push({ node: n, pin: b.cont, below: blockBottom + 18 });
+        cx = armX + armW + GX;
+        bottom = Math.max(bottom, blockBottom + (b.cont ? 30 : 0));
+        ports = ends;
+      }
+      return { w: Math.max(0, cx - GX - x), h: bottom - y, ends: ports };
+    }
+
+    const entry = scene.entry;
+    entry.x = 0;
+    entry.y = 0;
+    const r = sequence(scene.tree, entry.w + GX, 0, [{ node: entry, pin: 'out' }]);
+    const end = scene.end;
+    if (r.ends.length) {
+      end.x = entry.w + GX + r.w + (scene.tree.length ? GX : 0);
+      end.y = 0;
+      for (const p of r.ends) wire(p, { node: end, pin: 'in' });
+    } else {
+      end.el.remove();
+      scene.nodes = scene.nodes.filter(n => n !== end);
+    }
+    scene.edges = edges;
+    return new Map(scene.nodes.map(n => [n.id, { x: n.x, y: n.y }]));
+  }
+
+  // ------------------------------------------------------------- mounting
+
+  const layers = () => ({ nodes: $('nodes'), wires: $('wire-layer'), labels: $('labels'), frames: $('frames') });
+
+  function clearCanvas() {
+    const l = layers();
+    l.nodes.textContent = '';
+    l.wires.textContent = '';
+    l.labels.textContent = '';
+    l.frames.textContent = '';
+    $('legend').textContent = '';
+    $('note').hidden = true;
+    S.scene = null;
+    S.byId = new Map();
+    S.lit = null;
+    $('lit-wires').textContent = '';
+    $('wires').classList.remove('dimming');
+    $('groups').textContent = '';
+    $('group-wires').textContent = '';
+    groupStyle().textContent = '';
+    S.collapsed = null;
+    S.groupZoom = null;
+  }
+
+  function measurePins(n) {
+    n.pins = new Map();
+    for (const p of n.el.querySelectorAll('[data-pin]')) {
+      const dot = p.querySelector('i') || p;
+      let x = dot.offsetWidth / 2;
+      let y = dot.offsetHeight / 2;
+      let e = dot;
+      while (e && e !== n.el) {
+        x += e.offsetLeft;
+        y += e.offsetTop;
+        e = e.offsetParent;
+      }
+      n.pins.set(p.dataset.pin, { x, y });
+    }
+  }
+
+  function mount(scene, keepView) {
+    const was = remember();
+    const same = !!was && sameView(was.route, S.route);
+    const via = S.via;
+    S.via = null;
+    // another view: the one on show lifted off as a picture, to move away as this one comes in
+    const ghost = was && !same ? lift(was) : null;
+    clearCanvas();
+    // the list of asks belongs to no one level, so it stays while they are walked
+    if (!S.asksPanel) hidePanel();
+    hideMessage();
+    S.scene = scene;
+    S.selected = null;
+    // a step arriving or replayed is seen alone - see `fade`
+    S.focusing = S.fly && T.focus && !!S.marks;
+    if (S.focusing) S.scene = scene = narrowed(scene);
+    const l = layers();
+    for (const n of scene.nodes) {
+      n.el.dataset.id = n.id;
+      l.nodes.append(n.el);
+    }
+    for (const n of scene.nodes) {
+      n.w = n.el.offsetWidth;
+      n.h = n.el.offsetHeight;
+      measurePins(n);
+    }
+    // a big scene is laid out a group at a time, and zoomed out reads as its groups
+    if (scene.groups === undefined) {
+      scene.groups = scene.layout === 'layered' ? groupScene(scene) : null;
+      if (scene.groups) {
+        // laid out afresh, apart from where its nodes sat ungrouped
+        scene.key += ':grouped';
+        scene.frames = [
+          ...(scene.frames || []),
+          ...scene.groups.map(g => ({ title: g.key, sub: plural(g.members.length, g.unit), members: g.members, cls: 'group', group: g })),
+        ];
+      }
+    }
+    for (const n of scene.nodes) n.el.classList.add(...groupClasses(scene, n.id));
+    let pos;
+    if (scene.layout === 'flow') pos = layoutFlow(scene);
+    else if (scene.layout === 'context') pos = layoutContext(scene);
+    else if (scene.groups) pos = layeredGroups(scene);
+    else pos = layered(scene.nodes, scene.edges, scene);
+    const saved = scene.persist ? store.get('pos:' + scene.key, {}) : {};
+    for (const n of scene.nodes) {
+      const p = saved[n.key || n.id] || pos.get(n.id) || { x: 0, y: 0 };
+      n.x = p.x;
+      n.y = p.y;
+      place(n);
+      S.byId.set(n.id, n);
+    }
+    drawFrames();
+    drawEdges();
+    drawGroups();
+    if (scene.note) {
+      $('note').textContent = scene.note;
+      $('note').hidden = false;
+    }
+    if (scene.empty) showMessage(...scene.empty);
+    legend(scene.legend || []);
+    if (keepView) applyView();
+    else fit();
+    const changed = applyMarks();
+    // the camera goes straight to where it ends, and the motion carries it there
+    const moving = same || !!ghost;
+    if (S.fly && changed.length) flyTo(changed, moving);
+    S.fly = false;
+    if (same) morph(was);
+    else if (ghost) travel(was, ghost, via);
+    S.shownRoute = S.route && { ...S.route };
+  }
+
+  // ------------------------------------------------------------- motion
+
+  // motion is for those who want it
+  const calm = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+  // a scene past this many nodes changes in a cut - moving thousands of
+  // elements at once is a stall, not an animation
+  const MOTION_MAX = 600;
+  // and past this many coming and going, they simply appear
+  const MOTION_CROWD = 150;
+  const EASE = 'cubic-bezier(.2, .7, .2, 1)';
+  const MOVE_MS = 480;
+  const DEPTH = { system: 0, containers: 1, components: 2, code: 3, flow: 4 };
+  // words on a node that, changed, are pointed out
+  const WORDS = ['.head .t', '.head .q', '.body', '.chain', '.name', '.tech'];
+
+  // a node as the next scene knows it again
+  const morphKey = n => n.mkey || n.key || n.id;
+
+  // The same view drawn again - a step's other side, a function after an
+  // edit, the map after a save - rather than a move to another.
+  function sameView(a, b) {
+    if (!a || !b || a.level !== b.level) return false;
+    if (a.level === 'flow') return a.file === b.file && (a.name ? a.name === b.name : a.line === b.line);
+    return href(a) === href(b);
+  }
+
+  // a parameter is its name - `n: i32` is still `n` whatever its type becomes
+  const pinName = label => label.split(':')[0].trim();
+
+  // a node's pins as the eye reads them: the side, what each says, how far down
+  function pinsOf(n) {
+    const out = [];
+    const seen = new Map();
+    const top = n.el.getBoundingClientRect().top;
+    for (const p of n.el.querySelectorAll('.rows > .pin')) {
+      const label = p.querySelector('.lbl')?.textContent || '';
+      if (p.style.visibility === 'hidden' || (!label && !p.dataset.pin)) continue;
+      const side = p.classList.contains('in') ? 'in' : 'out';
+      const base = `${side}:${p.classList.contains('ret') ? 'ret' : pinName(label) || p.dataset.pin}`;
+      const k = seen.get(base) || 0;
+      seen.set(base, k + 1);
+      out.push({ key: `${base}#${k}`, label, side, el: p, top: (p.getBoundingClientRect().top - top) / S.zoom });
+    }
+    return out;
+  }
+
+  const wordsOf = el => new Map(WORDS.map(s => [s, el.querySelector(s)?.textContent ?? null]));
+
+  // a wire by the nodes it joins, as the next scene knows them again
+  function wireKey(e, keyOf) {
+    const pin = S.scene.layout === 'flow' ? e.fromPin || '' : '';
+    return `${keyOf(e.from)}:${pin}>${keyOf(e.to)}|${e.cls || ''}`;
+  }
+
+  // what the canvas shows now, for the scene that follows to move on from
+  function remember() {
+    if (!S.scene || !S.shownRoute || calm()) return null;
+    const size = S.scene.nodes.length;
+    const nodes = new Map();
+    const small = size <= MOTION_MAX;
+    for (const n of S.scene.nodes) {
+      nodes.set(morphKey(n), { n, x: n.x, y: n.y, pins: small && n.el.classList.contains('bp') ? pinsOf(n) : [], words: small ? wordsOf(n.el) : null });
+    }
+    const keyOf = id => (S.byId.has(id) ? morphKey(S.byId.get(id)) : String(id));
+    const wires = new Map();
+    if (small) for (const e of S.scene.edges) if (e.path) wires.set(wireKey(e, keyOf), e.path.getAttribute('d'));
+    return { route: S.shownRoute, size, nodes, wires, view: { zoom: S.zoom, panX: S.panX, panY: S.panY } };
+  }
+
+  // an animation that tidies up after itself, and is no promise of one
+  function animate(el, frames, opts, after) {
+    const a = el.animate(frames, opts);
+    if (after) a.finished.then(after, after);
+    return a;
+  }
+
+  // a class put on for the length of its animation, again if it was already
+  function flash(el, cls) {
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+    el.addEventListener('animationend', () => el.classList.remove(cls), { once: true });
+  }
+
+  const cameraOf = v => `translate(${v.panX}px, ${v.panY}px) scale(${v.zoom})`;
+  const gridOf = v => ({ backgroundSize: `${20 * v.zoom}px ${20 * v.zoom}px`, backgroundPosition: `${v.panX}px ${v.panY}px` });
+
+  // the camera carried from where it was to where it is now
+  function carryCamera(from) {
+    const to = { zoom: S.zoom, panX: S.panX, panY: S.panY };
+    if (Math.abs(from.zoom - to.zoom) < 1e-3 && Math.abs(from.panX - to.panX) < 0.5 && Math.abs(from.panY - to.panY) < 0.5) return;
+    $('viewport').classList.remove('glide');
+    for (const a of $('surface').getAnimations()) a.cancel();
+    animate($('surface'), [{ transform: cameraOf(from) }, { transform: cameraOf(to) }], { duration: MOVE_MS, easing: EASE });
+    animate($('viewport'), [gridOf(from), gridOf(to)], { duration: MOVE_MS, easing: EASE });
+  }
+
+  // The same view drawn again: what stayed glides to where it sits now, what
+  // came grows in, what went fades where it was, and the pins and words of a
+  // node that changed say so - a parameter, a return type, a call.
+  function morph(was) {
+    carryCamera(was.view);
+    const now = S.scene.nodes;
+    if (now.length > MOTION_MAX || was.size > MOTION_MAX) return;
+    const kept = new Set(now.map(morphKey).filter(k => was.nodes.has(k)));
+    const crowd = now.length - kept.size + was.nodes.size - kept.size > MOTION_CROWD;
+    // pins stamped so far, so each lands after the one before
+    let stamped = 0;
+    for (const n of now) {
+      const old = was.nodes.get(morphKey(n));
+      if (!old) {
+        if (!crowd) enter(n.el);
+        continue;
+      }
+      const dx = old.x - n.x;
+      const dy = old.y - n.y;
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) animate(n.el, [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: MOVE_MS, easing: EASE });
+      if (old.pins.length || n.el.classList.contains('bp')) stamped = morphPins(n, old.pins, stamped);
+      if (old.words) morphWords(n.el, old.words);
+    }
+    if (!crowd) for (const [k, old] of was.nodes) if (!kept.has(k)) leave(old.n.el);
+    morphWires(was.wires);
+  }
+
+  // a node that was not there before grows in, and glows a moment
+  function enter(el) {
+    animate(el, [{ opacity: 0, transform: 'scale(.86)' }, { opacity: 1, transform: 'none' }], { duration: 420, delay: 140, easing: EASE, fill: 'backwards' });
+    flash(el, 'arrived');
+  }
+
+  // a node gone from the scene fades out where it was
+  function leave(el) {
+    if (el.isConnected) return;
+    el.classList.add('leaving');
+    el.classList.remove('selected', 'hit', 'faded');
+    delete el.dataset.id;
+    $('nodes').append(el);
+    animate(el, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'scale(.86)' }], { duration: 520, easing: EASE, fill: 'forwards' }, () => el.remove());
+  }
+
+  // when the first pin is stamped - once the nodes have settled - the gap
+  // to the next, how many land one by one before the rest land together,
+  // and how long a stamp's ink takes to dry
+  const STAMP_AT = 340;
+  const STAMP_GAP = 170;
+  const STAMP_RUN = 10;
+  const STAMP_MS = 1700;
+
+  // A node's pins against what they were. One that came, or whose words
+  // changed, is stamped onto the node, one after another; one that went
+  // slides off the node struck through. `stamped` is how many landed before
+  // this node's, and the count is handed on.
+  function morphPins(n, before, stamped) {
+    const was = new Map(before.map(p => [p.key, p]));
+    const now = new Set();
+    for (const p of pinsOf(n)) {
+      now.add(p.key);
+      const old = was.get(p.key);
+      if (old && old.label === p.label) continue;
+      stamp(p.el, STAMP_AT + Math.min(stamped++, STAMP_RUN) * STAMP_GAP, old ? old.label : null);
+    }
+    for (const p of before) if (!now.has(p.key)) pinLeave(n, p);
+    return stamped;
+  }
+
+  // A pin pressed onto its node `at` ms from now: it lands from above, presses
+  // in and leaves a ring of ink - green for one that came, amber for one
+  // whose words changed. Those old words stay put until the stamp comes
+  // down, and lift off as it lands.
+  function stamp(pin, at, old) {
+    pin.style.setProperty('--stamp-at', at + 'ms');
+    pin.classList.toggle('changed', old != null);
+    pin.classList.add('stamp');
+    setTimeout(() => pin.classList.remove('stamp', 'changed'), at + STAMP_MS);
+    const lbl = old != null && pin.querySelector('.lbl');
+    if (!lbl) return;
+    const ghost = h('span', 'lbl-was', old);
+    ghost.style.left = lbl.offsetLeft + 'px';
+    ghost.style.top = lbl.offsetTop + 'px';
+    pin.append(ghost);
+    animate(ghost, [{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(7px) scale(.9)' }], { duration: 260, delay: Math.max(0, at - 120), easing: 'ease-in', fill: 'both' }, () => ghost.remove());
+  }
+
+  function pinLeave(n, p) {
+    const g = p.el;
+    if (g.isConnected) return;
+    g.classList.add('pin-out');
+    g.removeAttribute('data-pin');
+    g.style.top = Math.max(0, Math.min(p.top, n.el.offsetHeight - 22)) + 'px';
+    g.style[p.side === 'in' ? 'left' : 'right'] = '0';
+    n.el.append(g);
+    const off = p.side === 'in' ? -28 : 28;
+    animate(g, [{ opacity: 1, transform: 'none' }, { opacity: 1, transform: 'none', offset: 0.35 }, { opacity: 0, transform: `translateX(${off}px)` }], { duration: 900, easing: EASE, fill: 'forwards' }, () => g.remove());
+  }
+
+  function morphWords(el, before) {
+    for (const [sel, old] of before) {
+      const x = el.querySelector(sel);
+      if (x && old != null && x.textContent !== old) flash(x, 'txt-change');
+    }
+  }
+
+  // The wires settle in once the nodes have, the old fading as they go - a
+  // wire that went fades red, and one that came draws itself in.
+  function morphWires(before) {
+    const keyOf = id => (S.byId.has(id) ? morphKey(S.byId.get(id)) : String(id));
+    const now = new Map();
+    for (const e of S.scene.edges) if (e.path) now.set(wireKey(e, keyOf), e);
+    const svg = $('wires');
+    const old = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    old.setAttribute('class', 'ghost-wires');
+    for (const [k, d] of before) {
+      const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      p.setAttribute('d', d);
+      p.setAttribute('class', 'wire' + (now.has(k) ? '' : ' gone'));
+      old.append(p);
+    }
+    svg.insertBefore(old, $('wire-layer'));
+    animate(old, [{ opacity: 1 }, { opacity: 0 }], { duration: 360, easing: 'ease-out', fill: 'forwards' }, () => old.remove());
+    animate($('wire-layer'), [{ opacity: 0 }, { opacity: 0, offset: 0.55 }, { opacity: 1 }], { duration: MOVE_MS + 260 });
+    const fresh = [...now].filter(([k]) => !before.has(k)).map(([, e]) => e);
+    if (!before.size || fresh.length > MOTION_CROWD) return;
+    for (const e of fresh) {
+      const len = e.path.getTotalLength();
+      animate(e.path, [{ strokeDasharray: `${len}`, strokeDashoffset: `${len}` }, { strokeDasharray: `${len}`, strokeDashoffset: '0' }], { duration: 520, delay: MOVE_MS, easing: EASE, fill: 'backwards' });
+      flash(e.path, 'wire-new');
+    }
+  }
+
+  // the view on show lifted off the canvas as one picture - one move at a
+  // time, so a move made before the last one finished cuts it short
+  function lift(was) {
+    for (const g of document.querySelectorAll('.ghost')) g.remove();
+    for (const a of $('surface').getAnimations()) a.cancel();
+    if (was.size > MOTION_MAX) return null;
+    const ghost = h('div', 'ghost');
+    ghost.style.transform = $('surface').style.transform;
+    ghost.classList.toggle('grouped', !!S.grouped);
+    for (const id of ['frames', 'wires', 'labels', 'nodes', 'groups', 'group-wires']) {
+      const c = $(id).cloneNode(true);
+      c.removeAttribute('id');
+      for (const x of c.querySelectorAll('[id]')) x.removeAttribute('id');
+      ghost.append(c);
+    }
+    $('viewport').append(ghost);
+    return ghost;
+  }
+
+  // From one view to another. Going in, the old view swells through what was
+  // opened as the new one grows out of it; coming back up, the old view
+  // shrinks into where it sits in the new. Elsewhere, one fades into the other.
+  function travel(was, ghost, via) {
+    const vp = $('viewport').getBoundingClientRect();
+    const surface = $('surface');
+    const final = surface.style.transform;
+    const from = ghost.style.transform;
+    const done = () => ghost.remove();
+    const deeper = (DEPTH[S.route.level] ?? 0) > (DEPTH[was.route.level] ?? 0);
+    let at = deeper ? via : null;
+    if (!deeper && (DEPTH[S.route.level] ?? 0) < (DEPTH[was.route.level] ?? 0)) {
+      // the node in this view that opens the one left
+      const back = S.scene.nodes.find(n => n.drill && sameView(n.drill, was.route));
+      if (back) at = { left: vp.left + S.panX + back.x * S.zoom, top: vp.top + S.panY + back.y * S.zoom, width: back.w * S.zoom, height: back.h * S.zoom };
+    }
+    $('viewport').classList.remove('glide');
+    if (!at || !at.width || !at.height) {
+      animate(ghost, [{ opacity: 1 }, { opacity: 0 }], { duration: 260, easing: 'ease-out', fill: 'forwards' }, done);
+      animate(surface, [{ opacity: 0, transform: `translateY(8px) ${final}` }, { opacity: 1, transform: final }], { duration: 360, delay: 80, easing: EASE, fill: 'backwards' });
+      return;
+    }
+    const cx = at.left + at.width / 2 - vp.left;
+    const cy = at.top + at.height / 2 - vp.top;
+    // how small the whole view is, held within the node
+    const k = clamp(Math.max(at.width / vp.width, at.height / vp.height), 0.12, 0.9);
+    const about = (s, t) => `translate(${cx}px, ${cy}px) scale(${s}) translate(${-cx}px, ${-cy}px) ${t}`;
+    const big = Math.min(1 / k, 4);
+    if (deeper) {
+      animate(ghost, [{ opacity: 1, transform: from }, { opacity: 0, transform: about(big, from) }], { duration: MOVE_MS, easing: EASE, fill: 'forwards' }, done);
+      animate(surface, [{ opacity: 0, transform: about(k, final) }, { opacity: 1, transform: final }], { duration: MOVE_MS, easing: EASE });
+    } else {
+      animate(ghost, [{ opacity: 1, transform: from }, { opacity: 0, transform: about(k, from) }], { duration: MOVE_MS, easing: EASE, fill: 'forwards' }, done);
+      animate(surface, [{ opacity: 0, transform: about(Math.min(big, 1.6), final) }, { opacity: 1, transform: final }], { duration: MOVE_MS, easing: EASE });
+    }
+  }
+
+  // a step's scene past this many nodes keeps only what it touched and what
+  // is wired straight to it
+  const FOCUS_KEEP = 12;
+
+  // A scene cut down to the step on show and its neighbours, laid out afresh
+  // so they sit together and fit the screen. A function's logic and the
+  // context level keep every node - their shape is the point of them.
+  function narrowed(scene) {
+    if (scene.layout === 'flow' || scene.layout === 'context' || scene.nodes.length <= FOCUS_KEEP) return scene;
+    const hit = new Set(scene.nodes.filter(n => changeOf(n, S.marks.ev, S.marks.side)).map(n => n.id));
+    if (!hit.size) return scene;
+    const near = new Set(hit);
+    for (const e of scene.edges) {
+      if (hit.has(e.from)) near.add(e.to);
+      if (hit.has(e.to)) near.add(e.from);
+    }
+    if (near.size >= scene.nodes.length) return scene;
+    return {
+      ...scene,
+      nodes: scene.nodes.filter(n => near.has(n.id)),
+      edges: scene.edges.filter(e => near.has(e.from) && near.has(e.to)),
+      persist: false,
+      pruned: true,
+    };
+  }
+
+  function place(n) {
+    n.el.style.left = n.x + 'px';
+    n.el.style.top = n.y + 'px';
+  }
+
+  function savePos(n) {
+    const key = 'pos:' + S.scene.key;
+    const all = store.get(key, {});
+    all[n.key || n.id] = { x: Math.round(n.x), y: Math.round(n.y) };
+    store.set(key, all);
+  }
+
+  function drawFrames() {
+    const host = $('frames');
+    host.textContent = '';
+    for (const f of S.scene.frames || []) {
+      const members = f.members.map(id => S.byId.get(id)).filter(Boolean);
+      if (!members.length) continue;
+      const x0 = Math.min(...members.map(n => n.x)) - 28;
+      const y0 = Math.min(...members.map(n => n.y)) - (f.top || 28);
+      const x1 = Math.max(...members.map(n => n.x + n.w)) + 28;
+      const y1 = Math.max(...members.map(n => n.y + n.h)) + (f.bottom || 56);
+      const box = h('div', 'frame' + (f.cls ? ' ' + f.cls : ''));
+      Object.assign(box.style, { left: x0 + 'px', top: y0 + 'px', width: x1 - x0 + 'px', height: y1 - y0 + 'px' });
+      const title = h('div', 'title', f.title);
+      if (f.sub) title.append(h('small', null, `[${f.sub}]`));
+      box.append(title);
+      host.append(box);
+      f.box = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    }
+  }
+
+  // ------------------------------------------------------------- wires
+
+  function pinPos(n, name, fallbackSide) {
+    const p = name && n.pins.get(name);
+    if (p) return { x: n.x + p.x, y: n.y + p.y };
+    return fallbackSide === 'in' ? { x: n.x, y: n.y + 20 } : { x: n.x + n.w, y: n.y + 20 };
+  }
+
+  // straight, from the side of one box facing the other - how doc draws a relationship
+  function sideAnchors(a, b) {
+    const ca = { x: a.x + a.w / 2, y: a.y + a.h / 2 };
+    const cb = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+    const at = (n, c, toward) => {
+      const dx = toward.x - c.x;
+      const dy = toward.y - c.y;
+      if (Math.abs(dx) * n.h >= Math.abs(dy) * n.w) return { x: dx > 0 ? n.x + n.w : n.x, y: c.y };
+      return { x: c.x, y: dy > 0 ? n.y + n.h : n.y };
+    };
+    return [at(a, ca, cb), at(b, cb, ca)];
+  }
+
+  function curve(p1, p2) {
+    const c = Math.max(46, Math.abs(p2.x - p1.x) / 2);
+    return `M${p1.x} ${p1.y} C${p1.x + c} ${p1.y} ${p2.x - c} ${p2.y} ${p2.x} ${p2.y}`;
+  }
+
+  // level first, then a bend into the target: keeps a wire inside its own band
+  function run(p1, p2) {
+    if (p2.x - p1.x > 110 && Math.abs(p2.y - p1.y) > 2) {
+      const k = p2.x - 64;
+      return `M${p1.x} ${p1.y} L${k} ${p1.y} C${k + 34} ${p1.y} ${p2.x - 30} ${p2.y} ${p2.x} ${p2.y}`;
+    }
+    return curve(p1, p2);
+  }
+
+  // the reach of each bend of a wire that runs along a floor, and the least run worth drawing between them
+  const BEND = 64;
+  const FLOOR_RUN = 48;
+
+  // Down to a floor below what lies between, along it, and up into the
+  // target. Too close for a run along the floor, the two bends would fold
+  // back over each other - so they meet level at the lowest point instead,
+  // one smooth dip.
+  function below(p1, p2, yb) {
+    const span = p2.x - p1.x;
+    if (span >= 2 * BEND + FLOOR_RUN) {
+      return `M${p1.x} ${p1.y} C${p1.x + 34} ${p1.y} ${p1.x + 34} ${yb} ${p1.x + BEND} ${yb} L${p2.x - BEND} ${yb} C${p2.x - 34} ${yb} ${p2.x - 34} ${p2.y} ${p2.x} ${p2.y}`;
+    }
+    const mx = (p1.x + p2.x) / 2;
+    // which way the dip runs along its floor, and how level it lies there
+    const dir = span < 0 ? -1 : 1;
+    const level = Math.max(12, Math.abs(span) / 4);
+    const lead = clamp(Math.abs(span) / 2, 24, 40);
+    return `M${p1.x} ${p1.y} C${p1.x + lead} ${p1.y} ${mx - dir * level} ${yb} ${mx} ${yb} C${mx + dir * level} ${yb} ${p2.x - lead} ${p2.y} ${p2.x} ${p2.y}`;
+  }
+
+  function backTo(p1, n, yb) {
+    const tx = n.x + n.w / 2;
+    const ty = n.y + n.h;
+    return `M${p1.x} ${p1.y} C${p1.x + 40} ${p1.y} ${p1.x + 40} ${yb} ${p1.x} ${yb} L${tx} ${yb} L${tx} ${ty + 2}`;
+  }
+
+  function edgePath(e) {
+    const a = e.from != null ? S.byId.get(e.from) : null;
+    const b = e.to != null ? S.byId.get(e.to) : null;
+    if (S.scene.kind === 'c4') {
+      if (!a || !b) return null;
+      const [p1, p2] = sideAnchors(a, b);
+      e.mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+      return `M${p1.x} ${p1.y} L${p2.x} ${p2.y}`;
+    }
+    const p1 = e.fromPt || (a && pinPos(a, e.fromPin, 'out'));
+    if (!p1) return null;
+    if (e.route === 'back') return b ? backTo(p1, b, e.below) : null;
+    const p2 = e.toPt || (b && pinPos(b, e.toPin, 'in'));
+    if (!p2) return null;
+    if (e.route === 'below') return below(p1, p2, e.below);
+    if (e.route === 'run') return run(p1, p2);
+    return curve(p1, p2);
+  }
+
+  function drawEdges() {
+    const wires = $('wire-layer');
+    const labels = $('labels');
+    wires.textContent = '';
+    labels.textContent = '';
+    const c4 = S.scene.kind === 'c4';
+    for (const e of S.scene.edges) {
+      const d = edgePath(e);
+      if (!d) continue;
+      const path = sv('path', { d, class: 'wire ' + (e.cls || ''), 'marker-end': c4 ? 'url(#arrow)' : null });
+      // a wider transparent twin catches the pointer, as doc's hit line does
+      const hit = sv('path', { d, stroke: 'transparent', 'stroke-width': 14, fill: 'none' });
+      hit.addEventListener('click', ev => {
+        ev.stopPropagation();
+        selectEdge(e);
+      });
+      wires.append(path, hit);
+      e.path = path;
+      e.hit = hit;
+      // a wire at a grouped node goes while a group of its stands in for it
+      e.groups = [...new Set([...groupClasses(S.scene, e.from), ...groupClasses(S.scene, e.to)])];
+      path.classList.add(...e.groups);
+      hit.classList.add(...e.groups);
+      if (c4 && e.label && e.mid) {
+        const lab = h('div', 'elabel' + (e.cls === 'declared' ? ' declared' : ''), e.label);
+        lab.style.left = e.mid.x + 'px';
+        lab.style.top = e.mid.y + 'px';
+        if (e.title) lab.title = e.title;
+        if (S.scene.quietLabels) lab.style.display = 'none';
+        lab.addEventListener('click', ev => {
+          ev.stopPropagation();
+          selectEdge(e);
+        });
+        lab.classList.add(...e.groups);
+        labels.append(lab);
+        e.labelEl = lab;
+      }
+    }
+    highlight(S.selected);
+  }
+
+  // redraw only the wires touching a node being dragged
+  function redrawAround(id) {
+    for (const e of S.scene.edges) {
+      if (e.from !== id && e.to !== id) continue;
+      const d = edgePath(e);
+      if (!d || !e.path) continue;
+      e.path.setAttribute('d', d);
+      e.hit.setAttribute('d', d);
+      if (e.labelEl && e.mid) {
+        e.labelEl.style.left = e.mid.x + 'px';
+        e.labelEl.style.top = e.mid.y + 'px';
+      }
+    }
+    // the lit copies follow the wires they copy
+    if (S.lit && S.lit.edges.some(e => e.from === id || e.to === id)) highlight(S.lit.id);
+  }
+
+  // the wires at each node of the scene, gathered the first time they are asked for
+  function touching(id) {
+    const sc = S.scene;
+    if (!sc.touching) {
+      sc.touching = new Map();
+      for (const e of sc.edges) {
+        for (const end of new Set([e.from, e.to])) {
+          if (!sc.touching.has(end)) sc.touching.set(end, []);
+          sc.touching.get(end).push(e);
+        }
+      }
+    }
+    return (sc.touching.get(id) || []).filter(e => e.path);
+  }
+
+  // A node's wires lit and the rest dimmed. The scene's wires are one drawing,
+  // dimmed whole and never redrawn; the lit ones are copies on a layer of
+  // their own - so a pointer moving over thousands of wires redraws a handful.
+  function highlight(id) {
+    if (!S.scene) return;
+    const c4 = S.scene.kind === 'c4';
+    const quiet = S.scene.quietLabels;
+    const was = S.lit || { edges: [], nodes: [] };
+    for (const e of was.edges) {
+      if (!e.labelEl) continue;
+      e.labelEl.classList.remove('hot');
+      if (quiet) e.labelEl.style.display = 'none';
+    }
+    for (const n of was.nodes) n.el.classList.remove('hit');
+    const edges = id == null ? [] : touching(id);
+    const lit = $('lit-wires');
+    lit.textContent = '';
+    const near = new Set();
+    for (const e of edges) {
+      const copy = e.path.cloneNode(false);
+      copy.classList.add('hot');
+      if (c4) copy.setAttribute('marker-end', 'url(#arrow-hot)');
+      lit.append(copy);
+      if (e.labelEl) {
+        e.labelEl.classList.add('hot');
+        if (quiet) e.labelEl.style.display = '';
+      }
+      near.add(e.from);
+      near.add(e.to);
+    }
+    near.delete(id);
+    const nodes = [...near].map(n => S.byId.get(n)).filter(Boolean);
+    for (const n of nodes) n.el.classList.add('hit');
+    S.lit = { id, edges, nodes };
+    $('wires').classList.toggle('dimming', id != null);
+    $('labels').classList.toggle('dimming', id != null);
+  }
+
+  // Hover lights a node's wires a moment after the pointer reaches it, and
+  // lets them go a little later, so a pointer crossing the gaps between nodes
+  // never flashes the whole scene.
+  let hoverTimer = 0;
+  function hoverSoon() {
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => S.selected == null && highlight(S.hover), S.hover == null ? 150 : 30);
+  }
+
+  // ------------------------------------------------------------- view
+
+  // The camera: the surface moved and scaled as one layer, and the grid with
+  // it - set on those two alone, never as a property the thousands of nodes
+  // below would inherit and each be styled again for.
+  function applyView() {
+    const vp = $('viewport');
+    $('surface').style.transform = `translate(${S.panX}px, ${S.panY}px) scale(${S.zoom})`;
+    vp.style.backgroundSize = `${20 * S.zoom}px ${20 * S.zoom}px`;
+    vp.style.backgroundPosition = `${S.panX}px ${S.panY}px`;
+    // at 30% and below the grid goes - see `.viewport.far`
+    vp.classList.toggle('far', S.zoom <= 0.3);
+    $('zoom-level').textContent = Math.round(S.zoom * 100) + '%';
+    // a big scene zoomed out reads as its groups, and zoomed back in as its nodes
+    regroup();
+  }
+
+  // the camera once a frame, however many pointer or wheel events the frame brings
+  let viewFrame = 0;
+  function viewSoon() {
+    if (viewFrame) return;
+    viewFrame = requestAnimationFrame(() => {
+      viewFrame = 0;
+      applyView();
+    });
+  }
+
+  function bounds() {
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    const take = (x, y, w, h) => {
+      x0 = Math.min(x0, x);
+      y0 = Math.min(y0, y);
+      x1 = Math.max(x1, x + w);
+      y1 = Math.max(y1, y + h);
+    };
+    for (const n of S.scene ? S.scene.nodes : []) take(n.x, n.y, n.w, n.h);
+    for (const f of (S.scene && S.scene.frames) || []) if (f.box) take(f.box.x, f.box.y, f.box.w, f.box.h);
+    return x0 === Infinity ? { x: 0, y: 0, w: 1, h: 1 } : { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+
+  // Everything in view - except a function's logic, which reads left to right
+  // and is often far wider than the screen: past the point where its text
+  // stops being legible it opens on the entry node instead. `whole` forces
+  // the full view.
+  function fit(whole) {
+    const vp = $('viewport');
+    const b = bounds();
+    const vw = vp.clientWidth;
+    const vh = vp.clientHeight;
+    const z = clamp(Math.min((vw - 96) / b.w, (vh - 150) / b.h), 0.08, 1.15);
+    const entry = S.scene && S.scene.entry;
+    if (whole !== true && entry && z < 0.55) {
+      S.zoom = clamp((vh - 150) / b.h, 0.55, 1);
+      S.panX = 48 - b.x * S.zoom;
+      S.panY = vh / 2 - (entry.y + entry.h / 2) * S.zoom;
+    } else {
+      S.zoom = z;
+      S.panX = (vw - b.w * S.zoom) / 2 - b.x * S.zoom;
+      S.panY = (vh - b.h * S.zoom) / 2 - b.y * S.zoom;
+    }
+    applyView();
+  }
+
+  function zoomAt(mx, my, factor) {
+    const z = clamp(S.zoom * factor, 0.08, 3);
+    S.panX = mx - ((mx - S.panX) * z) / S.zoom;
+    S.panY = my - ((my - S.panY) * z) / S.zoom;
+    S.zoom = z;
+    viewSoon();
+  }
+
+  function zoomBy(factor) {
+    const vp = $('viewport');
+    zoomAt(vp.clientWidth / 2, vp.clientHeight / 2, factor);
+  }
+
+  // ------------------------------------------------------------- selection and panel
+
+  function select(id) {
+    for (const n of S.scene ? S.scene.nodes : []) n.el.classList.toggle('selected', n.id === id);
+    S.selected = id;
+    highlight(id);
+    if (id == null) return hidePanel();
+    // a node a folded group stands in for is gone to, near enough to see it
+    if (hiddenByGroup(id)) flyTo([S.byId.get(id)]);
+    showPanelFor(S.byId.get(id));
+    clearOfPanel(S.byId.get(id));
+  }
+
+  // the panel opens over the canvas's right side; a node it would cover is
+  // panned left, so what was just clicked stays in sight
+  function clearOfPanel(n) {
+    const p = $('panel');
+    if (!n || p.hidden) return;
+    const vp = $('viewport').getBoundingClientRect();
+    const limit = p.getBoundingClientRect().left - vp.left - 24;
+    const right = (n.x + n.w) * S.zoom + S.panX;
+    if (right > limit) {
+      S.panX -= right - limit;
+      applyView();
+    }
+  }
+
+  function selectEdge(e) {
+    select(null);
+    for (const x of S.scene.edges) if (x.path) x.path.classList.toggle('hot', x === e);
+    panelEdge(e);
+  }
+
+  function drill(n) {
+    if (!n || !n.drill) return;
+    // where the view opened from, for it to grow out of
+    S.via = n.el.getBoundingClientRect();
+    go(n.drill);
+  }
+
+  function hidePanel() {
+    $('panel').hidden = true;
+    S.stepPanel = false;
+    S.asksPanel = false;
+  }
+
+  function panel(what, title, fill) {
+    S.stepPanel = false;
+    S.asksPanel = false;
+    $('panel-what').textContent = what;
+    $('panel-title').textContent = title;
+    const body = $('panel-body');
+    body.textContent = '';
+    fill(body);
+    $('panel').hidden = false;
+  }
+
+  function dl(pairs) {
+    const d = h('dl');
+    for (const [k, v] of pairs) {
+      if (v == null || v === '' || v === false) continue;
+      d.append(h('dt', null, k));
+      const dd = h('dd');
+      if (v instanceof Node) dd.append(v);
+      else dd.textContent = String(v);
+      d.append(dd);
+    }
+    return d;
+  }
+
+  function editorHref(file, line) {
+    const root = (S.overview && S.overview.root_path) || '';
+    return `vscode://file${root.startsWith('/') ? '' : '/'}${root}/${file}${line ? ':' + line : ''}`;
+  }
+
+  // a link that opens the file at the line - a vscode:// link in a browser, a
+  // request to the extension inside it
+  function editorLink(text, file, line) {
+    const a = h('a', null, text);
+    a.href = editorHref(file, line);
+    a.addEventListener('click', e => {
+      if (!vscode) return;
+      e.preventDefault();
+      vscode.postMessage({ type: 'open', file, line });
+    });
+    return a;
+  }
+
+  function actions(list) {
+    const box = h('div', 'actions');
+    for (const a of list) {
+      if (!a) continue;
+      if (a.open) box.append(editorLink(a.label, ...a.open));
+      else {
+        const b = h('button', null, a.label);
+        b.addEventListener('click', a.run);
+        box.append(b);
+      }
+    }
+    return box;
+  }
+
+  function goBtn(text, route, title) {
+    const b = h('button', 'go', text);
+    if (title) b.title = title;
+    b.addEventListener('click', () => go(route));
+    return b;
+  }
+
+  function list(items) {
+    const ul = h('ul');
+    for (const it of items) {
+      const li = h('li');
+      li.append(it);
+      ul.append(li);
+    }
+    return ul;
+  }
+
+  function section(body, title, content) {
+    if (!content) return;
+    body.append(h('h3', null, title), content);
+  }
+
+  function showPanelFor(n) {
+    if (!n) return hidePanel();
+    const o = S.overview;
+    const d = n.data;
+    switch (n.kind) {
+      case 'system':
+        return panel('Software system', d.name, body => {
+          body.append(dl([['files', fmt(d.files)], ['lines', fmt(d.lines)], ['functions', fmt(d.functions)], ['resolved calls', fmt(d.edges)], ['containers', o.containers.length], ['grouped by', d.grouping]]));
+          section(body, 'Languages', list(d.languages.map(l => `${langName(l.language)} · ${plural(l.files, 'file')} · ${plural(l.lines, 'line')}`)));
+          body.append(actions([{ label: 'Open containers', run: () => drill(n) }]));
+        });
+      case 'container':
+        return panel('Container', d.name, body => {
+          body.append(dl([['files', d.files], ['functions', d.funcs], ['lines', fmt(d.lines)], ['entry points', d.entries], ['test files', d.tests], ['globs', d.globs.join(', ')]]));
+          section(body, 'Technology', list(d.languages.map(l => `${langName(l.language)} · ${plural(l.files, 'file')}`)));
+          const outE = o.container_edges.filter(e => e.from === d.id);
+          const inE = o.container_edges.filter(e => e.to === d.id);
+          if (outE.length) section(body, 'Calls into', list(outE.map(e => `${e.to} - ${e.detected ? `×${e.count}: ${e.symbols.join(', ')}` : 'declared only'}`)));
+          if (inE.length) section(body, 'Called from', list(inE.map(e => `${e.from} - ${e.detected ? `×${e.count}: ${e.symbols.join(', ')}` : 'declared only'}`)));
+          body.append(actions([{ label: 'Open components', run: () => drill(n) }]));
+        });
+      case 'component':
+        return panel('Component', d.id, body => {
+          body.append(dl([['container', d.container], ['language', langName(d.language)], ['lines', d.lines], ['functions', d.funcs], ['types', d.types], ['entry points', d.entries], ['most complex', d.max_complexity > 1 ? d.max_complexity : null], ['withdrawn by ccc:skip', d.withdrawn ? plural(d.withdrawn, 'function') : null]]));
+          const outE = o.component_edges.filter(e => e.from === d.id).sort((a, b) => b.count - a.count);
+          const inE = o.component_edges.filter(e => e.to === d.id).sort((a, b) => b.count - a.count);
+          if (outE.length) section(body, 'Calls into', list(outE.slice(0, 20).map(e => goBtn(`${e.to} ×${e.count}`, { level: 'code', file: e.to }, e.symbols.join(', ')))));
+          if (inE.length) section(body, 'Called from', list(inE.slice(0, 20).map(e => goBtn(`${e.from} ×${e.count}`, { level: 'code', file: e.from }, e.symbols.join(', ')))));
+          body.append(actions([{ label: 'Open code', run: () => drill(n) }, { label: 'Open in editor', open: [d.id, 1] }]));
+        });
+      case 'outer':
+        return panel('Container', d.name, body => {
+          body.append(dl([['calls from here', d.calls || null], ['calls into here', d.callers || null]]));
+          section(body, 'Symbols', h('div', 'mono', [...d.symbols].slice(0, 40).join(', ')));
+          body.append(actions([{ label: 'Open components', run: () => drill(n) }]));
+        });
+      case 'peer':
+        return panel('Peer repository', d.name, body => {
+          body.append(dl([['repository', d.repo], ['language', d.language && langName(d.language)], ['reached by', d.source], ['resolved', d.resolved ? 'yes' : 'no'], ['error', d.error], ['provides', d.provides], ['consumes', d.consumes]]));
+        });
+      case 'outside':
+        return panel(d.direction === 'in' ? 'Callers outside this map' : 'Endpoints outside this map', d.transport, body => {
+          body.append(h('p', 'doc', d.direction === 'in' ? 'Handlers marked `ccc:serves` that nothing in this map calls - something beyond it must.' : 'Calls marked `ccc:calls` that nothing in this map or its peers answers.'));
+          section(body, 'Keys', list(d.keys));
+          section(body, 'From containers', list(d.containers.map(c => `${c.container} ×${c.count}`)));
+        });
+      case 'function':
+      case 'proxy':
+        return panelFunction(n);
+      default:
+        return panelStep(n);
+    }
+  }
+
+  function panelFunction(n) {
+    const f = n.data;
+    const scene = S.scene;
+    const fileData = scene.file;
+    const all = fileData ? new Map([...fileData.functions.map(x => [x.id, x]), ...fileData.proxies.map(x => [x.id, x])]) : new Map();
+    const sig = f.module ? `${f.file} (top level)` : `${f.owner ? f.owner + '::' : ''}${f.name}(${(f.param_types || []).join(', ')})${f.ret ? ' → ' + f.ret : ''}`;
+    panel(n.kind === 'proxy' ? 'Outside this file' : f.entry ? 'Entry point' : 'Function', f.module ? 'top level' : f.name, body => {
+      body.append(h('div', 'mono', sig));
+      if (f.doc) body.append(h('p', 'doc', f.doc));
+      body.append(dl([['file', `${f.file}:${f.line}`], ['span', f.start ? `lines ${f.start}-${f.end}` : null], ['complexity', f.complexity], ['branches', f.branches], ['loops', f.loops], ['parameters', f.params], ['recursive', f.recursive ? 'yes' : null], ['test', f.test ? 'yes' : null]]));
+      const route = x => ({ level: 'flow', file: x.file, line: x.line, name: x.name });
+      if (f.calls && f.calls.length) section(body, `Calls (${f.calls_total})`, list(f.calls.map(c => all.get(c.to)).filter(Boolean).map(x => goBtn(`${x.owner ? x.owner + '::' : ''}${x.name}  ${x.file === f.file ? '' : x.file}`, route(x)))));
+      if (f.callers && f.callers.length) section(body, `Called by (${f.callers_total})`, list(f.callers.map(c => all.get(c)).filter(Boolean).map(x => goBtn(`${x.owner ? x.owner + '::' : ''}${x.name}  ${x.file === f.file ? '' : x.file}`, route(x)))));
+      body.append(actions([{ label: 'Open logic', run: () => drill(n) }, n.kind === 'proxy' && { label: 'Open its file', run: () => go({ level: 'code', file: f.file }) }, { label: 'Open in editor', open: [f.file, f.line] }]));
+      body.append(h('p', 'hint', 'Double-click a function to open its logic. Drag to move; positions are remembered.'));
+    });
+  }
+
+  function panelStep(n) {
+    const st = n.data;
+    const file = S.route.file;
+    if (n.kind === 'entry') {
+      const f = st.function;
+      return panel(f.entry ? 'Entry point' : 'Function', f.module ? 'top level' : f.name, body => {
+        body.append(dl([['file', `${f.file}:${f.line}`], ['span', `lines ${f.start}-${f.end}`], ['complexity', f.complexity], ['branches', f.branches], ['loops', f.loops], ['steps drawn', st.step_count]]));
+        if (f.doc) body.append(h('p', 'doc', f.doc));
+        if (st.params.length) section(body, 'Parameters', list(st.params.map(p => h('code', null, p))));
+        if (st.callers.length) section(body, `Called by (${st.callers_total})`, list(st.callers.map(c => goBtn(`${c.owner ? c.owner + '::' : ''}${c.name}  ${c.file}`, { level: 'flow', file: c.file, line: c.line, name: c.name }))));
+        body.append(actions([{ label: 'Open its file', run: () => go({ level: 'code', file: f.file }) }, { label: 'Open in editor', open: [f.file, f.line] }]));
+      });
+    }
+    if (n.kind === 'calls') {
+      return panel('Library calls', `${st.calls.length} call${st.calls.length === 1 ? '' : 's'}`, body => {
+        body.append(h('p', 'doc', 'Calls that reach no function in this project - the standard library, a dependency, or a name the resolver found no evidence for.'));
+        section(body, 'In order', list(st.calls.map(c => h('code', null, `${c.qual ? c.qual + '.' : ''}${c.name}(${c.args.join(', ')})  :${c.line}`))));
+        body.append(actions([{ label: 'Open in editor', open: [file, st.line] }]));
+      });
+    }
+    const title = st.t === 'call' ? st.name : st.label || st.kind;
+    panel({ call: 'Call', branch: 'Branch', loop: 'Loop', exit: 'Exit', closure: 'Closure', def: 'Definition', end: 'End' }[st.t] || 'Step', title, body => {
+      body.append(dl([['line', st.line], ['kind', st.kind], ['on', st.t === 'call' ? st.qual : null], ['arguments', st.args && st.args.length ? st.args.join(', ') : null], ['mode', st.mode ? MODES[st.mode] : null], ['condition', st.t === 'branch' ? st.label : null], ['header', st.t === 'loop' ? st.label : null]]));
+      if (st.arms) section(body, 'Arms', list(st.arms.map(a => `${a.label}: ${a.steps.length ? plural(a.steps.length, 'step') : a.implicit ? 'nothing written - carries on' : 'nothing'}`)));
+      if (st.target) section(body, 'Reaches', goBtn(`${st.target.owner ? st.target.owner + '::' : ''}${st.target.name}  ${st.target.file}:${st.target.line}`, n.drill));
+      else if (st.t === 'call') body.append(h('p', 'doc', 'No function in this project - a library call, or one the resolver had no evidence for.'));
+      body.append(actions([n.drill && { label: 'Open its logic', run: () => drill(n) }, st.line && { label: 'Open in editor', open: [file, st.line] }]));
+    });
+  }
+
+  function panelEdge(e) {
+    const d = e.data || {};
+    const name = id => (S.byId.get(id) ? S.byId.get(id).data.name || S.byId.get(id).data.id || id : id);
+    panel('Relationship', `${name(e.from)} → ${name(e.to)}`, body => {
+      body.append(dl([['calls', d.count], ['declared in map.json', d.declared ? 'yes' : null], ['detected', d.detected === false ? 'no - declared only' : null], ['transports', d.transports && d.transports.length ? d.transports.join(', ') : null]]));
+      if (d.symbols && d.symbols.length) section(body, 'Symbols', h('div', 'mono', [...new Set(d.symbols)].join(', ')));
+      if (d.sites && d.sites.length) {
+        section(
+          body,
+          'Call sites',
+          list(
+            d.sites.map(s => editorLink(`${s.caller} ${s.caller_file}:${s.caller_line} → ${s.symbol}`, s.caller_file, s.caller_line))
+          )
+        );
+      }
+    });
+  }
+
+  // ------------------------------------------------------------- chrome
+
+  function crumbs() {
+    const nav = $('crumbs');
+    nav.textContent = '';
+    const r = S.route;
+    if (!r) return;
+    nav.append(h('span', 'lvl', LEVELS[r.level]));
+    const items = [[S.overview ? S.overview.system.name : 'System', { level: 'system' }]];
+    if (r.level !== 'system') items.push(['containers', { level: 'containers' }]);
+    const container = r.level === 'components' ? r.container : r.file ? containerOf(r.file) : null;
+    if (container) items.push([container, { level: 'components', container }]);
+    if (r.file) items.push([base(r.file), { level: 'code', file: r.file }]);
+    if (r.level === 'flow') items.push([r.name || `line ${r.line}`, r]);
+    items.forEach(([label, route], i) => {
+      if (i) nav.append(h('span', 'sep', '›'));
+      const b = h('button', null, label);
+      b.title = route.file || route.container || '';
+      if (i === items.length - 1) b.setAttribute('aria-current', 'page');
+      else b.addEventListener('click', () => go(route));
+      nav.append(b);
+    });
+  }
+
+  function legend(items) {
+    const box = $('legend');
+    box.textContent = '';
+    for (const [label, colour, style] of items) {
+      const span = h('span');
+      const i = h('i', style ? style.replace('ext', '') : '');
+      i.style.setProperty('--c', colour);
+      if (style === 'line') i.style.borderColor = colour;
+      span.append(i, label);
+      box.append(span);
+    }
+    box.hidden = !items.length;
+  }
+
+  function showMessage(title, text) {
+    const m = $('message');
+    m.textContent = '';
+    m.append(h('b', null, title), h('span', null, text));
+    m.hidden = false;
+  }
+
+  function hideMessage() {
+    $('message').hidden = true;
+  }
+
+  function chips() {
+    $('lib').textContent = 'library calls: ' + { compact: 'folded', full: 'shown', hidden: 'hidden' }[S.lib];
+    $('lib').setAttribute('aria-pressed', S.lib !== 'hidden');
+    $('tests').setAttribute('aria-pressed', S.tests);
+    $('theme').textContent = 'theme: ' + S.theme;
+    if (S.theme === 'auto') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = S.theme;
+  }
+
+  // ------------------------------------------------------------- search
+
+  let searchSeq = 0;
+  let searchTimer = 0;
+  let picks = [];
+  let pickAt = -1;
+
+  function hideResults() {
+    $('results').hidden = true;
+    picks = [];
+    pickAt = -1;
+  }
+
+  async function runSearch() {
+    const q = $('search').value.trim();
+    const seq = ++searchSeq;
+    if (!q) return hideResults();
+    const ql = q.toLowerCase();
+    const local = [];
+    for (const c of (S.overview && S.overview.containers) || []) if (c.name.toLowerCase().includes(ql)) local.push({ k: 'container', n: c.name, p: plural(c.files, 'file'), route: { level: 'components', container: c.id } });
+    for (const c of (S.overview && S.overview.components) || []) if (c.id.toLowerCase().includes(ql)) local.push({ k: 'file', n: c.name, p: c.id, route: { level: 'code', file: c.id } });
+    let remote = [];
+    try {
+      const r = await getJSON('/find?q=' + encodeURIComponent(q) + '&kind=func');
+      remote = (r.results || []).map(x => ({ k: 'function', n: (x.owner ? x.owner + '::' : '') + x.name, p: `${x.file}:${x.line}`, route: { level: 'flow', file: x.file, line: x.line, name: x.name } }));
+    } catch {
+      // the local matches still stand
+    }
+    if (seq !== searchSeq) return;
+    picks = local.slice(0, 8).concat(remote).slice(0, 30);
+    pickAt = picks.length ? 0 : -1;
+    const box = $('results');
+    box.textContent = '';
+    if (!picks.length) box.append(h('div', 'none', `Nothing in the map matches “${q}”.`));
+    picks.forEach((p, i) => {
+      const b = h('button', i === pickAt ? 'on' : '');
+      b.append(h('span', 'k', p.k), h('span', 'n', p.n), h('span', 'p', p.p));
+      b.addEventListener('mousedown', ev => {
+        ev.preventDefault();
+        choose(i);
+      });
+      box.append(b);
+    });
+    box.hidden = false;
+  }
+
+  function choose(i) {
+    const p = picks[i];
+    if (!p) return;
+    hideResults();
+    $('search').blur();
+    go(p.route);
+  }
+
+  function movePick(delta) {
+    if (!picks.length) return;
+    pickAt = (pickAt + delta + picks.length) % picks.length;
+    [...$('results').children].forEach((b, i) => b.classList.toggle('on', i === pickAt));
+    $('results').children[pickAt].scrollIntoView({ block: 'nearest' });
+  }
+
+  // ------------------------------------------------------------- input
+
+  function bindCanvas() {
+    const vp = $('viewport');
+    let drag = null;
+    let frame = 0;
+
+    vp.addEventListener('pointerdown', e => {
+      if (e.target.closest('.elabel')) return;
+      const nodeEl = e.target.closest('.node');
+      if (nodeEl && e.button === 0) {
+        const n = S.byId.get(nodeEl.dataset.id);
+        if (n) drag = { mode: 'node', n, sx: e.clientX, sy: e.clientY, ox: n.x, oy: n.y, moved: false, id: e.pointerId };
+      } else {
+        drag = { mode: 'pan', sx: e.clientX, sy: e.clientY, px: S.panX, py: S.panY, moved: false, id: e.pointerId };
+      }
+    });
+
+    vp.addEventListener('pointermove', e => {
+      if (!drag) {
+        if (S.selected == null && S.scene) {
+          const nodeEl = e.target.closest('.node');
+          const id = nodeEl ? nodeEl.dataset.id : null;
+          if (id !== S.hover) {
+            S.hover = id;
+            hoverSoon();
+          }
+        }
+        return;
+      }
+      const dx = e.clientX - drag.sx;
+      const dy = e.clientY - drag.sy;
+      if (!drag.moved) {
+        if (Math.hypot(dx, dy) < 4) return;
+        drag.moved = true;
+        // captured only once it is a drag, so a plain click keeps its target
+        vp.setPointerCapture(drag.id);
+        if (drag.mode === 'pan') vp.classList.add('panning');
+        else drag.n.el.classList.add('dragging');
+      }
+      if (drag.mode === 'pan') {
+        S.panX = drag.px + dx;
+        S.panY = drag.py + dy;
+        viewSoon();
+        return;
+      }
+      const n = drag.n;
+      n.x = drag.ox + dx / S.zoom;
+      n.y = drag.oy + dy / S.zoom;
+      place(n);
+      if (!frame) {
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          redrawAround(n.id);
+          if (S.scene.frames) drawFrames();
+        });
+      }
+    });
+
+    const finish = () => {
+      vp.classList.remove('panning');
+      if (!drag) return;
+      const d = drag;
+      drag = null;
+      if (d.mode === 'node') {
+        d.n.el.classList.remove('dragging');
+        if (d.moved) {
+          if (S.scene.persist) savePos(d.n);
+        } else {
+          unfocus(false);
+          select(d.n.id);
+        }
+      } else if (!d.moved) {
+        unfocus(true);
+        select(null);
+      }
+    };
+    vp.addEventListener('pointerup', finish);
+    vp.addEventListener('pointercancel', finish);
+
+    vp.addEventListener('dblclick', e => {
+      const nodeEl = e.target.closest('.node');
+      if (nodeEl) drill(S.byId.get(nodeEl.dataset.id));
+    });
+    vp.addEventListener('contextmenu', e => e.preventDefault());
+
+    vp.addEventListener(
+      'wheel',
+      e => {
+        e.preventDefault();
+        // a mouse wheel and a pinch zoom; a trackpad's two-finger scroll pans
+        const wheel = e.deltaMode === 1 || (e.deltaX === 0 && Number.isInteger(e.deltaY) && Math.abs(e.deltaY) >= 40);
+        if (e.ctrlKey || wheel) {
+          const r = vp.getBoundingClientRect();
+          const step = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+          zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-step * (e.ctrlKey ? 0.01 : 0.0015)));
+        } else {
+          S.panX -= e.deltaX;
+          S.panY -= e.deltaY;
+          viewSoon();
+        }
+      },
+      { passive: false }
+    );
+
+    window.addEventListener('resize', () => applyView());
+  }
+
+  function bindChrome() {
+    $('zoom-in').addEventListener('click', () => zoomBy(1.2));
+    $('zoom-out').addEventListener('click', () => zoomBy(1 / 1.2));
+    $('zoom-fit').addEventListener('click', () => fit(true));
+    $('layout-reset').addEventListener('click', () => {
+      if (S.scene) store.set('pos:' + S.scene.key, {});
+      render(false);
+    });
+    $('panel-close').addEventListener('click', () => select(null));
+    $('lib').addEventListener('click', () => {
+      S.lib = { compact: 'full', full: 'hidden', hidden: 'compact' }[S.lib];
+      store.set('lib', S.lib);
+      chips();
+      if (S.route && S.route.level === 'flow') render(true);
+    });
+    $('tests').addEventListener('click', () => {
+      S.tests = !S.tests;
+      store.set('tests', S.tests);
+      chips();
+      render(true);
+    });
+    $('theme').addEventListener('click', () => {
+      S.theme = { light: 'dark', dark: 'auto', auto: 'light' }[S.theme] || 'light';
+      store.set('theme', S.theme);
+      chips();
+    });
+
+    const input = $('search');
+    input.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(runSearch, 140);
+    });
+    input.addEventListener('keydown', e => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        movePick(1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        movePick(-1);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        choose(pickAt);
+      } else if (e.key === 'Escape') {
+        hideResults();
+        input.blur();
+      }
+    });
+    input.addEventListener('blur', () => setTimeout(hideResults, 120));
+
+    document.addEventListener('keydown', e => {
+      if (e.target.matches('input, textarea')) return;
+      if (e.key === '/') {
+        e.preventDefault();
+        input.focus();
+        input.select();
+      } else if (e.key === 'Escape') {
+        if (!$('panel').hidden) select(null);
+        else up();
+      } else if (e.key === 'Backspace') up();
+      else if (e.key === 'f' || e.key === 'F') fit(true);
+      else if (e.key === '+' || e.key === '=') zoomBy(1.2);
+      else if (e.key === '-' || e.key === '_') zoomBy(1 / 1.2);
+      else if (e.key === 'Enter' && S.selected) drill(S.byId.get(S.selected));
+      else if (e.key === ',' || e.key === '<') stepBy(-1);
+      else if (e.key === '.' || e.key === '>') stepBy(1);
+      else if (e.key === 'l' || e.key === 'L') toggleFollow();
+      else if (e.key === '[') groupBy(-1);
+      else if (e.key === ']') groupBy(1);
+    });
+
+    window.addEventListener('hashchange', () => render(false));
+  }
+
+  // ------------------------------------------------------------- timeline
+
+  // Every step ccc's edit tools took, and every change made by hand, oldest
+  // first, as the server logged it.
+  // Following, each new one is shown where it landed and as the map holds it
+  // now; scrubbing replays any of them from the snapshots the server drew on
+  // each side of it while this page was open.
+  // replay speeds, as a share of real time
+  const SPEEDS = [1, 0.5, 0.25, 0.125, 0.1];
+  const SPEED_LABEL = { 1: 'Live', 0.5: '½×', 0.25: '¼×', 0.125: '⅛×', 0.1: '⅒×' };
+  // at live speed a step stays on show at least this long - parts that
+  // landed together still take their turn each - and never waits longer
+  // than this for the next, however long the agent paused
+  const STEP_MS = 1200;
+  const GAP_MS = 4000;
+
+  const T = {
+    boot: null,
+    seq: 0,
+    steps: [],
+    // the step on show, as an index into `steps`
+    at: null,
+    follow: true,
+    side: 'after',
+    // a past step drawn from its snapshot rather than the live map
+    replay: null,
+    // per step, the answer of /vis/event: the step and both its snapshots
+    full: new Map(),
+    playing: false,
+    // the first answer is history, not news - nothing flies for it
+    primed: false,
+    // show a change that only moves whitespace or wraps lines
+    ws: store.get('ws', false),
+    // how fast steps play, following or replaying - 1 keeps the time between them
+    speed: SPEEDS.includes(store.get('speed', 1)) ? store.get('speed', 1) : 1,
+    // steps landed while following, waiting their turn at that speed
+    queue: [],
+    pumping: false,
+    // the step shown last while following, and when
+    shown: null,
+    // the step controls opened by hand while following
+    unfolded: false,
+    // each step on show is seen alone: what it touched in full, the rest faded
+    focus: store.get('focus', true),
+  };
+  const MAX_TIMELINE = 200;
+  const STATUS = {
+    staged: 'staged - not written yet',
+    applied: 'applied - written',
+    reverted: 'reverted - put back',
+    discarded: 'discarded - dropped unwritten',
+    edited: 'edited by hand - saved outside ccc’s edit tools',
+    inspect: 'inspect - an agent read it, through ccc’s read tools or its own',
+  };
+
+  const sameFn = (t, f) => t.file === f.file && t.name === f.name && (t.owner || null) === (f.owner || null);
+  const within = (line, ranges) => line != null && ranges.some(([a, b]) => line >= a && line <= b);
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  const byHand = ev => ev.by === 'human';
+  // a step, file or function only its layout moved, while such changes are hidden
+  const layoutOnly = x => !T.ws && !!x && !!x.whitespace;
+  // the latest reason the agent gave for the step, if it gave one
+  const why = ev => (ev.intent && ev.intent[ev.intent.length - 1]) || null;
+
+  // The timeline's steps grouped by the ask behind them - the request an
+  // agent was answering, read from its transcript - or by a run of changes
+  // made by hand, as /vis/asks answers.
+  const A = { groups: [], of: new Map(), timer: 0 };
+  const groupOf = ev => (ev ? A.groups[A.of.get(ev.seq)] : null);
+
+  // what a group of steps is put down to, in a line
+  function groupText(g) {
+    if (g.kind === 'hand') return 'Changed by hand';
+    if (g.kind === 'agent') return 'An agent - no transcript names its ask';
+    return g.ask.prompt;
+  }
+
+  // a speech bubble, beside an ask an agent was answering
+  function bubble() {
+    const s = sv('svg', { class: 'glyph', viewBox: '0 0 16 16', 'aria-hidden': 'true' });
+    s.append(sv('path', { d: 'M2 2.5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7l-3.5 3v-3H2a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z' }));
+    return s;
+  }
+  const groupIcon = g => (g.kind === 'hand' ? person() : bubble());
+
+  // which ask each step answers - read again a moment after steps land, once
+  // the agent's transcript has caught up with them
+  function asksSoon(ms) {
+    clearTimeout(A.timer);
+    A.timer = setTimeout(loadAsks, ms);
+  }
+
+  async function loadAsks() {
+    let r;
+    try {
+      r = await getJSON('/vis/asks');
+    } catch {
+      return;
+    }
+    A.groups = r.groups || [];
+    A.of = new Map();
+    A.groups.forEach((g, i) => g.steps.forEach(seq => A.of.set(seq, i)));
+    drawTimeline();
+    if (S.asksPanel) panelAsks();
+  }
+
+  // a person, beside a change made by hand rather than by an agent
+  function person() {
+    const s = sv('svg', { class: 'person', viewBox: '0 0 16 16', 'aria-hidden': 'true' });
+    s.append(sv('circle', { cx: 8, cy: 4.5, r: 3 }), sv('path', { d: 'M2 15c0-3.6 2.7-6 6-6s6 2.4 6 6z' }));
+    return s;
+  }
+
+  function summary(ev) {
+    const fn = ev.focus && ev.focus.level === 'flow' ? ev.focus.name : null;
+    const files = ev.files.length === 1 ? base(ev.files[0].path) : plural(ev.files_total, 'file');
+    if (ev.status === 'inspect') return `inspected ${fn || files}`;
+    const added = ev.files.reduce((n, f) => n + f.added, 0);
+    const removed = ev.files.reduce((n, f) => n + f.removed, 0);
+    // one part of a step: the definition it is about, and which part of how many
+    const p = ev.part;
+    const what = (p && p.name ? `${p.owner ? p.owner + '::' : ''}${p.name}` : fn) || files;
+    const part = p ? ` · ${p.kind === 'file' ? 'file' : p.kind} ${p.change} · ${p.index + 1}/${p.of}` : '';
+    return `${what} +${added} −${removed}${part}`;
+  }
+
+  // one part of a step in a line: what it is about, and which of how many
+  function partOf(ev) {
+    const p = ev.part;
+    if (!p) return null;
+    const name = p.name ? ` ${p.owner ? p.owner + '::' : ''}${p.name}` : '';
+    return `${p.kind}${name} ${p.change} ${p.index + 1}/${p.of}`;
+  }
+
+  // where on the canvas a step is seen, on one side of it
+  function focusRoute(ev, side) {
+    const f = ev.focus;
+    if (!f) return null;
+    const mapped = file => !!containerOf(file);
+    if (f.level === 'flow') {
+      const pos = f[side];
+      if (!mapped(f.file)) return null;
+      return pos ? { level: 'flow', file: f.file, line: pos.line, name: f.name } : { level: 'code', file: f.file };
+    }
+    if (f.level === 'code') return mapped(f.file) ? { level: 'code', file: f.file } : null;
+    const containers = [...new Set(ev.files.map(x => containerOf(x.path)).filter(Boolean))];
+    if (containers.length === 1) return { level: 'components', container: containers[0] };
+    return containers.length ? { level: 'containers' } : null;
+  }
+
+  // how a node took part in the marked step - added, modified, removed - if at all
+  function changeOf(n, ev, side) {
+    const d = n.data || {};
+    switch (S.route && S.route.level) {
+      case 'flow': {
+        const fn = S.scene.entry && S.scene.entry.data.function;
+        const t = fn && ev.functions.find(x => sameFn(x, fn));
+        if (!t || layoutOnly(t)) return null;
+        const lines = t['lines_' + side] || [];
+        // the entry stands for the signature: marked when a change reaches its first line
+        if (n.kind === 'entry') return t.change !== 'modified' ? t.change : t[side] && within(t[side].start, lines) ? 'modified' : null;
+        const hit = n.kind === 'calls' ? d.calls.some(c => within(c.line, lines)) : within(d.line, lines);
+        return hit ? (t.change === 'added' || t.change === 'inspect' ? t.change : 'modified') : null;
+      }
+      case 'code': {
+        if (n.kind !== 'function' && n.kind !== 'proxy') return null;
+        const t = ev.functions.find(x => sameFn(x, d));
+        return t && !layoutOnly(t) ? t.change : null;
+      }
+      case 'components': {
+        const f = n.kind === 'component' && ev.files.find(x => x.path === d.id);
+        return f && !layoutOnly(f) ? f.change : null;
+      }
+      case 'containers':
+        return n.kind === 'container' && ev.files.some(x => containerOf(x.path) === d.id && !layoutOnly(x)) ? touched(ev) : null;
+      case 'system':
+        return n.kind === 'system' && ev.files.some(x => !layoutOnly(x)) ? touched(ev) : null;
+      default:
+        return null;
+    }
+  }
+
+  // how a level above the code took part: inspected, or changed
+  const touched = ev => (ev.status === 'inspect' ? 'inspect' : 'modified');
+
+  // A change with no step of its own - lines removed, a statement that calls
+  // nothing - is marked on the step it lands after, or on the entry.
+  function landing(ev, side) {
+    const fn = S.scene.entry && S.scene.entry.data.function;
+    const t = fn && ev.functions.find(x => sameFn(x, fn));
+    const ranges = t && t['lines_' + side];
+    if (!ranges || !ranges.length || t.change !== 'modified' || layoutOnly(t)) return null;
+    const at = ranges[0][0];
+    let best = null;
+    for (const n of S.scene.nodes) {
+      const line = n.kind === 'entry' || !n.data ? null : n.data.line;
+      if (line != null && line <= at && (!best || line >= best.line)) best = { n, line };
+    }
+    return best ? best.n : S.scene.entry;
+  }
+
+  // mark what the step on show changed, and return the nodes marked
+  function applyMarks() {
+    const hit = [];
+    if (!S.scene) return hit;
+    const m = S.marks;
+    const mark = (n, how) => {
+      // read layout between the two so the pulse starts again
+      void n.el.offsetWidth;
+      n.el.classList.add('chg', 'chg-' + how);
+      if (m.ev.status === 'staged') n.el.classList.add('chg-pending');
+      hit.push(n);
+    };
+    for (const n of S.scene.nodes) {
+      n.el.classList.remove('chg', 'chg-added', 'chg-modified', 'chg-removed', 'chg-pending', 'chg-inspect');
+      const how = m ? changeOf(n, m.ev, m.side) : null;
+      if (how) mark(n, how);
+    }
+    if (m && !hit.length && S.route && S.route.level === 'flow') {
+      const near = landing(m.ev, m.side);
+      if (near) mark(near, 'modified');
+    }
+    fade(hit);
+    markGroups();
+    return hit;
+  }
+
+  // The step on show seen alone: what it touched in full, every other node
+  // and wire faded back - while it is on show, and until the viewer reaches
+  // into the canvas.
+  function fade(hit) {
+    const on = !!(S.scene && S.focusing && hit.length);
+    const keep = new Set(hit.map(n => n.id));
+    for (const n of S.scene ? S.scene.nodes : []) n.el.classList.toggle('faded', on && !keep.has(n.id));
+    for (const e of S.scene ? S.scene.edges : []) {
+      const lit = keep.has(e.from) || keep.has(e.to);
+      if (e.path) e.path.classList.toggle('faded', on && !lit);
+      if (e.labelEl) e.labelEl.classList.toggle('faded', on && !lit);
+    }
+    $('frames').classList.toggle('faded', on);
+  }
+
+  // the canvas whole again - `whole` brings back what a big scene left out
+  function unfocus(whole) {
+    if (!S.focusing) return;
+    S.focusing = false;
+    fade([]);
+    if (whole && S.scene && S.scene.pruned && !T.replay) render(true);
+  }
+
+  // glide the camera onto the marked nodes, near enough to read them
+  // `now` - straight there, as the motion of a new scene carries the camera
+  function flyTo(nodes, now) {
+    const vp = $('viewport');
+    const bar = $('timeline');
+    const x0 = Math.min(...nodes.map(n => n.x));
+    const y0 = Math.min(...nodes.map(n => n.y));
+    const x1 = Math.max(...nodes.map(n => n.x + n.w));
+    const y1 = Math.max(...nodes.map(n => n.y + n.h));
+    const vw = vp.clientWidth - ($('panel').hidden ? 0 : 352);
+    const vh = vp.clientHeight - (bar.hidden ? 0 : bar.offsetHeight + 12);
+    // near enough a grouped scene that its nodes are back
+    const floor = S.route && S.route.level === 'flow' ? 0.6 : S.scene && S.scene.groups ? GROUP_SHOW + 0.05 : 0.3;
+    S.zoom = clamp(Math.min((vw - 120) / Math.max(1, x1 - x0), (vh - 120) / Math.max(1, y1 - y0)), floor, 1.1);
+    S.panX = vw / 2 - ((x0 + x1) / 2) * S.zoom;
+    S.panY = vh / 2 - ((y0 + y1) / 2) * S.zoom;
+    if (!now) glide();
+    applyView();
+  }
+
+  let glideTimer = 0;
+  function glide() {
+    const vp = $('viewport');
+    vp.classList.add('glide');
+    clearTimeout(glideTimer);
+    glideTimer = setTimeout(() => vp.classList.remove('glide'), 700);
+  }
+
+  // how long a write is shown as it was before it becomes what it is
+  const BEFORE_MS = 650;
+
+  // a step just landed: show it where it happened, as the map holds it now
+  async function arrive(ev) {
+    const i = T.steps.indexOf(ev);
+    T.at = i < 0 ? T.steps.length - 1 : i;
+    T.side = ev.on_disk;
+    drawTimeline();
+    if (ev.status === 'discarded') {
+      // nothing moved; the marks of what it dropped go with it, and so does
+      // a preview of what it would have written
+      if (!S.marks || S.marks.ev.changeset !== ev.changeset) return;
+      S.marks = null;
+      if (!(T.replay && T.replay.live)) return applyMarks();
+      const route = focusRoute(ev, 'before');
+      return route ? go(route) : render(true);
+    }
+    // only its layout moved: nothing to show, though what is on screen may have shifted
+    if (layoutOnly(ev)) {
+      S.marks = null;
+      if (ev.status === 'staged') return applyMarks();
+      S.overview = null;
+      return render(true);
+    }
+    // a step not written yet: draw the map as it would leave it, to look over
+    if (ev.status === 'staged' && ev.snapshot && ev.focus) return replay(T.at, 'after', true);
+    // A write to one function or file seen from elsewhere: shown first as it
+    // was, a moment, then becoming what it is - its pins, calls and words
+    // moving to their new places.
+    const near = ev.focus && (ev.focus.level === 'flow' || ev.focus.level === 'code');
+    if (near && ev.snapshot && ['applied', 'reverted', 'edited'].includes(ev.status) && !calm() && !sameView(S.shownRoute, focusRoute(ev, 'before'))) {
+      await replay(T.at, 'before', true);
+      await sleep(BEFORE_MS / T.speed);
+      if (T.steps[T.at] !== ev || !T.follow) return;
+    }
+    // an inspect moved nothing, so the overview on show still holds
+    if (ev.status !== 'staged' && ev.status !== 'inspect') S.overview = null;
+    try {
+      await ensureOverview();
+    } catch {
+      return;
+    }
+    S.marks = { ev, side: ev.on_disk };
+    S.fly = true;
+    const route = focusRoute(ev, ev.on_disk);
+    if (route) go(route);
+    else render(true);
+  }
+
+  // the live map again, the newest step shown as if it had just landed, and
+  // each step after it followed
+  // The follow switch: on, each live change is shown as it lands; off, the
+  // step on show stays.
+  function toggleFollow() {
+    if (!(T.follow && (!T.replay || T.replay.live))) return followLive();
+    stopPlay();
+    T.follow = false;
+    T.queue = [];
+    drawTimeline();
+  }
+
+  function followLive() {
+    stopPlay();
+    T.follow = true;
+    // the step controls fold away again
+    T.unfolded = false;
+    // live is now, whatever was still waiting its turn, in the latest ask
+    T.queue = [];
+    T.shown = null;
+    endReplay();
+    const last = T.steps[T.steps.length - 1];
+    if (!last || last.status === 'discarded') {
+      S.marks = null;
+      T.at = last ? T.steps.length - 1 : null;
+      drawTimeline();
+      return render(true);
+    }
+    return arrive(last);
+  }
+
+  // how long a step stays on show before the next, at the chosen speed
+  const pace = (ev, next) => clamp(next && ev ? next.at - ev.at : 0, STEP_MS, GAP_MS) / T.speed;
+
+  // Steps landed while following, shown one after another: live keeps the
+  // time between them, a slower speed stretches it, and parts that landed
+  // together still take their turn each.
+  async function pump() {
+    if (T.pumping) return;
+    T.pumping = true;
+    try {
+      let drawn = -1;
+      while (T.queue.length && T.follow && !T.playing) {
+        const ev = T.queue[0];
+        const wait = T.shown ? T.shown.at + pace(T.shown.ev, ev) - Date.now() : 0;
+        if (wait > 0) {
+          // waiting, only the count behind moves
+          if (drawn !== T.queue.length) {
+            drawn = T.queue.length;
+            drawTimeline();
+          }
+          await sleep(Math.min(wait, 250));
+          continue;
+        }
+        T.queue.shift();
+        if (!T.steps.includes(ev)) continue;
+        T.shown = { ev, at: Date.now() };
+        await arrive(ev);
+      }
+    } finally {
+      T.pumping = false;
+      drawTimeline();
+    }
+  }
+
+  // how steps play: a speed from SPEEDS, and whether each is seen alone
+  function setReplay(speed, focus) {
+    if (SPEEDS.includes(speed)) {
+      T.speed = speed;
+      store.set('speed', speed);
+    }
+    if (typeof focus === 'boolean') {
+      T.focus = focus;
+      store.set('focus', focus);
+      if (!focus) unfocus(true);
+    }
+    drawTimeline();
+  }
+
+  let replaySeq = 0;
+
+  // A past step drawn from the snapshot the server took of it, on one side.
+  // `live` is the newest step drawn while following - a preview of what a
+  // staged step would write - so following carries on past it.
+  async function replay(i, side, live) {
+    const ev = T.steps[i];
+    if (!ev) return;
+    const mine = ++replaySeq;
+    if (!live) T.follow = false;
+    T.at = i;
+    drawTimeline();
+    let full = T.full.get(ev.seq);
+    if (!full && ev.snapshot) {
+      try {
+        full = await getJSON('/vis/event?seq=' + ev.seq);
+        T.full.set(ev.seq, full);
+      } catch {
+        full = null;
+      }
+      if (mine !== replaySeq) return;
+    }
+    const has = s => !!(full && full[s]);
+    side = side || T.side;
+    if (!has(side)) side = has('after') ? 'after' : has('before') ? 'before' : side;
+    T.side = side;
+    const keepPanel = S.stepPanel;
+    S.marks = { ev, side };
+    S.fly = true;
+    if (!has(side)) {
+      // nothing was drawn of it - no visualiser was open, or it is older than
+      // the snapshots kept - so show where it happened in the map as it is
+      try {
+        await ensureOverview();
+      } catch {
+        return;
+      }
+      const route = focusRoute(ev, ev.on_disk);
+      if (route) go(route);
+      else drawTimeline();
+      return;
+    }
+    const snap = full[side];
+    const f = ev.focus;
+    if (f.level !== 'overview' && S.overviewReplay) {
+      S.overview = S.liveOverview;
+      S.overviewReplay = false;
+    }
+    let scene;
+    try {
+      if (f.level === 'flow') {
+        S.route = { level: 'flow', file: f.file, line: snap.function.line, name: f.name };
+        scene = sceneFlow(snap);
+      } else if (f.level === 'code') {
+        S.route = { level: 'code', file: f.file };
+        scene = sceneCode(snap);
+      } else {
+        if (!S.overviewReplay) S.liveOverview = S.overview;
+        S.overview = snap;
+        S.overviewReplay = true;
+        const r = focusRoute(ev, side);
+        S.route = r && r.level === 'components' ? r : { level: 'containers' };
+        scene = S.route.level === 'components' ? sceneComponents(S.route.container) : sceneContainers();
+      }
+    } catch (e) {
+      showMessage('Could not draw this step', e.message);
+      return;
+    }
+    T.replay = { seq: ev.seq, side, live: !!live };
+    // a live render still in flight must not draw over the replay
+    renderSeq++;
+    mount(scene, false);
+    crumbs();
+    if (keepPanel) panelEvent(ev);
+    drawTimeline();
+  }
+
+  function endReplay() {
+    if (!T.replay && !S.overviewReplay) return;
+    T.replay = null;
+    if (S.overviewReplay) {
+      // the live map has likely moved on since; fetch it again
+      S.overview = null;
+      S.overviewReplay = false;
+    }
+    drawTimeline();
+  }
+
+  // the step before or after the one on show, within the ask on show
+  function stepBy(d) {
+    const shown = shownSteps();
+    if (!shown.length) return;
+    stopPlay();
+    const k = shown.indexOf(T.at);
+    const from = k < 0 ? (d > 0 ? -1 : shown.length) : k;
+    const i = shown[clamp(from + d, 0, shown.length - 1)];
+    if (i !== T.at || !T.replay) replay(i, T.side);
+  }
+
+  // replay step after step - those given, or every one from the playhead on -
+  // then follow again at the end
+  async function play(list) {
+    if (T.playing) return stopPlay();
+    if (!T.steps.length) return;
+    T.playing = true;
+    const shown = shownSteps();
+    const k = shown.indexOf(T.at);
+    const queue = list || shown.slice(k < 0 || k >= shown.length - 1 ? 0 : k + 1);
+    drawTimeline();
+    for (const [k, i] of queue.entries()) {
+      if (!T.playing) break;
+      await replay(i, 'after');
+      await sleep(pace(T.steps[i], T.steps[queue[k + 1]]));
+    }
+    if (T.playing) {
+      T.playing = false;
+      followLive();
+    }
+  }
+
+  function stopPlay() {
+    if (!T.playing) return;
+    T.playing = false;
+    drawTimeline();
+  }
+
+  // The collection a group of steps belongs to: every step of one ask,
+  // wherever they fall, or one run of changes made by hand, or of steps no
+  // transcript explains. The timeline holds one collection at a time.
+  const collectionOf = gi => (A.groups[gi]?.ask ? 'ask:' + A.groups[gi].ask.id : 'run:' + gi);
+
+  // the collection of the step on show - undefined while its ask is not known yet
+  const collectionAt = () => {
+    const gi = T.at != null ? A.of.get(T.steps[T.at]?.seq) : undefined;
+    return gi === undefined ? undefined : collectionOf(gi);
+  };
+
+  // The collections on the timeline in the order they began, each with the
+  // numbers of its steps.
+  function collections() {
+    const out = new Map();
+    A.groups.forEach((g, gi) => {
+      const key = collectionOf(gi);
+      if (!out.has(key)) out.set(key, { key, group: g, steps: [] });
+      out.get(key).steps.push(...g.steps);
+    });
+    return [...out.values()];
+  }
+
+  // The steps of the collection on show, as indices into `steps`: that of the
+  // step on show, else the latest - so following, each new ask starts the
+  // timeline afresh. A step no ask is known for yet is the newest, so it goes
+  // with the latest.
+  function shownSteps() {
+    if (!A.groups.length) return T.steps.map((_, i) => i);
+    const latest = collectionOf(A.groups.length - 1);
+    const want = collectionAt() || latest;
+    const out = [];
+    T.steps.forEach((ev, i) => {
+      const gi = A.of.get(ev.seq);
+      if (gi === undefined ? want === latest : collectionOf(gi) === want) out.push(i);
+    });
+    return out;
+  }
+
+  function drawTimeline() {
+    const bar = $('timeline');
+    const n = T.steps.length;
+    // with no edits yet there is no timeline, only the switches for what comes
+    bar.hidden = false;
+    bar.classList.toggle('empty', !n);
+    document.body.classList.toggle('with-timeline', n > 0);
+    document.body.classList.toggle('with-tl-switches', !n);
+    const ticks = $('tl-ticks');
+    ticks.textContent = '';
+    // one collection at a time - scrubbing stays inside it, and a long history drawn whole is what lags
+    const shown = shownSteps();
+    shown.forEach(i => {
+      const ev = T.steps[i];
+      const g = A.groups[A.of.get(ev.seq)];
+      const t = h('i', `tick ${ev.status}${byHand(ev) ? ' human' : ''}${layoutOnly(ev) ? ' ws' : ''}${i === T.at ? ' at' : ''}`);
+      t.title = `${g ? groupText(g) + '\n' : ''}#${ev.seq} ${ev.status} · ${ev.tool} · ${summary(ev)}${why(ev) ? ' · ' + why(ev) : ''}`;
+      t.dataset.i = i;
+      ticks.append(t);
+    });
+    const ev = T.at != null ? T.steps[T.at] : null;
+    const label = $('tl-step');
+    const who = ev && byHand(ev) ? [person()] : [];
+    // a part says what it is about before why its step was taken
+    const text = ev && `#${ev.seq} ${ev.status} · ${[partOf(ev), why(ev)].filter(Boolean).join(' · ') || summary(ev)}${ev.whitespace ? ' · layout only' : ''}`;
+    label.replaceChildren(...who, text || 'No edits yet - every change lands here, by ccc’s edit tools or by hand');
+    label.title = ev ? `${STATUS[ev.status]} · ${ev.tool} · ${summary(ev)}${ev.changeset ? ' · changeset ' + ev.changeset : ''} - click for its diff` : '';
+    label.disabled = !ev;
+    const g = groupOf(ev);
+    const chip = $('tl-ask');
+    chip.hidden = !A.groups.length;
+    const k = shown.indexOf(T.at);
+    chip.replaceChildren(
+      ...(g ? [groupIcon(g)] : []),
+      h('span', 'ask-label', g ? groupText(g) : 'Asks'),
+      ...(g && k >= 0 ? [h('span', 'ask-n', `${k + 1} / ${shown.length}`)] : [])
+    );
+    chip.title = `${g ? groupText(g) + '\n\n' : ''}Every ask and what it changed - [ and ] step between them`;
+    const cur = collectionAt();
+    for (const row of document.querySelectorAll('#panel .ask-row')) row.classList.toggle('at', row.dataset.c === cur);
+    $('tl-prev').disabled = !shown.length || k === 0;
+    $('tl-next').disabled = !shown.length || T.at == null || k >= shown.length - 1;
+    $('tl-play').disabled = !n;
+    $('tl-play').textContent = T.playing ? '❚❚' : '▶';
+    $('tl-play').title = T.playing ? 'Pause' : 'Replay the steps from here';
+    const full = ev && T.full.get(ev.seq);
+    $('tl-side').hidden = !T.replay;
+    for (const b of $('tl-side').children) {
+      b.setAttribute('aria-pressed', String(T.side === b.dataset.side));
+      b.disabled = !(full && full[b.dataset.side]);
+    }
+    const live = T.follow && (!T.replay || T.replay.live);
+    $('tl-follow').setAttribute('aria-checked', String(live));
+    // slowed, following runs behind by the steps still waiting their turn
+    $('tl-behind').replaceChildren(...(live && T.queue.length ? [` · ${T.queue.length}`, h('span', 'tl-behind', ' behind')] : []));
+    // Following, the step controls fold away to the left behind an arrow
+    // that opens them - and stopping opens them too.
+    const folded = live && !T.unfolded;
+    const controls = $('tl-controls');
+    controls.classList.toggle('folded', folded);
+    controls.inert = folded;
+    const unfold = $('tl-unfold');
+    unfold.hidden = !live;
+    unfold.textContent = folded ? '»' : '«';
+    unfold.title = folded ? 'Show the step controls' : 'Fold the step controls away';
+    unfold.setAttribute('aria-label', unfold.title.toLowerCase());
+    unfold.setAttribute('aria-expanded', String(!folded));
+    $('tl-ws').setAttribute('aria-pressed', String(T.ws));
+    $('tl-speed').textContent = SPEED_LABEL[T.speed];
+    $('tl-focus').setAttribute('aria-pressed', String(T.focus));
+    const badge = $('replay-badge');
+    badge.hidden = !T.replay || !ev;
+    if (!badge.hidden) {
+      badge.replaceChildren(
+        ...(byHand(ev) ? [person()] : []),
+        T.replay.live
+          ? `Proposed · step #${ev.seq}${why(ev) ? ' · ' + why(ev) : ' - staged, not written yet'}`
+          : `Replay · step #${ev.seq} ${ev.status} · ${T.side} it${why(ev) ? ' · ' + why(ev) : ''}`,
+      );
+      badge.title = (ev.intent || []).join('\n');
+    }
+  }
+
+  function diffView(ev) {
+    const box = h('div', 'diff');
+    for (const f of ev.files) {
+      const head = h('div', 'diff-file');
+      head.append(h('b', null, f.path), h('span', null, ` +${f.added} −${f.removed}`));
+      const pre = h('pre');
+      for (const line of f.diff) {
+        const cls = /^(\+\+\+|---)/.test(line) ? 'meta' : line.startsWith('@@') ? 'hunk' : line[0] === '+' ? 'add' : line[0] === '-' ? 'del' : null;
+        pre.append(h('span', cls, line + '\n'));
+      }
+      if (f.diff_truncated) pre.append(h('span', 'meta', '… cut short\n'));
+      box.append(head, pre);
+    }
+    if (ev.files_total > ev.files.length) box.append(h('p', 'hint', `and ${plural(ev.files_total - ev.files.length, 'more file')}`));
+    return box;
+  }
+
+  function panelEvent(ev) {
+    select(null);
+    const look = ev.status === 'inspect';
+    // a read an agent took with its own tool names the call, found in its transcript
+    const own = look && !!ev.call;
+    panel((look ? 'Inspect #' : 'Edit step #') + ev.seq, `${ev.status} · ${ev.tool}`, body => {
+      const by = byHand(ev)
+        ? 'a person, by hand'
+        : own
+          ? `an agent, with its own ${ev.tool} tool`
+          : look
+            ? 'an agent, through ccc’s read tools'
+            : 'an agent, through ccc’s edit tools';
+      const rows = [['status', STATUS[ev.status]], ['by', by]];
+      if (ev.intent && ev.intent.length) rows.push([own ? 'read' : look ? 'asked' : 'why', ev.intent.join(' · ')]);
+      if (ev.part) rows.push(['part', `${ev.part.index + 1} of ${ev.part.of} - ${ev.part.kind} ${ev.part.change}`]);
+      const g = groupOf(ev);
+      if (g && g.ask) rows.push(['ask', g.ask.prompt]);
+      if (ev.changeset) rows.push(['changeset', ev.changeset]);
+      rows.push(['at', new Date(ev.at).toLocaleTimeString()], ['files', ev.files_total]);
+      body.append(dl(rows));
+      if (ev.functions.length) {
+        const rows = ev.functions.map(t => {
+          const pos = t[ev.on_disk];
+          const route = pos ? { level: 'flow', file: t.file, line: pos.line, name: t.name } : { level: 'code', file: t.file };
+          const row = h('span', 'chg-row');
+          row.append(h('span', 'chg-tag ' + (t.whitespace ? 'ws' : t.change), t.whitespace ? 'layout' : t.change), goBtn(`${t.owner ? t.owner + '::' : ''}${t.name}  ${base(t.file)}`, route));
+          return row;
+        });
+        section(body, look ? 'Inspected' : 'Functions', list(rows));
+      }
+      if (ev.ops.length) section(body, 'Operations', list(ev.ops.map(o => h('code', null, o))));
+      if (look) section(body, 'Files', list(ev.files.map(f => goBtn(f.path, { level: 'code', file: f.path }))));
+      else section(body, 'Diff', diffView(ev));
+    });
+    S.stepPanel = true;
+  }
+
+  // Every collection the timeline holds - each ask, each run of changes by
+  // hand - in order, under the session it was made in: pick one and the
+  // timeline holds its steps alone, or play a whole session through.
+  function panelAsks() {
+    const keep = S.asksPanel ? $('panel-body').scrollTop : 0;
+    select(null);
+    const all = collections();
+    const asks = all.filter(c => c.group.ask).length;
+    panel('Asks', `${plural(asks, 'ask')} · ${plural(T.steps.length, 'step')}`, body => {
+      if (!all.length) body.append(h('p', 'hint', 'No steps yet - each ask an agent works on lands here, and every change made by hand'));
+      const cur = collectionAt();
+      let session;
+      for (const c of all) {
+        const g = c.group;
+        if (g.ask && g.ask.session !== session) {
+          session = g.ask.session;
+          const s = session;
+          const head = h('div', 'ask-session');
+          head.append(h('span', null, `${g.ask.agent} session · ${new Date(g.ask.at).toLocaleString()}`));
+          const all = h('button', null, '▶ Play session');
+          all.title = 'Replay every step from this session’s first ask to its last';
+          all.addEventListener('click', () => playSession(s));
+          head.append(all);
+          body.append(head);
+        }
+        const row = h('div', 'ask-row' + (c.key === cur ? ' at' : ''));
+        row.dataset.c = c.key;
+        const go = h('button', 'ask-go');
+        go.append(groupIcon(g), h('span', 'ask-text', groupText(g)), h('span', 'ask-n', plural(c.steps.length, 'step')));
+        go.title = groupText(g);
+        go.addEventListener('click', () => goCollection(c));
+        const one = h('button', 'ask-play', '▶');
+        one.title = 'Replay this ask’s steps';
+        one.addEventListener('click', () => play(indicesOf(c.steps)));
+        row.append(go, one);
+        body.append(row);
+      }
+    });
+    S.asksPanel = true;
+    $('panel-body').scrollTop = keep;
+  }
+
+  // where steps sit on the timeline, by their numbers
+  const indicesOf = seqs => seqs.map(seq => T.steps.findIndex(e => e.seq === seq)).filter(i => i >= 0);
+
+  // a collection, from its first step - the timeline then holds it alone
+  function goCollection(c) {
+    const [i] = c ? indicesOf(c.steps) : [];
+    if (i == null) return;
+    stopPlay();
+    replay(i, 'after');
+  }
+
+  // the collection before or after the one on show
+  function groupBy(d) {
+    const all = collections();
+    if (!all.length) return;
+    const k = all.findIndex(c => c.key === collectionAt());
+    const from = k < 0 ? (d > 0 ? -1 : all.length) : k;
+    goCollection(all[clamp(from + d, 0, all.length - 1)]);
+  }
+
+  // every step from a session's first ask to its last, changes by hand between them included
+  function playSession(session) {
+    const at = A.groups.map((g, i) => (g.ask && g.ask.session === session ? i : -1)).filter(i => i >= 0);
+    if (!at.length) return;
+    stopPlay();
+    play(indicesOf(A.groups.slice(at[0], at[at.length - 1] + 1).flatMap(g => g.steps)));
+  }
+
+  // how far the timeline's top sits from the window's foot, for what keeps clear of it
+  function clearOfTimeline() {
+    const bar = $('timeline');
+    const set = () => {
+      const top = bar.hidden ? 0 : Math.ceil(window.innerHeight - bar.getBoundingClientRect().top);
+      document.body.style.setProperty('--tl-top', top + 'px');
+    };
+    new ResizeObserver(set).observe(bar);
+    window.addEventListener('resize', set);
+  }
+
+  function bindTimeline() {
+    clearOfTimeline();
+    const track = $('tl-track');
+    let scrubbing = false;
+    let timer = 0;
+    const pick = x => {
+      if (!T.steps.length) return;
+      // the tick under the pointer - ticks are packed left, so a share of the
+      // track's width is not a step
+      const ticks = [...$('tl-ticks').querySelectorAll('.tick')];
+      let k = ticks.findIndex(t => x < t.getBoundingClientRect().right);
+      if (k < 0) k = ticks.length - 1;
+      if (k < 0) return;
+      const i = +ticks[k].dataset.i;
+      if (i === T.at && T.replay) return;
+      stopPlay();
+      T.follow = false;
+      T.at = i;
+      drawTimeline();
+      // a fast scrub draws only where it comes to rest
+      clearTimeout(timer);
+      timer = setTimeout(() => replay(i, T.side), 110);
+    };
+    track.addEventListener('pointerdown', e => {
+      scrubbing = true;
+      track.setPointerCapture(e.pointerId);
+      pick(e.clientX);
+    });
+    track.addEventListener('pointermove', e => {
+      if (scrubbing) pick(e.clientX);
+    });
+    track.addEventListener('pointerup', () => (scrubbing = false));
+    track.addEventListener('pointercancel', () => (scrubbing = false));
+    track.addEventListener('keydown', e => {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        e.stopPropagation();
+        stepBy(e.key === 'ArrowLeft' ? -1 : 1);
+      }
+    });
+    $('tl-prev').addEventListener('click', () => stepBy(-1));
+    $('tl-next').addEventListener('click', () => stepBy(1));
+    $('tl-play').addEventListener('click', () => play());
+    $('tl-follow').addEventListener('click', () => toggleFollow());
+    $('tl-unfold').addEventListener('click', () => {
+      T.unfolded = !T.unfolded;
+      drawTimeline();
+    });
+    $('tl-speed').addEventListener('click', e => {
+      // shift steps back up through the speeds
+      const i = SPEEDS.indexOf(T.speed);
+      setReplay(SPEEDS[(i + (e.shiftKey ? SPEEDS.length - 1 : 1)) % SPEEDS.length]);
+    });
+    $('tl-focus').addEventListener('click', () => setReplay(undefined, !T.focus));
+    $('tl-ask').addEventListener('click', () => (S.asksPanel ? hidePanel() : panelAsks()));
+    $('tl-ws').addEventListener('click', () => {
+      T.ws = !T.ws;
+      store.set('ws', T.ws);
+      applyMarks();
+      drawTimeline();
+    });
+    $('tl-step').addEventListener('click', () => {
+      const ev = T.steps[T.at];
+      if (ev) panelEvent(ev);
+    });
+    for (const b of $('tl-side').children) {
+      b.addEventListener('click', () => {
+        if (T.at != null) replay(T.at, b.dataset.side);
+      });
+    }
+  }
+
+  // One request a second carries both: new edit steps, and the map's
+  // generation - which a save or a branch switch moves without any step.
+  async function poll() {
+    let wait = 1000;
+    try {
+      let r = await getJSON('/vis/events?since=' + T.seq);
+      if (r.boot !== T.boot) {
+        // the server started again - perhaps a newer build, serving a newer
+        // page than this one - so the page is loaded afresh; a host that
+        // cannot do that leaves this one running, its numbering started over
+        if (T.boot != null && !T.reloading) {
+          T.reloading = true;
+          if (vscode) vscode.postMessage({ type: 'reload' });
+          else location.reload();
+        }
+        if (T.boot != null && T.seq) r = await getJSON('/vis/events?since=0');
+        T.boot = r.boot;
+        T.steps = [];
+        T.full.clear();
+        T.at = null;
+        A.groups = [];
+        A.of = new Map();
+      }
+      const fresh = r.events || [];
+      T.steps.push(...fresh);
+      // past the cap an inspect goes before an edit does, as on the server
+      while (T.steps.length > MAX_TIMELINE) {
+        const look = T.steps.slice(0, T.steps.length >> 1).findIndex(e => e.status === 'inspect');
+        const cut = look < 0 ? 0 : look;
+        T.steps.splice(cut, 1);
+        if (T.at != null && T.at > cut) T.at--;
+      }
+      T.seq = r.latest;
+      if (fresh.length) asksSoon(T.primed ? 2500 : 0);
+      if (!T.primed) {
+        T.primed = true;
+        if (T.steps.length) T.at = T.steps.length - 1;
+        drawTimeline();
+      } else if (fresh.length) {
+        // each takes its turn at the chosen speed, the polling going on meanwhile
+        if (T.follow && !T.playing) {
+          T.queue.push(...fresh);
+          pump();
+        } else drawTimeline();
+      } else if (S.generated && r.generated !== S.generated && !T.replay) {
+        S.overview = null;
+        await render(true);
+      }
+    } catch {
+      // not answering right now - try again a little later
+      wait = 4000;
+    }
+    setTimeout(poll, wait);
+  }
+
+  chips();
+  bindCanvas();
+  bindChrome();
+  bindTimeline();
+  applyView();
+  if (vscode && !location.hash) {
+    const saved = store.get('hash', '');
+    try {
+      if (saved) history.replaceState(null, '', saved);
+    } catch {
+      // the default view will do
+    }
+  }
+  drawTimeline();
+  render(false).then(poll);
+})();

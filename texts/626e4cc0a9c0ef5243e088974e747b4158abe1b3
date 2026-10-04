@@ -1,0 +1,1689 @@
+//! `ccc prompts` - pair the requests sent to claude/copilot with the code they
+//! changed.
+//!
+//! Both agents already keep a local record of every exchange. Claude Code writes
+//! one JSONL transcript per session under `~/.claude/projects/<slug>/`, carrying
+//! the prompt, the `parentUuid` chain that links a tool call back to it, and the
+//! `Edit`/`Write` call itself with the exact text it wrote. Copilot writes a
+//! patch log per workspace under VS Code's `workspaceStorage`, carrying the
+//! prompt text and its timestamp but no edit payload.
+//!
+//! Nothing here is asserted with more confidence than its source supports: every
+//! attribution carries the evidence that produced it, weakest last, and a
+//! changed file that no request claims is reported as unattributed rather than
+//! attached to whichever prompt happened to be nearest.
+
+use anyhow::{Context, Result};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub const SCHEMA: &str = "ccc-prompts/1";
+
+// the ledger `--record` appends to, under `.ccc/`
+pub const LEDGER_NAME: &str = "prompts.jsonl";
+
+// tool calls that write source. anything else an agent does to a file - a
+// `sed -i`, a heredoc - arrives through Bash, where the command is not
+// statically parseable, and is covered by the temporal rung instead
+const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+// prompt text kept per turn. long enough to recognise the request, short
+// enough that a report full of them still fits an agent's context
+const PROMPT_CAP: usize = 500;
+
+// proposed/agreed text kept per edit
+const EDIT_TEXT_CAP: usize = 2000;
+
+// current state - read alongside a pinned edit
+const MAX_AGREED_LINES: usize = 60;
+
+// how far after a request a file write may still be credited to it. beyond
+// this the request is simply not the explanation, and saying so is the point
+const MAX_TEMPORAL_GAP_SECS: i64 = 4 * 3600;
+
+// guards the `parentUuid` walk against a malformed or cyclic transcript
+const MAX_PARENT_HOPS: usize = 1000;
+
+#[derive(Debug, Default, Clone)]
+pub struct PromptsOptions {
+    // base ref to diff against; None resolves the same way `changes` does
+    pub base: Option<String>,
+    // include uncommitted edits and untracked files
+    pub worktree: bool,
+    // restrict to one agent: `claude` or `copilot`; None reads both
+    pub agent: Option<String>,
+    // only turns from the last N days
+    pub since_days: Option<u64>,
+    // append the collected turns to `.ccc/prompts.jsonl`
+    pub record: bool,
+    // restrict to exactly one session id
+    pub session: Option<String>,
+    // self-reported model name
+    pub model: Option<String>,
+}
+
+// one file an agent wrote in service of a request
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnEdit {
+    // repo-relative where the write landed inside the project, absolute
+    // otherwise; a turn may well touch files outside this checkout
+    pub path: String,
+    // Edit | Write | MultiEdit | NotebookEdit
+    pub tool: String,
+    // a distinctive line of what was written, used to find the edit again in
+    // the file as it stands today
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    // what the tool actually wrote
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<String>,
+}
+
+// one request sent to a model, and the edits it produced
+#[derive(Debug, Clone, Serialize)]
+pub struct Turn {
+    // `<agent>:<session>:<uuid>`, stable across runs so a report can be diffed
+    pub id: String,
+    // claude | copilot
+    pub agent: String,
+    pub session: String,
+    // the model that answered
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    // RFC3339, when the request was sent
+    pub ts: String,
+    // git branch recorded at the time, where the source knows it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    // the request itself
+    pub prompt: String,
+    // the files it wrote; empty is meaningful - a question that changed
+    // nothing is still an answer
+    pub edits: Vec<TurnEdit>,
+    // every changeset its calls to ccc's edit tools named - staged, applied or
+    // dropped - so a step on the visualiser's timeline finds the ask behind it
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changesets: Vec<String>,
+    // epoch seconds, not serialised: ordering and windowing only
+    #[serde(skip)]
+    pub epoch: i64,
+}
+
+// a change, and the request that produced it
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptRef {
+    // Turn.id
+    pub turn: String,
+    pub agent: String,
+    pub ts: String,
+    pub prompt: String,
+    // content-match | tool-edit | temporal, weakest last
+    pub evidence: String,
+    // the changed range this reference was pinned to. Absent means the
+    // reference covers the whole file, which is all `tool-edit` and `temporal`
+    // can honestly claim
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<[usize; 2]>,
+    // only for `content-match`, where a span is known
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agreed: Option<String>,
+}
+
+impl PromptRef {
+    // does this reference cover a span, given that a file-wide one covers all
+    // ccc:skip
+    pub fn covers(&self, start: usize, end: usize) -> bool {
+        match self.lines {
+            None => true,
+            Some([s, e]) => s <= end && start <= e,
+        }
+    }
+
+    // rank of the evidence that produced it, strongest first
+    // ccc:skip
+    fn rank(&self) -> u8 {
+        match self.evidence.as_str() {
+            "content-match" => 0,
+            "tool-edit" => 1,
+            _ => 2,
+        }
+    }
+}
+
+// what the attribution pass concluded
+#[derive(Debug, Default, Clone)]
+pub struct Attribution {
+    // repo-relative path -> the requests that produced its changes
+    pub by_file: BTreeMap<String, Vec<PromptRef>>,
+    // changed files no request claims: written by hand, or by an agent whose
+    // record ccc cannot read
+    pub unattributed: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+pub struct PromptsCounts {
+    pub turns: usize,
+    pub edits: usize,
+    pub attributed_files: usize,
+    pub unattributed_files: usize,
+    pub claude_turns: usize,
+    pub copilot_turns: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptsReport {
+    pub schema: &'static str,
+    pub root: String,
+    pub base: String,
+    pub turns: Vec<Turn>,
+    // repo-relative path -> the requests behind its changes
+    pub attributed: BTreeMap<String, Vec<PromptRef>>,
+    pub unattributed: Vec<String>,
+    // agent records ccc looked for and could not read, so an empty report is
+    // distinguishable from a missing one
+    pub sources: Vec<SourceStatus>,
+    pub counts: PromptsCounts,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SourceStatus {
+    pub agent: String,
+    pub location: String,
+    pub sessions: usize,
+}
+
+// source discovery
+// ccc:skip
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+// the directory claude code keeps its transcripts in
+// ccc:skip
+fn claude_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(dir).join("projects"));
+    }
+    home().map(|h| h.join(".claude").join("projects"))
+}
+
+// claude names a project directory after its path with the separators flattened
+pub(crate) fn claude_slug(root: &Path) -> String {
+    root.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+// the first record of a transcript names the directory the session ran in.
+// The slug is only a hint - this is the fact
+// ccc:skip
+fn transcript_cwd(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    for line in raw.lines().take(50) {
+        let v: Value = serde_json::from_str(line).ok()?;
+        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
+// ccc:skip
+fn jsonl_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    out.sort();
+    out
+}
+
+// transcripts for this project: the slug first, then any other project
+// directory whose sessions actually ran here
+// ccc:skip
+fn claude_transcripts(root: &Path) -> (Vec<PathBuf>, String) {
+    let Some(base) = claude_root() else {
+        return (Vec::new(), "<no home directory>".into());
+    };
+    let location = base.display().to_string();
+    let want = root.to_string_lossy().to_string();
+    let slug_dir = base.join(claude_slug(root));
+    let mut found = jsonl_files(&slug_dir);
+    if !found.is_empty() {
+        return (found, location);
+    }
+    // the slug rule flattens `.` and `/` alike, so it can miss; fall back to
+    // asking each transcript where it ran
+    let Ok(entries) = fs::read_dir(&base) else {
+        return (found, location);
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        for f in jsonl_files(&dir) {
+            if transcript_cwd(&f).is_some_and(|c| c == want || c.starts_with(&format!("{want}/"))) {
+                found.push(f);
+            }
+        }
+    }
+    (found, location)
+}
+
+// every VS Code flavour that keeps a `workspaceStorage`
+// ccc:skip
+fn vscode_user_dirs() -> Vec<PathBuf> {
+    let Some(h) = home() else {
+        return Vec::new();
+    };
+    let flavours = ["Code", "Code - Insiders", "VSCodium", "Cursor"];
+    let mut roots = vec![
+        h.join(".config"),
+        h.join("Library").join("Application Support"),
+    ];
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        roots.push(PathBuf::from(appdata));
+    }
+    let mut out = Vec::new();
+    for r in roots {
+        for f in flavours {
+            let p = r.join(f).join("User");
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+// copilot chat sessions for the workspace rooted here
+// ccc:skip
+fn copilot_sessions(root: &Path) -> (Vec<PathBuf>, String) {
+    let dirs = vscode_user_dirs();
+    let location = dirs
+        .first()
+        .map(|d| d.join("workspaceStorage").display().to_string())
+        .unwrap_or_else(|| "<no VS Code user directory>".into());
+    let want = format!("file://{}", root.to_string_lossy());
+    let mut out = Vec::new();
+    for user in dirs {
+        let storage = user.join("workspaceStorage");
+        let Ok(entries) = fs::read_dir(&storage) else {
+            continue;
+        };
+        let mut hashes: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        hashes.sort();
+        for hash in hashes {
+            let meta = hash.join("workspace.json");
+            let Ok(raw) = fs::read_to_string(&meta) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let folder = v.get("folder").and_then(|f| f.as_str()).unwrap_or_default();
+            if folder.trim_end_matches('/') != want.trim_end_matches('/') {
+                continue;
+            }
+            out.extend(jsonl_files(&hash.join("chatSessions")));
+        }
+    }
+    (out, location)
+}
+
+// transcripts
+// blocks the harness injects around the user's own words
+// ccc:skip
+fn strip_injected(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let tags = [
+        ("<system-reminder>", "</system-reminder>"),
+        ("<ide_selection>", "</ide_selection>"),
+        ("<ide_opened_file>", "</ide_opened_file>"),
+        ("<local-command-stdout>", "</local-command-stdout>"),
+    ];
+    'outer: loop {
+        let next = tags
+            .iter()
+            .filter_map(|(open, close)| rest.find(open).map(|i| (i, *open, *close)))
+            .min_by_key(|(i, _, _)| *i);
+        match next {
+            Some((i, open, close)) => {
+                out.push_str(&rest[..i]);
+                let after = &rest[i + open.len()..];
+                match after.find(close) {
+                    Some(j) => rest = &after[j + close.len()..],
+                    // unterminated: drop the remainder rather than echo it
+                    None => break 'outer,
+                }
+            }
+            None => {
+                out.push_str(rest);
+                break 'outer;
+            }
+        }
+    }
+    out
+}
+
+// condense a request to something a report can carry
+fn condense(text: &str) -> String {
+    let cleaned = strip_injected(text);
+    let mut flat = String::new();
+    for line in cleaned.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !flat.is_empty() {
+            flat.push(' ');
+        }
+        flat.push_str(t);
+        if flat.chars().count() > PROMPT_CAP {
+            break;
+        }
+    }
+    truncate(&flat, PROMPT_CAP)
+}
+
+// ccc:skip
+fn truncate(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(cap).collect();
+    format!("{}…", head.trim_end())
+}
+
+// the text of a record, when it is one the user actually typed. Tool results,
+// harness metadata and slash-command expansions are not requests
+// ccc:skip
+fn user_prompt_text(rec: &Value) -> Option<String> {
+    if rec.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
+    }
+    if rec.get("isMeta").and_then(|m| m.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let content = rec.get("message")?.get("content")?;
+    let raw = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => {
+            // a tool result is the harness answering the model, not a request
+            if blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            {
+                return None;
+            }
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => return None,
+    };
+    if raw.trim_start().starts_with("<command-name>")
+        || raw.trim_start().starts_with("<local-command")
+    {
+        return None;
+    }
+    let condensed = condense(&raw);
+    (!condensed.is_empty()).then_some(condensed)
+}
+
+// the longest distinctive line of what a tool wrote, for finding it again
+// ccc:skip
+fn anchor_of(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.chars().count() >= 12)
+        .max_by_key(|l| l.chars().count())
+        .map(|l| truncate(l, 160).trim_end_matches('…').to_string())
+        .filter(|l| l.chars().count() >= 12)
+}
+
+// one `TurnEdit` for a block of text a tool wrote
+fn edit_of(path: &str, tool: &str, text: Option<&str>) -> TurnEdit {
+    let text = text.filter(|t| !t.trim().is_empty());
+    TurnEdit {
+        path: path.to_string(),
+        tool: tool.to_string(),
+        anchor: text.and_then(anchor_of),
+        proposed: text.map(|t| truncate(t, EDIT_TEXT_CAP)),
+    }
+}
+
+// what ccc's own edit tools wrote - their input is a handle, so the text comes back from the ledger `edit_apply` keeps
+struct CccWrites<'a> {
+    // tool_use id -> the text that call was answered with
+    answers: BTreeMap<&'a str, String>,
+    // changeset id -> (path, text written)
+    ledger: &'a BTreeMap<String, Vec<(String, String)>>,
+}
+
+// ccc's write tools as an MCP client names them - `mcp__<server>__edit_*`
+fn is_ccc_edit(name: &str) -> bool {
+    name.starts_with("mcp__") && name.contains("__edit_")
+}
+
+// the files one ccc edit call wrote, by the changeset its input names or its answer reports applied
+// ccc:skip
+fn ccc_edits_of(block: &Value, name: &str, ccc: &CccWrites) -> Vec<TurnEdit> {
+    let tool = name.rsplit("__").next().unwrap_or(name);
+    // a revert takes code away, it writes nothing a request asked for
+    if tool == "edit_revert" {
+        return Vec::new();
+    }
+    let mut ids: Vec<String> = Vec::new();
+    if tool == "edit_apply" {
+        if let Some(c) = block.get("input").and_then(|i| i.get("changeset")).and_then(|c| c.as_str()) {
+            ids.push(c.trim().to_string());
+        }
+    }
+    if let Some(answer) = block.get("id").and_then(|i| i.as_str()).and_then(|id| ccc.answers.get(id)) {
+        ids.extend(crate::edit::applied_ids(answer));
+    }
+    ids.sort();
+    ids.dedup();
+    ids.iter()
+        .filter_map(|id| ccc.ledger.get(id))
+        .flatten()
+        .map(|(path, written)| edit_of(path, tool, Some(written)))
+        .collect()
+}
+
+// the files one `tool_use` block wrote
+// ccc:skip
+fn edits_of(block: &Value, root: &Path, ccc: &CccWrites) -> Vec<TurnEdit> {
+    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+    if is_ccc_edit(name) {
+        return ccc_edits_of(block, name, ccc);
+    }
+    if !EDIT_TOOLS.contains(&name) {
+        return Vec::new();
+    }
+    let Some(input) = block.get("input") else {
+        return Vec::new();
+    };
+    let raw_path = input
+        .get("file_path")
+        .or_else(|| input.get("notebook_path"))
+        .and_then(|p| p.as_str());
+    let Some(raw_path) = raw_path else {
+        return Vec::new();
+    };
+    let path = relativise(raw_path, root);
+    match name {
+        "Write" => vec![edit_of(&path, name, input.get("content").and_then(|c| c.as_str()))],
+        "NotebookEdit" => vec![edit_of(&path, name, input.get("new_source").and_then(|c| c.as_str()))],
+        "MultiEdit" => {
+            let subs: Vec<TurnEdit> = input
+                .get("edits")
+                .and_then(|e| e.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("new_string").and_then(|s| s.as_str()))
+                .filter(|t| !t.trim().is_empty())
+                .map(|t| edit_of(&path, name, Some(t)))
+                .collect();
+            if subs.is_empty() {
+                vec![edit_of(&path, name, None)]
+            } else {
+                subs
+            }
+        }
+        _ => vec![edit_of(&path, name, input.get("new_string").and_then(|c| c.as_str()))],
+    }
+}
+
+// paths inside the project are reported the way every other ccc report reports
+// them; paths outside it stay absolute, because that is what they are
+// ccc:skip
+fn relativise(raw: &str, root: &Path) -> String {
+    let p = Path::new(raw);
+    match p.strip_prefix(root) {
+        Ok(rel) => crate::changes::path_str(rel),
+        Err(_) => raw.to_string(),
+    }
+}
+
+// ccc:skip
+fn epoch_of(ts: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|d| d.timestamp())
+        .unwrap_or(0)
+}
+
+// one claude transcript -> the requests it contains, each with its edits
+#[cfg(test)]
+fn parse_claude(path: &Path, root: &Path) -> Vec<Turn> {
+    parse_claude_with(path, root, &crate::edit::ledger(root))
+}
+
+// ccc:skip
+fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(String, String)>>) -> Vec<Turn> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let records: Vec<Value> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+
+    let mut by_uuid: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, r) in records.iter().enumerate() {
+        if let Some(u) = r.get("uuid").and_then(|u| u.as_str()) {
+            by_uuid.insert(u, i);
+        }
+    }
+
+    let session = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // every request, in the order it was made, whether or not it produced an
+    // edit. `at` maps the record it came from to its slot, so the edit pass
+    // below can find it again by walking the parent chain
+    let mut out: Vec<Turn> = Vec::new();
+    let mut at: BTreeMap<usize, usize> = BTreeMap::new();
+    for (i, rec) in records.iter().enumerate() {
+        let Some(prompt) = user_prompt_text(rec) else {
+            continue;
+        };
+        let Some(uuid) = rec.get("uuid").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        let ts = rec
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        at.insert(i, out.len());
+        out.push(Turn {
+            id: format!("claude:{session}:{uuid}"),
+            agent: "claude".into(),
+            session: session.clone(),
+            model: None,
+            epoch: epoch_of(&ts),
+            ts,
+            branch: rec
+                .get("gitBranch")
+                .and_then(|b| b.as_str())
+                .filter(|b| !b.is_empty())
+                .map(str::to_string),
+            prompt,
+            edits: Vec::new(),
+            changesets: Vec::new(),
+        });
+    }
+
+    // what each tool call was answered with - the only place a ccc edit names the changeset it applied
+    let mut answers: BTreeMap<&str, String> = BTreeMap::new();
+    for rec in &records {
+        let blocks = rec
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array());
+        for b in blocks.into_iter().flatten() {
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            let text = match b.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => continue,
+            };
+            answers.insert(id, text);
+        }
+    }
+    let ccc = CccWrites { answers, ledger };
+
+    // then credit each edit - and the model that produced it - to the
+    // request that led to it
+    for rec in &records {
+        if rec.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let model = rec
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str());
+        let edits: Vec<TurnEdit> = rec
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                    .flat_map(|b| edits_of(b, root, &ccc))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let named: Vec<String> = rec
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .flat_map(|b| match b.get("name").and_then(|n| n.as_str()) {
+                Some(name) if is_ccc_edit(name) => changesets_of(b, &ccc.answers),
+                // ccc reached another way - a shell, a client naming it otherwise - answers alike
+                _ => reported_changesets(b, &ccc.answers),
+            })
+            .collect();
+        // a purely conversational reply still names the model that gave it
+        if edits.is_empty() && named.is_empty() && model.is_none() {
+            continue;
+        }
+        let Some(idx) = walk_to_prompt(rec, &records, &by_uuid) else {
+            continue;
+        };
+        if let Some(turn) = at.get(&idx).and_then(|&slot| out.get_mut(slot)) {
+            turn.edits.extend(edits);
+            turn.changesets.extend(named);
+            if turn.model.is_none() {
+                turn.model = model.map(str::to_string);
+            }
+        }
+    }
+
+    for t in &mut out {
+        t.edits.sort_by(|a, b| (&a.path, &a.tool).cmp(&(&b.path, &b.tool)));
+        t.edits.dedup_by(|a, b| a.path == b.path && a.anchor == b.anchor);
+        t.changesets.sort();
+        t.changesets.dedup();
+    }
+    out
+}
+
+// the changesets one ccc edit call named - in what it was asked, and in its answer
+fn changesets_of(block: &Value, answers: &BTreeMap<&str, String>) -> Vec<String> {
+    let asked = block.get("input").and_then(|i| i.get("changeset")).and_then(|c| c.as_str());
+    let mut ids: Vec<String> = asked.map(|c| c.trim().to_string()).into_iter().collect();
+    if let Some(answer) = block.get("id").and_then(|i| i.as_str()).and_then(|id| answers.get(id)) {
+        ids.extend(crate::edit::changeset_ids(answer));
+    }
+    ids.retain(|i| !i.is_empty());
+    ids
+}
+
+// the changesets ccc reported in the answer to any other call, known by the
+// shape ccc gives them
+fn reported_changesets(block: &Value, answers: &BTreeMap<&str, String>) -> Vec<String> {
+    let answer = block.get("id").and_then(|i| i.as_str()).and_then(|id| answers.get(id));
+    let ids = answer.map(|a| crate::edit::changeset_ids(a)).unwrap_or_default();
+    ids.into_iter().filter(|id| changeset_shaped(id)).collect()
+}
+
+// `c<number>-<tag>`, as ccc names a changeset
+fn changeset_shaped(id: &str) -> bool {
+    id.strip_prefix('c')
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(n, tag)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !tag.is_empty())
+}
+
+// climb `parentUuid` from an assistant record to the request that led to it
+// ccc:skip
+fn walk_to_prompt(
+    from: &Value,
+    records: &[Value],
+    by_uuid: &BTreeMap<&str, usize>,
+) -> Option<usize> {
+    let mut cursor = from.get("parentUuid").and_then(|p| p.as_str());
+    let mut seen = BTreeSet::new();
+    for _ in 0..MAX_PARENT_HOPS {
+        let uuid = cursor?;
+        if !seen.insert(uuid) {
+            return None;
+        }
+        let idx = *by_uuid.get(uuid)?;
+        if user_prompt_text(&records[idx]).is_some() {
+            return Some(idx);
+        }
+        cursor = records[idx].get("parentUuid").and_then(|p| p.as_str());
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// copilot sessions
+// ---------------------------------------------------------------------------
+
+// VS Code stores a chat session as an initial snapshot plus a patch log:
+// `kind:0` seeds the object, `kind:1` sets the value at a path, `kind:2`
+// appends to the array at a path. Only `requests` is of interest here
+fn parse_copilot(path: &Path) -> Vec<Turn> {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let session = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut requests: Vec<Value> = Vec::new();
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = v.get("kind").and_then(|k| k.as_u64()).unwrap_or(u64::MAX);
+        let key: Vec<&str> = v
+            .get("k")
+            .and_then(|k| k.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        match kind {
+            0 => {
+                if let Some(rs) = v.get("v").and_then(|o| o.get("requests")).and_then(|r| r.as_array()) {
+                    requests = rs.clone();
+                }
+            }
+            1 if key == ["requests"] => {
+                if let Some(rs) = v.get("v").and_then(|r| r.as_array()) {
+                    requests = rs.clone();
+                }
+            }
+            2 if key == ["requests"] => {
+                if let Some(rs) = v.get("v").and_then(|r| r.as_array()) {
+                    requests.extend(rs.iter().cloned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    requests
+        .iter()
+        .filter_map(|r| {
+            let text = r.get("message")?.get("text")?.as_str()?;
+            let prompt = condense(text);
+            if prompt.is_empty() {
+                return None;
+            }
+            let ms = r.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+            let ts = chrono::DateTime::from_timestamp_millis(ms)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            let id = r
+                .get("requestId")
+                .and_then(|i| i.as_str())
+                .unwrap_or_default();
+            Some(Turn {
+                id: format!("copilot:{session}:{id}"),
+                agent: "copilot".into(),
+                session: session.clone(),
+                // copilot has to be different
+                model: None,
+                ts,
+                epoch: ms / 1000,
+                branch: None,
+                prompt,
+                // copilot's log records the request and the rendered reply, not
+                // the edit payload, so its changes can only be placed in time
+                edits: Vec::new(),
+                changesets: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+// narrow to the caller's own session
+fn apply_session(turns: &mut Vec<Turn>, opts: &PromptsOptions) {
+    let Some(session) = opts.session.as_deref() else {
+        return;
+    };
+    turns.retain(|t| t.session == session);
+    if let Some(model) = opts.model.as_deref() {
+        for t in turns.iter_mut() {
+            if t.model.is_none() {
+                t.model = Some(model.to_string());
+            }
+        }
+    }
+}
+
+// collection
+// every request made against this project, oldest first
+// ccc:skip
+pub fn collect(root: &Path, opts: &PromptsOptions) -> (Vec<Turn>, Vec<SourceStatus>) {
+    let want = |a: &str| opts.agent.as_deref().is_none_or(|w| w == a);
+    let mut turns = Vec::new();
+    let mut sources = Vec::new();
+
+    if want("claude") {
+        let (files, location) = claude_transcripts(root);
+        sources.push(SourceStatus {
+            agent: "claude".into(),
+            location,
+            sessions: files.len(),
+        });
+        let ledger = crate::edit::ledger(root);
+        for f in files {
+            turns.extend(parse_claude_with(&f, root, &ledger));
+        }
+    }
+    if want("copilot") {
+        let (files, location) = copilot_sessions(root);
+        sources.push(SourceStatus {
+            agent: "copilot".into(),
+            location,
+            sessions: files.len(),
+        });
+        for f in files {
+            turns.extend(parse_copilot(&f));
+        }
+    }
+
+    if let Some(days) = opts.since_days {
+        let cutoff = chrono::Utc::now().timestamp() - (days as i64) * 86_400;
+        turns.retain(|t| t.epoch >= cutoff);
+    }
+    apply_session(&mut turns, opts);
+    turns.sort_by(|a, b| (a.epoch, &a.id).cmp(&(b.epoch, &b.id)));
+    turns.dedup_by(|a, b| a.id == b.id);
+    (turns, sources)
+}
+
+// where agents' records are looked for again - finding them walks VS Code's storage
+const ASK_SOURCES_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+// and again for a project claude keeps no directory of its own for, where
+// finding its sessions means opening every other project's
+const ASK_SOURCES_SLOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+// One stamp per record: when it was last written, and how long it was.
+type Stamp = (Option<std::time::SystemTime>, u64);
+
+// The requests made in this project, kept per transcript and read again only
+// once that transcript changes - the visualiser asks often, and one session's
+// transcript runs to megabytes.
+#[derive(Default)]
+pub struct Asks {
+    // the records found, claude's marked true, and when they were looked for
+    sources: Option<(std::time::Instant, Vec<(PathBuf, bool)>)>,
+    read: BTreeMap<PathBuf, (Stamp, Vec<Turn>)>,
+}
+
+impl Asks {
+    // every request made since `since` (epoch seconds), oldest first
+    pub fn since(&mut self, root: &Path, since: i64) -> Vec<Turn> {
+        let quick = claude_root().is_some_and(|b| b.join(claude_slug(root)).is_dir());
+        let every = if quick { ASK_SOURCES_EVERY } else { ASK_SOURCES_SLOW };
+        let stale = self.sources.as_ref().is_none_or(|(at, _)| at.elapsed() > every);
+        if stale {
+            let mut found: Vec<(PathBuf, bool)> = claude_transcripts(root).0.into_iter().map(|f| (f, true)).collect();
+            found.extend(copilot_sessions(root).0.into_iter().map(|f| (f, false)));
+            self.sources = Some((std::time::Instant::now(), found));
+        }
+        let sources = self.sources.as_ref().map(|(_, s)| s.clone()).unwrap_or_default();
+        // edits are not wanted here, so no ledger is read for them
+        let ledger = BTreeMap::new();
+        let mut out = Vec::new();
+        let mut live = BTreeSet::new();
+        for (f, claude) in sources {
+            let Ok(md) = fs::metadata(&f) else {
+                continue;
+            };
+            let modified = md.modified().ok();
+            // a record last written before the window holds nothing inside it
+            let secs = modified
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            if secs.is_some_and(|s| s < since) {
+                continue;
+            }
+            let stamp = (modified, md.len());
+            if self.read.get(&f).is_none_or(|(s, _)| *s != stamp) {
+                let turns = if claude { parse_claude_with(&f, root, &ledger) } else { parse_copilot(&f) };
+                self.read.insert(f.clone(), (stamp, turns));
+            }
+            if let Some((_, turns)) = self.read.get(&f) {
+                out.extend(turns.iter().filter(|t| t.epoch >= since).cloned());
+            }
+            live.insert(f);
+        }
+        self.read.retain(|f, _| live.contains(f));
+        out.sort_by(|a, b| (a.epoch, &a.id).cmp(&(b.epoch, &b.id)));
+        out.dedup_by(|a, b| a.id == b.id);
+        out
+    }
+}
+
+// attribution
+// ccc:skip
+fn as_ref_of(
+    turn: &Turn,
+    evidence: &str,
+    lines: Option<[usize; 2]>,
+    proposed: Option<String>,
+    agreed: Option<String>,
+) -> PromptRef {
+    PromptRef {
+        turn: turn.id.clone(),
+        agent: turn.agent.clone(),
+        ts: turn.ts.clone(),
+        prompt: turn.prompt.clone(),
+        evidence: evidence.to_string(),
+        lines,
+        proposed,
+        agreed,
+    }
+}
+
+// the 1-based line an anchor sits on in `text`
+// ccc:skip
+fn line_of(text: &str, anchor: &str) -> Option<usize> {
+    text.lines()
+        .position(|l| l.trim() == anchor || l.contains(anchor))
+        .map(|i| i + 1)
+}
+
+// what is at `from_line` onward
+// ccc:skip
+fn agreed_text(text: &str, from_line: usize, proposed: Option<&str>) -> Option<String> {
+    let want = proposed
+        .map(|p| p.lines().count().max(1))
+        .unwrap_or(1)
+        .min(MAX_AGREED_LINES);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = from_line.checked_sub(1)?;
+    let end = (start + want).min(lines.len());
+    (start < end).then(|| truncate(&lines[start..end].join("\n"), EDIT_TEXT_CAP))
+}
+
+// Tie each changed file to the requests that produced it.
+//
+// `hunks` is the changed line ranges per repo-relative path, as `changes`
+// already computes them. `times` is when each changed file was last written,
+// in epoch seconds - a commit time where the change is committed, an mtime
+// where it is not.
+pub fn attribute(
+    root: &Path,
+    turns: &[Turn],
+    hunks: &BTreeMap<String, Vec<(usize, usize)>>,
+    times: &BTreeMap<String, i64>,
+) -> Attribution {
+    let mut by_file: BTreeMap<String, Vec<PromptRef>> = BTreeMap::new();
+
+    // the strong rungs: the request said which file it wrote
+    for turn in turns {
+        for edit in &turn.edits {
+            let Some(ranges) = hunks.get(&edit.path) else {
+                continue;
+            };
+            // is what it wrote still there, inside something that changed?
+            // when it is, also read what is at that span today
+            let mut agreed = None;
+            let pinned = edit.anchor.as_ref().and_then(|a| {
+                let text = fs::read_to_string(root.join(&edit.path)).ok()?;
+                let line = line_of(&text, a)?;
+                let span = ranges
+                    .iter()
+                    .find(|&&(s, e)| s <= line && line <= e)
+                    // a brand new file is one open-ended range: pinning inside
+                    // it would claim a precision the range does not have
+                    .filter(|&&(_, e)| e != usize::MAX)
+                    .map(|&(s, e)| [s, e]);
+                if span.is_some() {
+                    agreed = agreed_text(&text, line, edit.proposed.as_deref());
+                }
+                span
+            });
+            let r = match pinned {
+                Some(span) => as_ref_of(turn, "content-match", Some(span), edit.proposed.clone(), agreed),
+                None => as_ref_of(turn, "tool-edit", None, None, None),
+            };
+            by_file.entry(edit.path.clone()).or_default().push(r);
+        }
+    }
+
+    // the weak rung: a file changed inside a request's window, and no request
+    // named it. Bash edits and copilot edits both land here
+    for (path, _) in hunks.iter() {
+        if by_file.contains_key(path) {
+            continue;
+        }
+        let Some(&written) = times.get(path) else {
+            continue;
+        };
+        if let Some(turn) = window_owner(turns, written) {
+            by_file
+                .entry(path.clone())
+                .or_default()
+                .push(as_ref_of(turn, "temporal", None, None, None));
+        }
+    }
+
+    for refs in by_file.values_mut() {
+        refs.sort_by(|a, b| (a.rank(), &a.ts, &a.turn).cmp(&(b.rank(), &b.ts, &b.turn)));
+        refs.dedup_by(|a, b| a.turn == b.turn && a.lines == b.lines);
+        // a request that pinned to a span has already proved it wrote the
+        // file; repeating the claim at a weaker rung says nothing new
+        let pinned: BTreeSet<String> = refs
+            .iter()
+            .filter(|r| r.lines.is_some())
+            .map(|r| r.turn.clone())
+            .collect();
+        refs.retain(|r| r.lines.is_some() || !pinned.contains(&r.turn));
+    }
+
+    let unattributed: Vec<String> = hunks
+        .keys()
+        .filter(|p| !by_file.contains_key(*p))
+        .cloned()
+        .collect();
+
+    Attribution {
+        by_file,
+        unattributed,
+    }
+}
+
+// the request that was in flight when `written` happened: the last one sent
+// before it, provided it was recent enough to be the explanation
+// ccc:skip
+fn window_owner(turns: &[Turn], written: i64) -> Option<&Turn> {
+    let mut best: Option<&Turn> = None;
+    for t in turns {
+        if t.epoch > written {
+            break;
+        }
+        best = Some(t);
+    }
+    let t = best?;
+    (written - t.epoch <= MAX_TEMPORAL_GAP_SECS).then_some(t)
+}
+
+// report
+// Build the standalone report: collect the requests, diff the branch, and
+// attribute. `changes` performs the same join at function granularity.
+// ccc:skip
+pub fn prompts(root: &Path, root_label: &str, opts: &PromptsOptions) -> Result<PromptsReport> {
+    let (turns, sources) = collect(root, opts);
+    let (base_label, hunks, times) = crate::changes::changed_line_times(root, opts.base.as_deref(), opts.worktree)?;
+    let attribution = attribute(root, &turns, &hunks, &times);
+
+    if opts.record {
+        record(root, &turns).context("recording the prompt ledger")?;
+    }
+
+    let counts = PromptsCounts {
+        turns: turns.len(),
+        edits: turns.iter().map(|t| t.edits.len()).sum(),
+        attributed_files: attribution.by_file.len(),
+        unattributed_files: attribution.unattributed.len(),
+        claude_turns: turns.iter().filter(|t| t.agent == "claude").count(),
+        copilot_turns: turns.iter().filter(|t| t.agent == "copilot").count(),
+    };
+    Ok(PromptsReport {
+        schema: SCHEMA,
+        root: root_label.to_string(),
+        base: base_label,
+        turns,
+        attributed: attribution.by_file,
+        unattributed: attribution.unattributed,
+        sources,
+        counts,
+    })
+}
+
+// Append the collected requests to `.ccc/prompts.jsonl`, and make sure git is
+// not about to commit them: prompt text is the user's own words, and `.ccc/`
+// is a tracked directory in most projects
+// ccc:skip
+fn record(root: &Path, turns: &[Turn]) -> Result<()> {
+    use std::io::Write;
+
+    let dir = root.join(".ccc");
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let ledger = dir.join(LEDGER_NAME);
+
+    // only append what is not already there, so repeated runs stay idempotent
+    let existing: BTreeSet<String> = fs::read_to_string(&ledger)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+        .collect();
+
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&ledger)
+        .with_context(|| format!("opening {}", ledger.display()))?;
+    for t in turns.iter().filter(|t| !existing.contains(&t.id)) {
+        writeln!(f, "{}", serde_json::to_string(t)?)?;
+    }
+    ignore_ledger(root)
+}
+
+// ccc:skip
+fn ignore_ledger(root: &Path) -> Result<()> {
+    ignore_path(
+        root,
+        &format!("/.ccc/{LEDGER_NAME}"),
+        "prompt text recorded by `ccc prompts --record`",
+    )
+}
+
+// add `entry` to `.gitignore` under a `# why` line if it is not already covered
+// ccc:skip
+pub(crate) fn ignore_path(root: &Path, entry: &str, why: &str) -> Result<()> {
+    use std::io::Write;
+
+    let path = root.join(".gitignore");
+    let current = fs::read_to_string(&path).unwrap_or_default();
+    if current.lines().any(|l| l.trim() == entry) {
+        return Ok(());
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let lead = if current.is_empty() || current.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    writeln!(f, "{lead}\n# {why}\n{entry}")?;
+    eprintln!("ccc: added {entry} to .gitignore so it stays out of git");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a throwaway directory that cleans up on drop
+    mod tempdir {
+        pub struct Dir(std::path::PathBuf);
+        impl Dir {
+            pub fn new(tag: &str) -> Dir {
+                let p = std::env::temp_dir().join(format!("ccc-{tag}-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::create_dir_all(&p).unwrap();
+                Dir(p)
+            }
+            pub fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    fn write(dir: &Path, name: &str, lines: &[Value]) -> PathBuf {
+        let p = dir.join(name);
+        let body: String = lines
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        fs::create_dir_all(dir).unwrap();
+        fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn user(uuid: &str, parent: Option<&str>, ts: &str, text: Value) -> Value {
+        serde_json::json!({
+            "type": "user", "uuid": uuid, "parentUuid": parent, "timestamp": ts,
+            "cwd": "/proj", "gitBranch": "feature",
+            "message": {"content": text},
+        })
+    }
+
+    fn assistant(uuid: &str, parent: &str, ts: &str, blocks: Value) -> Value {
+        serde_json::json!({
+            "type": "assistant", "uuid": uuid, "parentUuid": parent, "timestamp": ts,
+            "cwd": "/proj",
+            "message": {"content": blocks},
+        })
+    }
+
+    fn assistant_with_model(uuid: &str, parent: &str, ts: &str, model: &str, blocks: Value) -> Value {
+        serde_json::json!({
+            "type": "assistant", "uuid": uuid, "parentUuid": parent, "timestamp": ts,
+            "cwd": "/proj",
+            "message": {"model": model, "content": blocks},
+        })
+    }
+
+    fn tool_use(name: &str, input: Value) -> Value {
+        serde_json::json!({"type": "tool_use", "id": "t1", "name": name, "input": input})
+    }
+
+    #[test]
+    fn an_edit_is_credited_to_the_request_that_led_to_it_across_a_tool_result_gap() {
+        let dir = tempdir::Dir::new("prompt-walk");
+        let root = Path::new("/proj");
+        let file = write(
+            dir.path(),
+            "s1.jsonl",
+            &[
+                user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("add a retry to charge")),
+                assistant("a1", "u1", "2026-08-20T10:00:01Z", serde_json::json!([
+                    tool_use("Read", serde_json::json!({"file_path": "/proj/src/pay.rs"}))
+                ])),
+                // the harness answering the model sits between the request and the edit
+                user("r1", Some("a1"), "2026-08-20T10:00:02Z", serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ])),
+                assistant("a2", "r1", "2026-08-20T10:00:03Z", serde_json::json!([
+                    tool_use("Edit", serde_json::json!({
+                        "file_path": "/proj/src/pay.rs",
+                        "new_string": "    let mut attempts = 0; // retry the charge",
+                    }))
+                ])),
+            ],
+        );
+        let turns = parse_claude(&file, root);
+        assert_eq!(turns.len(), 1, "one request, not one per assistant record");
+        assert_eq!(turns[0].prompt, "add a retry to charge");
+        assert_eq!(turns[0].branch.as_deref(), Some("feature"));
+        assert_eq!(turns[0].edits.len(), 1);
+        assert_eq!(turns[0].edits[0].path, "src/pay.rs", "paths are repo-relative");
+        assert_eq!(turns[0].edits[0].tool, "Edit");
+        assert!(turns[0].edits[0].anchor.is_some());
+    }
+
+    #[test]
+    fn a_turn_carries_the_model_that_answered_it_even_with_no_edit() {
+        let dir = tempdir::Dir::new("prompt-model");
+        let file = write(
+            dir.path(),
+            "s1.jsonl",
+            &[
+                user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("what does serve do?")),
+                assistant_with_model(
+                    "a1", "u1", "2026-08-20T10:00:01Z", "claude-sonnet-5",
+                    serde_json::json!([{"type": "text", "text": "it runs the http server"}]),
+                ),
+            ],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].edits.is_empty(), "a question is still an answer");
+        assert_eq!(turns[0].model.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn multi_edit_keeps_one_turn_edit_per_sub_edit_rather_than_one_collapsed_anchor() {
+        let dir = tempdir::Dir::new("prompt-multiedit");
+        let file = write(
+            dir.path(),
+            "s1.jsonl",
+            &[
+                user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("rename both helpers")),
+                assistant("a1", "u1", "2026-08-20T10:00:01Z", serde_json::json!([
+                    tool_use("MultiEdit", serde_json::json!({
+                        "file_path": "/proj/src/lib.rs",
+                        "edits": [
+                            {"old_string": "fn old_a() {}", "new_string": "fn renamed_a() { /* first hunk */ }"},
+                            {"old_string": "fn old_b() {}", "new_string": "fn renamed_b() { /* second hunk */ }"},
+                        ],
+                    }))
+                ])),
+            ],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].edits.len(), 2, "one TurnEdit per sub-edit, not one collapsed anchor: {:#?}", turns[0].edits);
+        let anchors: Vec<&str> = turns[0].edits.iter().filter_map(|e| e.anchor.as_deref()).collect();
+        assert!(anchors.iter().any(|a| a.contains("renamed_a")));
+        assert!(anchors.iter().any(|a| a.contains("renamed_b")));
+        assert!(
+            turns[0].edits.iter().all(|e| e.proposed.is_some()),
+            "each sub-edit keeps the text it wrote, not just an anchor"
+        );
+    }
+
+    #[test]
+    fn harness_noise_is_never_reported_as_a_request() {
+        let dir = tempdir::Dir::new("prompt-noise");
+        let file = write(
+            dir.path(),
+            "s2.jsonl",
+            &[
+                // a slash command is an instruction to the harness, not a request
+                user("u1", None, "2026-08-20T10:00:00Z",
+                     serde_json::json!("<command-name>/clear</command-name>")),
+                // meta records are the harness talking to itself
+                serde_json::json!({
+                    "type": "user", "uuid": "u2", "parentUuid": null, "isMeta": true,
+                    "timestamp": "2026-08-20T10:00:01Z", "cwd": "/proj",
+                    "message": {"content": "caveat: this session is being continued"},
+                }),
+                // an injected reminder is stripped, the user's own words survive
+                user("u3", None, "2026-08-20T10:00:02Z", serde_json::json!([{
+                    "type": "text",
+                    "text": "<system-reminder>ignore me</system-reminder>rename the port field",
+                }])),
+            ],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        assert_eq!(turns.len(), 1, "only the real request survives: {turns:#?}");
+        assert_eq!(turns[0].prompt, "rename the port field");
+    }
+
+    #[test]
+    fn a_request_that_changed_nothing_is_still_reported() {
+        let dir = tempdir::Dir::new("prompt-noedit");
+        let file = write(
+            dir.path(),
+            "s3.jsonl",
+            &[user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("what does serve do?"))],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].edits.is_empty(), "a question is an answer too");
+    }
+
+    #[test]
+    fn copilots_patch_log_replays_into_the_requests_it_recorded() {
+        let dir = tempdir::Dir::new("prompt-copilot");
+        let file = write(
+            dir.path(),
+            "c1.jsonl",
+            &[
+                serde_json::json!({"kind": 0, "v": {"sessionId": "c1", "requests": []}}),
+                serde_json::json!({"kind": 2, "k": ["requests"], "v": [{
+                    "requestId": "r1", "timestamp": 1_787_000_000_000i64,
+                    "message": {"text": "extract this into a helper"},
+                }]}),
+                // an unrelated set must not clobber the request list
+                serde_json::json!({"kind": 1, "k": ["inputState", "inputText"], "v": "@workspace "}),
+                serde_json::json!({"kind": 2, "k": ["requests"], "v": [{
+                    "requestId": "r2", "timestamp": 1_787_000_060_000i64,
+                    "message": {"text": "now add a test for it"},
+                }]}),
+            ],
+        );
+        let turns = parse_copilot(&file);
+        assert_eq!(turns.len(), 2, "both appends replayed: {turns:#?}");
+        assert_eq!(turns[0].prompt, "extract this into a helper");
+        assert_eq!(turns[1].prompt, "now add a test for it");
+        assert_eq!(turns[0].agent, "copilot");
+        assert!(turns[0].edits.is_empty(), "copilot's log carries no edit payload");
+        assert!(turns[1].epoch > turns[0].epoch);
+    }
+
+    #[test]
+    fn session_scopes_to_one_conversation_and_self_reported_model_only_fills_that_ones_gaps() {
+        let dir = tempdir::Dir::new("prompt-session");
+        write(
+            dir.path(),
+            "s1.jsonl",
+            &[user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("first session's question"))],
+        );
+        write(
+            dir.path(),
+            "s2.jsonl",
+            &[user("u2", None, "2026-08-20T10:05:00Z", serde_json::json!("second session's question"))],
+        );
+
+        let mut turns: Vec<Turn> = jsonl_files(dir.path())
+            .iter()
+            .flat_map(|f| parse_claude(f, Path::new("/proj")))
+            .collect();
+        assert_eq!(turns.len(), 2, "both sessions present before filtering");
+
+        let opts = PromptsOptions {
+            session: Some("s1".into()),
+            model: Some("claude-sonnet-5".into()),
+            ..Default::default()
+        };
+        apply_session(&mut turns, &opts);
+        assert_eq!(turns.len(), 1, "only the named session survives");
+        assert_eq!(turns[0].prompt, "first session's question");
+        assert_eq!(
+            turns[0].model.as_deref(),
+            Some("claude-sonnet-5"),
+            "self-reported model fills a turn its own transcript did not name"
+        );
+    }
+
+    fn turn(id: &str, epoch: i64, edits: Vec<TurnEdit>) -> Turn {
+        Turn {
+            id: id.into(),
+            agent: "claude".into(),
+            session: "s".into(),
+            model: None,
+            ts: chrono::DateTime::from_timestamp(epoch, 0).unwrap().to_rfc3339(),
+            epoch,
+            branch: None,
+            prompt: format!("request {id}"),
+            edits,
+            changesets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn evidence_is_graded_from_the_text_still_being_there_down_to_mere_timing() {
+        let dir = tempdir::Dir::new("prompt-evidence");
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/pay.rs"),
+            "fn charge() {\n    let mut attempts = 0; // retry the charge\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/other.rs"), "fn other() {}\n").unwrap();
+
+        let turns = vec![
+            // wrote a line that is still in the file, inside a changed hunk
+            turn(
+                "match",
+                1000,
+                vec![TurnEdit {
+                    path: "src/pay.rs".into(),
+                    tool: "Edit".into(),
+                    anchor: Some("let mut attempts = 0; // retry the charge".into()),
+                    proposed: Some("    let mut attempts = 0; // retry the charge".into()),
+                }],
+            ),
+            // named a file whose text has since moved on
+            turn(
+                "named",
+                1100,
+                vec![TurnEdit {
+                    path: "src/other.rs".into(),
+                    tool: "Write".into(),
+                    anchor: Some("a line that is no longer present anywhere".into()),
+                    proposed: Some("a line that is no longer present anywhere".into()),
+                }],
+            ),
+            // named nothing; only its timing places it
+            turn("timing", 1200, vec![]),
+        ];
+        let hunks = BTreeMap::from([
+            ("src/pay.rs".to_string(), vec![(1usize, 3usize)]),
+            ("src/other.rs".to_string(), vec![(1, 1)]),
+            ("src/bash.rs".to_string(), vec![(1, 5)]),
+            ("src/hand.rs".to_string(), vec![(1, 2)]),
+        ]);
+        let times = BTreeMap::from([
+            ("src/bash.rs".to_string(), 1250i64),
+            // written days after the last request, so nothing explains it
+            ("src/hand.rs".to_string(), 1200 + MAX_TEMPORAL_GAP_SECS + 60),
+        ]);
+
+        let got = attribute(root, &turns, &hunks, &times);
+
+        let ev = |p: &str| got.by_file.get(p).map(|r| r[0].evidence.clone());
+        assert_eq!(ev("src/pay.rs").as_deref(), Some("content-match"));
+        assert_eq!(ev("src/other.rs").as_deref(), Some("tool-edit"));
+        assert_eq!(ev("src/bash.rs").as_deref(), Some("temporal"));
+        assert_eq!(
+            got.by_file["src/bash.rs"][0].turn, "timing",
+            "the request in flight when the write happened"
+        );
+        // a content match pins the reference to the hunk it landed in, so a
+        // function join can tell which part of the file it explains
+        assert_eq!(got.by_file["src/pay.rs"][0].lines, Some([1, 3]));
+        assert!(got.by_file["src/other.rs"][0].lines.is_none());
+        // content-match carries proposed-vs-agreed; nothing else can honestly
+        let pay = &got.by_file["src/pay.rs"][0];
+        assert_eq!(pay.proposed.as_deref(), Some("    let mut attempts = 0; // retry the charge"));
+        assert_eq!(
+            pay.agreed, pay.proposed,
+            "the file matches what was proposed - no drift to show"
+        );
+        assert!(got.by_file["src/other.rs"][0].proposed.is_none(), "tool-edit cannot pin a span to compare");
+        assert!(got.by_file["src/other.rs"][0].agreed.is_none());
+        assert_eq!(
+            got.unattributed,
+            vec!["src/hand.rs".to_string()],
+            "a change nothing explains is reported, not guessed at"
+        );
+    }
+
+    #[test]
+    fn a_file_wide_reference_covers_every_span_and_a_pinned_one_does_not() {
+        let wide = PromptRef {
+            turn: "t".into(),
+            agent: "claude".into(),
+            ts: "".into(),
+            prompt: "".into(),
+            evidence: "tool-edit".into(),
+            lines: None,
+            proposed: None,
+            agreed: None,
+        };
+        assert!(wide.covers(1, 1) && wide.covers(900, 1000));
+        let pinned = PromptRef {
+            lines: Some([10, 20]),
+            ..wide
+        };
+        assert!(pinned.covers(15, 30), "overlap at the top");
+        assert!(pinned.covers(1, 12), "overlap at the bottom");
+        assert!(!pinned.covers(21, 40), "past the end");
+        assert!(!pinned.covers(1, 9), "before the start");
+    }
+
+    #[test]
+    fn the_slug_flattens_the_path_the_way_claude_writes_it() {
+        assert_eq!(
+            claude_slug(Path::new("/home/a/Work/codecache")),
+            "-home-a-Work-codecache"
+        );
+        // a dot in a directory name is flattened too, which is why discovery
+        // confirms against the `cwd` the transcript records
+        assert_eq!(
+            claude_slug(Path::new("/home/a/cloudphage.org")),
+            "-home-a-cloudphage-org"
+        );
+    }
+
+    #[test]
+    fn a_long_request_is_condensed_rather_than_carried_whole() {
+        let long = "line one\n\n".to_string() + &"x".repeat(PROMPT_CAP * 2);
+        let got = condense(&long);
+        assert!(got.chars().count() <= PROMPT_CAP + 1, "capped: {}", got.chars().count());
+        assert!(got.starts_with("line one"), "the opening survives: {got}");
+        assert!(got.ends_with('…'), "and the cut is visible: {got}");
+    }
+
+    #[test]
+    fn a_ccc_edit_is_credited_through_the_ledger_of_what_it_applied() {
+        let dir = tempdir::Dir::new("prompt-ccc-edit");
+        let root = dir.path();
+        let ledger = root.join(".ccc").join(crate::edit::LEDGER_NAME);
+        fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let entry = serde_json::json!({
+            "id": "c3-abc", "ts": "2026-08-20T10:00:02Z", "ops": ["rename `charge` -> `settle` (r1)"],
+            "files": [{"path": "src/pay.rs", "written": "pub fn settle(amount: u64) -> u64 {"}],
+        });
+        fs::write(&ledger, format!("{entry}\n")).unwrap();
+        let ts = "2026-08-20T10:00:00Z";
+        let file = write(
+            &root.join("transcripts"),
+            "s1.jsonl",
+            &[
+                user("u1", None, ts, serde_json::json!("rename charge to settle")),
+                // staged and applied in one call - the handle in the input says nothing about the text
+                assistant("a1", "u1", ts, serde_json::json!([{
+                    "type": "tool_use", "id": "t9", "name": "mcp__ccc__edit_rename",
+                    "input": {"result": "r1", "to": "settle", "apply": true},
+                }])),
+                user("r1", Some("a1"), ts, serde_json::json!([{
+                    "type": "tool_result", "tool_use_id": "t9",
+                    "content": [{"type": "text", "text": "# edit_apply - applied changeset `c3-abc`\n1 file(s) written"}],
+                }])),
+            ],
+        );
+        let turns = parse_claude(&file, root);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].edits.len(), 1, "{:?}", turns[0].edits);
+        assert_eq!(turns[0].edits[0].path, "src/pay.rs");
+        assert_eq!(turns[0].edits[0].tool, "edit_rename");
+        assert!(turns[0].edits[0].anchor.is_some(), "the written text pins the edit like an `Edit` would");
+
+        // reverted since - the request no longer explains that file
+        let mut f = fs::OpenOptions::new().append(true).open(&ledger).unwrap();
+        use std::io::Write;
+        writeln!(f, "{}", serde_json::json!({"id": "c3-abc", "reverted": true})).unwrap();
+        assert!(parse_claude(&file, root)[0].edits.is_empty());
+    }
+
+    // ccc reached through a shell answers with its changeset all the same, and
+    // the ask is credited with it; prose that only looks like one is not one
+    #[test]
+    fn a_changeset_ccc_reported_through_any_tool_is_credited() {
+        let dir = tempdir::Dir::new("prompt-shell-ccc");
+        let root = dir.path();
+        let ts = "2026-08-20T10:00:00Z";
+        let file = write(
+            &root.join("transcripts"),
+            "s1.jsonl",
+            &[
+                user("u1", None, ts, serde_json::json!("tidy the parser")),
+                assistant("a1", "u1", ts, serde_json::json!([{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ccc.py edit_text"}}])),
+                user("r1", Some("a1"), ts, serde_json::json!([{
+                    "type": "tool_result", "tool_use_id": "t1",
+                    "content": "# edit_text src/a.rs (1 replacement(s)) -> changeset `c7-mck1` (staged, nothing written yet)",
+                }])),
+                assistant("a2", "u1", ts, serde_json::json!([{"type": "tool_use", "id": "t2", "name": "Read", "input": {}}])),
+                user("r2", Some("a2"), ts, serde_json::json!([{
+                    "type": "tool_result", "tool_use_id": "t2",
+                    "content": "let id = id_after(&out, \"changeset `\"); the changeset `release-notes` waits",
+                }])),
+            ],
+        );
+        let turns = parse_claude(&file, root);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].changesets, ["c7-mck1"]);
+    }
+}

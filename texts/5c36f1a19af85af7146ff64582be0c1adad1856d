@@ -1,0 +1,124 @@
+//! What agents read with their own tools - a `Read`, a `cat` or a `sed -n` in
+//! a shell - taken from their transcripts as they are written. ccc's read tools
+//! put their looks on the timeline as they answer; these are the rest, so the
+//! visualiser shows an agent inspecting code whichever way it looked.
+//!
+//! Claude Code's transcripts only, a session's subagents with it: Copilot's
+//! chat log keeps no record of the files its tools read.
+
+use crate::model::FileCache;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+
+// transcripts are looked for again this often - a new session, a subagent
+const FOUND_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+// and this often when claude keeps no directory for the project, where
+// finding them means opening every other project's
+const FOUND_SLOW: std::time::Duration = std::time::Duration::from_secs(600);
+// the sites one read names past the file itself
+const READ_SITES: usize = 59;
+
+// commands that read the files they name and write none
+const READERS: &[&str] = &[
+    "cat", "head", "tail", "sed", "awk", "nl", "less", "more", "bat", "batcat", "view", "grep", "egrep", "fgrep", "rg", "ag",
+    "wc", "cut", "sort", "uniq", "diff", "strings", "xxd", "od", "jq",
+];
+// readers whose first word is a pattern or a script rather than a file
+const PATTERNED: &[&str] = &["sed", "awk", "grep", "egrep", "fgrep", "rg", "ag", "jq"];
+// words ahead of a command that only change how it runs
+const WRAPPERS: &[&str] = &["sudo", "env", "time", "command", "nohup", "exec", "nice"];
+
+// One file an agent read with its own tools.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Read {
+    pub at_ms: u64,
+    pub session: String,
+    // the tool call it was, so it is put down once
+    pub call: String,
+    // Read, NotebookRead, Grep, Bash
+    pub tool: String,
+    // project-relative
+    pub path: String,
+    // 1-based and inclusive, ending at `usize::MAX` for the rest of the file -
+    // none for the whole of it
+    pub lines: Option<(usize, usize)>,
+}
+
+impl Read {
+    // the file and the lines read, as the timeline labels it
+    pub fn what(&self) -> String {
+        match self.lines {
+            None => self.path.clone(),
+            Some((a, b)) if a == b => format!("{}:{a}", self.path),
+            Some((a, usize::MAX)) => format!("{}:{a}-", self.path),
+            Some((a, b)) => format!("{}:{a}-{b}", self.path),
+        }
+    }
+
+    // Where on the map it was read, as (file, line - none for the file, main):
+    // the one function the lines lie in, else the file and each function they
+    // cross.
+    pub fn sites(&self, caches: &[FileCache]) -> Vec<(String, usize, bool)> {
+        let whole = vec![(self.path.clone(), 0, true)];
+        let cache = caches.iter().find(|c| crate::changes::path_str(&c.rel_path) == self.path);
+        let (Some((from, to)), Some(c)) = (self.lines, cache) else {
+            return whole;
+        };
+        let holding = c
+            .funcs
+            .iter()
+            .filter(|f| f.start_line <= from && to <= f.end_line)
+            .min_by_key(|f| f.end_line - f.start_line);
+        if let Some(f) = holding {
+            return vec![(self.path.clone(), f.line, true)];
+        }
+        let crossed = c.funcs.iter().filter(|f| f.start_line <= to && from <= f.end_line);
+        whole.into_iter().chain(crossed.take(READ_SITES).map(|f| (self.path.clone(), f.line, false))).collect()
+    }
+}
+
+// The transcripts of this project's agents, each read as far as it was last.
+#[derive(Default)]
+pub struct Reads {
+    // when the transcripts were last looked for
+    found: Option<std::time::Instant>,
+    // each, and the bytes of it read so far
+    read: BTreeMap<PathBuf, u64>,
+}
+
+impl Reads {
+    // The reads agents made since the last call, oldest first.
+    pub fn fresh(&mut self, root: &Path) -> Vec<Read> {
+        let quick = crate::prompts::claude_root().is_some_and(|b| b.join(crate::prompts::claude_slug(root)).is_dir());
+        let every = if quick { FOUND_EVERY } else { FOUND_SLOW };
+        if self.found.is_none_or(|t| t.elapsed() >= every) {
+            let found = transcripts(root);
+            self.found_now(found);
+        }
+        self.tail(root)
+    }
+
+    // What a transcript held when it was first found is history; one begun
+    // since is news from its first line.
+    fn found_now(&mut self, found: Vec<PathBuf>) {
+        let first = self.found.is_none();
+        self.read.retain(|f, _| found.contains(f));
+        for f in found {
+            let from = if first { std::fs::metadata(&f).map_or(0, |m| m.len()) } else { 0 };
+            self.read.entry(f).or_insert(from);
+        }
+        self.found = Some(std::time::Instant::now());
+    }
+
+    fn tail(&mut self, root: &Path) -> Vec<Read> {
+        let mut out = Vec::new();
+        for (f, from) in self.read.iter_mut() {
+            let (records, end) = tail(f, *from);
+            *from = end;
+            out.extend(records.iter().flat_map(|r| reads_of(r, root)));
+        }
+        out.sort_by_key(|r| r.at_ms);
+        out
+    }
+}

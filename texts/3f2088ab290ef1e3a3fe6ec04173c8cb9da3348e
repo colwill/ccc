@@ -1,0 +1,2918 @@
+//! The architecture visualiser behind `ccc run --vis`.
+//!
+//! Like the rest of ccc this reads syntax, not behaviour: an edge is a call the
+//! resolver found evidence for, and a branch is a node in the tree, not a path
+//! anything has been seen to take.
+
+use crate::changes;
+use crate::contracts::ContractIndex;
+use crate::edit;
+use crate::externals::norm_key;
+use crate::extract::{self, loop_label};
+use crate::insights;
+use crate::languages::Language;
+use crate::model::{Boundary, FileCache, Func};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::Arc;
+use tree_sitter::{Node, Parser};
+
+pub const SCHEMA: &str = "ccc-vis/v1";
+
+// files no service glob claims still need a box to sit in
+const UNASSIGNED: &str = "(unassigned)";
+// symbols named on one edge, and call sites kept for its detail panel
+const EDGE_SYMBOLS: usize = 8;
+const EDGE_SITES: usize = 12;
+// stand-ins for functions outside a component, so a hub file called from
+// everywhere cannot drown its own code view
+const MAX_PROXIES: usize = 120;
+// callers listed on a flow's entry node
+const MAX_CALLERS: usize = 16;
+// a generated thousand-line function must not become an unbounded graph
+const MAX_STEPS: usize = 600;
+// flow constructs nested deeper than this are cut, and so is a syntax tree
+// deeper than `MAX_TREE_DEPTH`, which only generated code reaches
+const MAX_NESTING: usize = 32;
+const MAX_TREE_DEPTH: usize = 400;
+// characters kept from text read off the source
+const LABEL_CHARS: usize = 56;
+const ARG_CHARS: usize = 28;
+const MAX_ARGS: usize = 6;
+// what a timeline event carries of a step: files listed, and diff lines per file
+const EVENT_FILES: usize = 60;
+const EVENT_DIFF_LINES: usize = 400;
+// the sites of a read tool's answer a look marks
+const LOOK_SITES: usize = 60;
+
+// one function in the call graph, copied out so the model owns its data
+struct FnNode {
+    file: String,
+    name: String,
+    owner: Option<String>,
+    line: usize,
+    start: usize,
+    end: usize,
+    ret: Option<String>,
+    param_types: Vec<String>,
+    params: usize,
+    complexity: usize,
+    score: u8,
+    branches: usize,
+    loops: usize,
+    recursive: bool,
+    test: bool,
+    // a file's top-level code rather than a function someone wrote
+    module: bool,
+    // nothing else calls it
+    entry: bool,
+    doc: Option<String>,
+    language: &'static str,
+}
+
+impl FnNode {
+    // a function as the extractor read it from some text, outside any graph
+    fn read(f: &Func, file: &str, lang: Language) -> FnNode {
+        FnNode {
+            file: file.to_string(),
+            name: f.name.clone(),
+            owner: f.owner.clone(),
+            line: f.line,
+            start: f.start_line,
+            end: f.end_line,
+            ret: f.ret.clone(),
+            param_types: f.param_types.clone(),
+            params: f.metrics.params,
+            complexity: f.metrics.complexity(),
+            score: f.metrics.complexity_score(),
+            branches: f.metrics.branches,
+            loops: f.metrics.loops.len(),
+            recursive: f.metrics.recursive,
+            test: f.test_ctx,
+            module: false,
+            entry: false,
+            doc: f.comment.clone(),
+            language: lang.as_str(),
+        }
+    }
+
+    fn json(&self, id: usize) -> Value {
+        json!({
+            "id": id,
+            "name": self.name,
+            "owner": self.owner,
+            "file": self.file,
+            "line": self.line,
+            "start": self.start,
+            "end": self.end,
+            "ret": self.ret,
+            "params": self.params,
+            "param_types": self.param_types,
+            "complexity": self.complexity,
+            "score": self.score,
+            "branches": self.branches,
+            "loops": self.loops,
+            "recursive": self.recursive,
+            "test": self.test,
+            "module": self.module,
+            "entry": self.entry,
+            "doc": self.doc,
+            "language": self.language,
+        })
+    }
+
+    // enough to draw a stand-in and follow it
+    fn brief(&self, id: usize) -> Value {
+        json!({
+            "id": id,
+            "name": self.name,
+            "owner": self.owner,
+            "file": self.file,
+            "line": self.line,
+            "module": self.module,
+        })
+    }
+}
+
+// The visualiser's view of one map generation, built once and sliced per
+// request: the overview whole, the code and flow levels on demand.
+pub struct Model {
+    // shared, so a timeline snapshot of this generation costs a pointer
+    overview: Arc<Value>,
+    funcs: Vec<FnNode>,
+    // per function, what it calls and the line of the first call there, in
+    // source order - the order a node's outputs are drawn in
+    out: Vec<Vec<(usize, usize)>>,
+    into: Vec<Vec<usize>>,
+    // every mapped file, with the functions defined in it
+    by_file: BTreeMap<String, Vec<usize>>,
+    container_of: BTreeMap<String, String>,
+}
+
+impl Model {
+    pub fn build(
+        caches: &[FileCache],
+        root: &Path,
+        root_label: &str,
+        generated: &str,
+        contracts: &ContractIndex,
+    ) -> Model {
+        let g = insights::build_graph(caches, contracts);
+        let ctx = insights::service_ctx(&g, root, contracts);
+        let n = g.nodes.len();
+
+        // where each call sits, so a function's outputs read in source order
+        let mut sites: BTreeMap<(usize, &str, &str), Vec<usize>> = BTreeMap::new();
+        for (fi, c) in caches.iter().enumerate() {
+            for call in &c.calls {
+                sites
+                    .entry((fi, call.caller.as_str(), call.name.as_str()))
+                    .or_default()
+                    .push(call.line);
+            }
+        }
+        let funcs: Vec<FnNode> = (0..n)
+            .map(|i| {
+                let f = g.func(i);
+                FnNode {
+                    file: g.file(i),
+                    name: f.name.clone(),
+                    owner: f.owner.clone(),
+                    line: f.line,
+                    start: f.start_line,
+                    end: f.end_line,
+                    ret: f.ret.clone(),
+                    param_types: f.param_types.clone(),
+                    params: f.metrics.params,
+                    complexity: f.metrics.complexity(),
+                    score: f.metrics.complexity_score(),
+                    branches: f.metrics.branches,
+                    loops: f.metrics.loops.len(),
+                    recursive: f.metrics.recursive,
+                    test: g.is_test(i),
+                    module: g.is_module(i),
+                    entry: g.is_root(i),
+                    doc: f.comment.clone(),
+                    language: g.lang(i).as_str(),
+                }
+            })
+            .collect();
+        let out: Vec<Vec<(usize, usize)>> = (0..n)
+            .map(|i| {
+                let f = g.func(i);
+                let mut calls: Vec<(usize, usize)> = g.out[i]
+                    .iter()
+                    .filter(|&&t| t != i)
+                    .map(|&t| {
+                        let line = sites
+                            .get(&(g.node_file(i), f.name.as_str(), g.name(t)))
+                            .and_then(|ls| {
+                                ls.iter()
+                                    .copied()
+                                    .filter(|&l| l >= f.start_line && l <= f.end_line)
+                                    .min()
+                            })
+                            .unwrap_or(f.line);
+                        (t, line)
+                    })
+                    .collect();
+                calls.sort_by_key(|&(t, line)| (line, t));
+                calls
+            })
+            .collect();
+        let into: Vec<Vec<usize>> = (0..n)
+            .map(|i| g.into[i].iter().copied().filter(|&c| c != i).collect())
+            .collect();
+
+        let paths: Vec<String> = caches.iter().map(|c| changes::path_str(&c.rel_path)).collect();
+        let container_of: Vec<String> = (0..caches.len())
+            .map(|fi| {
+                ctx.of_file
+                    .get(fi)
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_else(|| UNASSIGNED.to_string())
+            })
+            .collect();
+        let mut by_file: BTreeMap<String, Vec<usize>> =
+            paths.iter().map(|p| (p.clone(), Vec::new())).collect();
+        for (i, f) in funcs.iter().enumerate() {
+            if let Some(ids) = by_file.get_mut(&f.file) {
+                ids.push(i);
+            }
+        }
+
+        let overview = json!({
+            "schema": SCHEMA,
+            "root": root_label,
+            // for `vscode://file/...` links; the page is served on loopback only
+            "root_path": root.to_string_lossy().replace('\\', "/"),
+            "generated": generated,
+            "system": system(caches, &out, root_label, &ctx.source),
+            "containers": containers(&g, &ctx, caches, &paths, &container_of),
+            "container_edges": container_edges(&insights::services(&g, &ctx)),
+            "peers": ctx.externals.iter().map(|e| e.json()).collect::<Vec<_>>(),
+            "outside": outside(&ctx, caches, &container_of),
+            "components": components(caches, &paths, &container_of, &by_file, &funcs),
+            "component_edges": component_edges(&g, &out, &paths),
+            "note": "read off the syntax tree: an edge is a call the resolver found \
+                     evidence for, a branch is a node in the tree - not a profile of \
+                     what runs.",
+        });
+        Model {
+            overview: Arc::new(overview),
+            funcs,
+            out,
+            into,
+            by_file,
+            container_of: paths.into_iter().zip(container_of).collect(),
+        }
+    }
+
+    // the system, container and component levels, drawn from the whole map
+    pub fn overview(&self) -> &Value {
+        &self.overview
+    }
+
+    // The code inside one component: every function defined in the file, with
+    // the calls between them, plus a stand-in for each function outside it
+    // that one of them calls or is called by.
+    pub fn code(&self, caches: &[FileCache], file: &str) -> Result<Value, String> {
+        let path = file.trim().trim_start_matches("./");
+        let ids = self
+            .by_file
+            .get(path)
+            .ok_or_else(|| format!("no file `{path}` in the map"))?;
+        let cache = caches.iter().find(|c| changes::path_str(&c.rel_path) == path);
+        let mine: BTreeSet<usize> = ids.iter().copied().collect();
+        // what this code calls is drawn first; its callers fill what is left
+        let mut proxies: Vec<usize> = Vec::new();
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        for &i in ids {
+            for &(t, _) in &self.out[i] {
+                if !mine.contains(&t) && seen.insert(t) {
+                    proxies.push(t);
+                }
+            }
+        }
+        for &i in ids {
+            for &c in &self.into[i] {
+                if !mine.contains(&c) && seen.insert(c) {
+                    proxies.push(c);
+                }
+            }
+        }
+        let truncated = proxies.len() > MAX_PROXIES;
+        proxies.truncate(MAX_PROXIES);
+        let shown: BTreeSet<usize> = mine.iter().chain(proxies.iter()).copied().collect();
+
+        let functions: Vec<Value> = ids
+            .iter()
+            .map(|&i| {
+                let mut v = self.funcs[i].json(i);
+                v["calls"] = json!(self.out[i]
+                    .iter()
+                    .filter(|(t, _)| shown.contains(t))
+                    .map(|&(t, line)| json!({"to": t, "line": line}))
+                    .collect::<Vec<_>>());
+                v["callers"] = json!(self.into[i]
+                    .iter()
+                    .filter(|c| shown.contains(c))
+                    .collect::<Vec<_>>());
+                v["calls_total"] = json!(self.out[i].len());
+                v["callers_total"] = json!(self.into[i].len());
+                v
+            })
+            .collect();
+        let proxies: Vec<Value> = proxies
+            .iter()
+            .map(|&p| {
+                let f = &self.funcs[p];
+                let mut v = f.brief(p);
+                v["container"] = json!(self.container_of.get(&f.file));
+                v["language"] = json!(f.language);
+                v
+            })
+            .collect();
+        Ok(json!({
+            "schema": SCHEMA,
+            "file": path,
+            "language": cache.map(|c| c.language.as_str()),
+            "container": self.container_of.get(path),
+            "lines": cache.map(|c| c.lines),
+            "functions": functions,
+            "types": cache
+                .map(|c| {
+                    c.types
+                        .iter()
+                        .map(|t| json!({"name": t.name, "kind": t.kind, "line": t.line}))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            "proxies": proxies,
+            "proxies_truncated": truncated,
+        }))
+    }
+
+    // The logic of one function as a node graph. The file is parsed again on
+    // request rather than held: the outline is only wanted for the function
+    // somebody opened, and the source is the one thing the map does not keep.
+    pub fn flow(
+        &self,
+        caches: &[FileCache],
+        root: &Path,
+        file: &str,
+        line: usize,
+        name: Option<&str>,
+    ) -> Result<Value, String> {
+        let path = file.trim().trim_start_matches("./");
+        let ids = self
+            .by_file
+            .get(path)
+            .ok_or_else(|| format!("no file `{path}` in the map"))?;
+        let on_line: Vec<usize> = ids.iter().copied().filter(|&i| self.funcs[i].line == line).collect();
+        let id = on_line
+            .iter()
+            .copied()
+            .find(|&i| name.is_some_and(|n| self.funcs[i].name == n))
+            .or_else(|| on_line.iter().copied().find(|&i| !self.funcs[i].module))
+            .or_else(|| on_line.first().copied())
+            // an address taken down before the file changed - the function
+            // of that name nearest where it was
+            .or_else(|| {
+                let name = name?;
+                ids.iter()
+                    .copied()
+                    .filter(|&i| !self.funcs[i].module && self.funcs[i].name == name)
+                    .min_by_key(|&i| self.funcs[i].line.abs_diff(line))
+            })
+            .ok_or_else(|| format!("nothing is defined on line {line} of `{path}`"))?;
+        let f = &self.funcs[id];
+        let lang = caches
+            .iter()
+            .find(|c| changes::path_str(&c.rel_path) == path)
+            .map(|c| c.language)
+            .ok_or_else(|| format!("no file `{path}` in the map"))?;
+        let src = std::fs::read_to_string(root.join(path)).map_err(|e| format!("reading {path}: {e}"))?;
+        self.draw(
+            path,
+            lang,
+            &src,
+            Target { id: Some(id), start: f.start, end: f.end, module: f.module, function: f.json(id) },
+        )
+    }
+
+    // A function as one side of an edit step wrote it - drawn from the text
+    // the step carried rather than the disk, which may hold the other side.
+    // The map lends it its calls and callers where it holds a function of the
+    // same name; one it has not seen yet is drawn with its calls unresolved.
+    pub fn flow_text(
+        &self,
+        caches: &[FileCache],
+        file: &str,
+        src: &str,
+        name: &str,
+        owner: Option<&str>,
+        span: (usize, usize),
+    ) -> Result<Value, String> {
+        let path = file.trim().trim_start_matches("./");
+        let lang = caches
+            .iter()
+            .find(|c| changes::path_str(&c.rel_path) == path)
+            .map(|c| c.language)
+            .or_else(|| Language::from_path(Path::new(path)))
+            .ok_or_else(|| format!("`{path}` is in no language ccc reads"))?;
+        let read = extract::extract(lang, src).ok_or_else(|| format!("`{path}` did not parse"))?;
+        let func = read
+            .funcs
+            .iter()
+            .find(|f| f.name == name && (f.start_line, f.end_line) == span)
+            .ok_or_else(|| format!("`{name}` is not defined at lines {}-{} of that text", span.0, span.1))?;
+        let id = self.by_file.get(path).and_then(|ids| {
+            ids.iter()
+                .copied()
+                .filter(|&i| {
+                    let f = &self.funcs[i];
+                    !f.module && f.name == name && f.owner.as_deref() == owner
+                })
+                .min_by_key(|&i| self.funcs[i].start.abs_diff(span.0))
+        });
+        let mut node = FnNode::read(func, path, lang);
+        node.entry = id.is_some_and(|i| self.funcs[i].entry);
+        let mut function = node.json(id.unwrap_or_default());
+        if id.is_none() {
+            function["id"] = Value::Null;
+        }
+        self.draw(path, lang, src, Target { id, start: span.0, end: span.1, module: false, function })
+    }
+
+    // a function's steps, walked from `src` - its calls resolved through the
+    // map when the map holds it
+    fn draw(&self, path: &str, lang: Language, src: &str, t: Target) -> Result<Value, String> {
+        let siblings: &[usize] = self.by_file.get(path).map_or(&[], Vec::as_slice);
+        let mut parser = Parser::new();
+        parser.set_language(&lang.ts_language()).map_err(|e| e.to_string())?;
+        let tree = parser.parse(src, None).ok_or_else(|| format!("`{path}` did not parse"))?;
+        // a module frame is the file's own top level
+        let node = if t.module {
+            Some(tree.root_node())
+        } else {
+            definition(tree.root_node(), lang, t.start, t.end)
+        }
+        .ok_or_else(|| {
+            format!(
+                "`{}` has moved since the map was built - the map refreshes within \
+                 seconds, so try again",
+                t.function["name"].as_str().unwrap_or_default()
+            )
+        })?;
+
+        let mut w = Walker {
+            lang,
+            src,
+            steps: 0,
+            truncated: false,
+            breaks_case: Vec::new(),
+            calls: t.id.map_or(&[], |i| self.out[i].as_slice()),
+            funcs: &self.funcs,
+            siblings,
+        };
+        let mut steps = Vec::new();
+        match node.child_by_field_name("body").filter(|_| !t.module) {
+            Some(body) => w.visit(body, 0, 0, &mut steps),
+            None => w.children(node, 0, 0, &mut steps),
+        }
+        let callers: &[usize] = t.id.map_or(&[], |i| self.into[i].as_slice());
+        Ok(json!({
+            "schema": SCHEMA,
+            "function": t.function,
+            "language": lang.as_str(),
+            "params": if t.module { Vec::new() } else { params(node, lang, src) },
+            "callers": callers
+                .iter()
+                .take(MAX_CALLERS)
+                .map(|&c| self.funcs[c].brief(c))
+                .collect::<Vec<_>>(),
+            "callers_total": callers.len(),
+            "steps": steps,
+            "step_count": w.steps,
+            "truncated": w.truncated,
+        }))
+    }
+
+    // One side of an edit step, drawn at the level it happened on. The map
+    // this is called on is the one that side belongs to: the map the step
+    // started from for `before`, the one it left - or, not written yet, the
+    // one it would leave - for `after`. A function's logic is drawn from the
+    // step's own text, so either side shows exactly what it held.
+    pub fn snapshot(
+        &self,
+        caches: &[FileCache],
+        step: &edit::Activity,
+        focus: &Focus,
+        after: bool,
+    ) -> Option<Arc<Value>> {
+        match focus {
+            Focus::Flow(t) => {
+                let (_, start, end) = if after { t.after } else { t.before }?;
+                let file = step.files.iter().find(|f| f.path == t.file)?;
+                let src = if after { file.after.as_deref() } else { file.before.as_deref() }?;
+                self.flow_text(caches, &t.file, src, &t.name, t.owner.as_deref(), (start, end))
+                    .ok()
+                    .map(Arc::new)
+            }
+            Focus::Code(file) => self.code(caches, file).ok().map(Arc::new),
+            Focus::Overview => Some(Arc::clone(&self.overview)),
+            Focus::Nowhere => None,
+        }
+    }
+}
+
+// which function `Model::draw` walks, and where it sits in the text
+struct Target {
+    id: Option<usize>,
+    start: usize,
+    end: usize,
+    module: bool,
+    function: Value,
+}
+
+// ------------------------------------------------------------- timeline
+
+// a function's name line, then the first and last lines of its span
+type Span = (usize, usize, usize);
+// a function on one side of a change: owner, name, and which of that name
+// it is counting from the top - how the same function pairs up across it
+type Key = (Option<String>, String, usize);
+
+// One function an edit step touched, as each side of the step defines it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Touched {
+    pub file: String,
+    pub name: String,
+    pub owner: Option<String>,
+    // added | modified | removed
+    pub change: &'static str,
+    pub before: Option<Span>,
+    pub after: Option<Span>,
+    // the lines the step moved on each side, kept inside the function; a
+    // side the function is missing from keeps where the change lands there
+    pub lines_before: Vec<(usize, usize)>,
+    pub lines_after: Vec<(usize, usize)>,
+    // only its layout moved - whitespace, a wrapped line - so nothing it does changed
+    pub whitespace: bool,
+}
+
+impl Touched {
+    fn json(&self) -> Value {
+        let span = |s: Option<Span>| s.map(|(line, start, end)| json!({"line": line, "start": start, "end": end}));
+        json!({
+            "file": self.file,
+            "name": self.name,
+            "owner": self.owner,
+            "change": self.change,
+            "before": span(self.before),
+            "after": span(self.after),
+            "lines_before": self.lines_before,
+            "lines_after": self.lines_after,
+            "whitespace": self.whitespace,
+        })
+    }
+
+    // does this function's span hold the other's, on a side both are on
+    fn holds(&self, other: &Touched) -> bool {
+        let inside = |a: Option<Span>, b: Option<Span>| match (a, b) {
+            (Some((_, s0, e0)), Some((_, s1, e1))) => (s0, e0) != (s1, e1) && s0 <= s1 && e1 <= e0,
+            _ => false,
+        };
+        self.file == other.file && (inside(self.after, other.after) || inside(self.before, other.before))
+    }
+}
+
+// Where on the diagram a step happened: inside one function, across one
+// file, or wider - the level a snapshot of the step is drawn at.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Focus {
+    Flow(Touched),
+    Code(String),
+    Overview,
+    // nothing the map draws - documentation, config
+    Nowhere,
+}
+
+impl Focus {
+    fn json(&self) -> Value {
+        match self {
+            Focus::Flow(t) => {
+                let mut v = t.json();
+                v["level"] = json!("flow");
+                v
+            }
+            Focus::Code(file) => json!({"level": "code", "file": file}),
+            Focus::Overview => json!({"level": "overview"}),
+            Focus::Nowhere => Value::Null,
+        }
+    }
+}
+
+// one step of an edit as the visualiser's timeline holds it
+pub struct Event {
+    pub json: Value,
+    pub focus: Focus,
+}
+
+// One step of an edit as the timeline shows it: every file it moved with its
+// diff, the functions in them it touched, and the level to look at it on.
+// `lang_of` names a file's language - none for a file the map does not read.
+pub fn event(
+    seq: u64,
+    at_ms: u64,
+    tool: &str,
+    step: &edit::Activity,
+    lang_of: impl Fn(&str) -> Option<Language>,
+) -> Event {
+    let mut files = Vec::new();
+    let mut funcs: Vec<Touched> = Vec::new();
+    // each file the map reads, and whether only its layout moved
+    let mut mapped: Vec<(&str, bool)> = Vec::new();
+    for fc in step.files.iter().take(EVENT_FILES) {
+        let (before, after) = (fc.before.as_deref(), fc.after.as_deref());
+        let layout = layout_only(before, after);
+        let hunks = edit::hunks(before, after);
+        let mut diff = edit::unified(&fc.path, before, after);
+        let cut = diff.len() > EVENT_DIFF_LINES;
+        diff.truncate(EVENT_DIFF_LINES);
+        files.push(json!({
+            "path": fc.path,
+            "change": match (before, after) {
+                (None, _) => "added",
+                (_, None) => "removed",
+                _ => "modified",
+            },
+            "added": hunks.iter().map(|h| h.after.1).sum::<usize>(),
+            "removed": hunks.iter().map(|h| h.before.1).sum::<usize>(),
+            "hunks": hunks
+                .iter()
+                .map(|h| json!({"before": [h.before.0, h.before.1], "after": [h.after.0, h.after.1]}))
+                .collect::<Vec<_>>(),
+            "diff": diff,
+            "diff_truncated": cut,
+            "whitespace": layout,
+        }));
+        if let Some(lang) = lang_of(&fc.path) {
+            mapped.push((&fc.path, layout));
+            funcs.extend(touched(lang, &fc.path, before, after));
+        }
+    }
+    // a step is seen where it changed what the code does - unless layout is
+    // all it changed
+    let all_layout = step.files.iter().all(|f| layout_only(f.before.as_deref(), f.after.as_deref()));
+    let real: Vec<&Touched> = funcs.iter().filter(|t| all_layout || !t.whitespace).collect();
+    let at: Vec<&str> = mapped.iter().filter(|(_, l)| all_layout || !l).map(|(p, _)| *p).collect();
+    // a change inside a nested function touches the one holding it too; the
+    // innermost is where it happened
+    let inner: Vec<&Touched> = real.iter().copied().filter(|t| !real.iter().any(|o| t.holds(o))).collect();
+    let focus = match (inner.as_slice(), at.as_slice()) {
+        ([one], _) => Focus::Flow((*one).clone()),
+        (_, [file]) => Focus::Code(file.to_string()),
+        (_, []) => Focus::Nowhere,
+        _ => Focus::Overview,
+    };
+    let json = json!({
+        "seq": seq,
+        "at": at_ms,
+        "tool": tool,
+        // a change made by hand has no changeset
+        "changeset": (!step.changeset.is_empty()).then_some(&step.changeset),
+        "status": step.status,
+        // who made it - an agent through the edit tools, or a person by hand
+        "by": if step.status == "edited" { "human" } else { "agent" },
+        // why, a terse line per staging call that gave one
+        "intent": step.intent,
+        // which side of the step the files hold now
+        "on_disk": if matches!(step.status, "applied" | "reverted" | "edited") { "after" } else { "before" },
+        "ops": step.ops,
+        "files": files,
+        "files_total": step.files.len(),
+        // nothing but layout moved - whitespace, wrapped lines
+        "whitespace": all_layout && !step.files.is_empty(),
+        "functions": funcs.iter().map(Touched::json).collect::<Vec<_>>(),
+        "focus": focus.json(),
+    });
+    Event { json, focus }
+}
+
+// The functions one file's change touched. Each side is read again with the
+// map's own extractor, so what it pairs up is what the diagram draws.
+pub fn touched(lang: Language, file: &str, before: Option<&str>, after: Option<&str>) -> Vec<Touched> {
+    let hunks = edit::hunks(before, after);
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+    let (was, now) = (defined(lang, before), defined(lang, after));
+    let keys: BTreeSet<&Key> = was.keys().chain(now.keys()).collect();
+    let overlaps = |r: (usize, usize), s: Span| r.0 <= s.2 && s.1 <= r.1;
+    // a range kept inside a span - or, on a side the function is missing
+    // from, kept as it is
+    let clip = |r: (usize, usize), s: Option<Span>| match s {
+        Some((_, lo, hi)) => (r.0.clamp(lo, hi), r.1.clamp(lo, hi)),
+        None => r,
+    };
+    let mut out: Vec<Touched> = Vec::new();
+    for key in keys {
+        let (b, a) = (was.get(key).copied(), now.get(key).copied());
+        // a run of lines touches a function when it moves lines inside it
+        let hits: Vec<&edit::Hunk> = hunks
+            .iter()
+            .filter(|h| {
+                b.is_some_and(|s| h.before.1 > 0 && overlaps(edit::Hunk::span(h.before), s))
+                    || a.is_some_and(|s| h.after.1 > 0 && overlaps(edit::Hunk::span(h.after), s))
+            })
+            .collect();
+        let change = match (b, a) {
+            (None, Some(_)) => "added",
+            (Some(_), None) => "removed",
+            _ if hits.is_empty() => continue,
+            _ => "modified",
+        };
+        let mut lines_before: Vec<(usize, usize)> =
+            hits.iter().map(|h| clip(edit::Hunk::span(h.before), b)).collect();
+        let mut lines_after: Vec<(usize, usize)> = hits.iter().map(|h| clip(edit::Hunk::span(h.after), a)).collect();
+        lines_before.dedup();
+        lines_after.dedup();
+        let whitespace = match (before, b, after, a) {
+            (Some(was), Some(sb), Some(now), Some(sa)) => without_layout(&lines_of(was, sb)) == without_layout(&lines_of(now, sa)),
+            _ => false,
+        };
+        out.push(Touched {
+            file: file.to_string(),
+            name: key.1.clone(),
+            owner: key.0.clone(),
+            change,
+            before: b,
+            after: a,
+            lines_before,
+            lines_after,
+            whitespace,
+        });
+    }
+    out.sort_by_key(|t| (t.after.or(t.before).map(|s| s.1), t.name.clone()));
+    out
+}
+
+// Text with its layout taken out - whitespace, and the trailing comma a
+// formatter adds when it wraps a list - so a reflowed function reads the same.
+fn without_layout(text: &str) -> String {
+    let mut out: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    for close in [")", "]", "}"] {
+        out = out.replace(&format!(",{close}"), close);
+    }
+    out
+}
+
+// the lines of `src` a function's span covers
+fn lines_of(src: &str, (_, start, end): Span) -> String {
+    src.lines()
+        .skip(start.saturating_sub(1))
+        .take((end + 1).saturating_sub(start))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// two sides of a file that differ only in layout
+fn layout_only(before: Option<&str>, after: Option<&str>) -> bool {
+    matches!((before, after), (Some(b), Some(a)) if without_layout(b) == without_layout(a))
+}
+
+// every function one text defines, keyed to pair up across a change
+fn defined(lang: Language, src: Option<&str>) -> BTreeMap<Key, Span> {
+    let Some(read) = src.and_then(|s| extract::extract(lang, s)) else {
+        return BTreeMap::new();
+    };
+    let mut seen: BTreeMap<(Option<String>, String), usize> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for f in read.funcs {
+        let n = seen.entry((f.owner.clone(), f.name.clone())).or_default();
+        out.insert((f.owner, f.name, *n), (f.line, f.start_line, f.end_line));
+        *n += 1;
+    }
+    out
+}
+
+// ------------------------------------------------------------- parts
+
+// a step that splits into more parts than this is shown whole - a rename
+// across the project, a file written end to end
+const MAX_PARTS: usize = 40;
+
+// One part of an edit step: the definition it adds, changes or removes, or
+// the imports or other code it moves - and where it sits among its step's parts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Part {
+    // function | type | const | imports | code | file
+    pub kind: &'static str,
+    pub name: Option<String>,
+    pub owner: Option<String>,
+    // added | modified | removed
+    pub change: &'static str,
+    pub index: usize,
+    pub of: usize,
+}
+
+impl Part {
+    pub fn json(&self) -> Value {
+        json!({
+            "kind": self.kind,
+            "name": self.name,
+            "owner": self.owner,
+            "change": self.change,
+            "index": self.index,
+            "of": self.of,
+        })
+    }
+}
+
+// An edit step as the parts it is made of, in the order they read best:
+// imports, then what it adds, then what it changes, then what it removes.
+// Each part's sides are the file as the parts before it left it and as it
+// leaves it, so replaying them in turn builds the step up one definition at
+// a time. A step that splits no further comes back whole.
+pub fn split(step: &edit::Activity, lang_of: impl Fn(&str) -> Option<Language>) -> Vec<(edit::Activity, Option<Part>)> {
+    let mut parts: Vec<(edit::FileText, Label)> = Vec::new();
+    for fc in &step.files {
+        let links = match (lang_of(&fc.path), fc.after.as_deref()) {
+            (Some(lang), Some(after)) => chain(lang, fc.before.as_deref(), after),
+            _ => None,
+        };
+        match links {
+            Some(links) => parts.extend(links.into_iter().map(|(before, after, label)| {
+                (edit::FileText { path: fc.path.clone(), before, after: Some(after) }, label)
+            })),
+            None => parts.push((fc.clone(), Label::file(fc))),
+        }
+    }
+    if parts.len() < 2 || parts.len() > MAX_PARTS {
+        return vec![(step.clone(), None)];
+    }
+    let of = parts.len();
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, (file, l))| {
+            let part = Part { kind: l.kind, name: l.name, owner: l.owner, change: l.change, index, of };
+            (edit::Activity { files: vec![file], ..step.clone() }, Some(part))
+        })
+        .collect()
+}
+
+// what a part is about, before it is numbered
+#[derive(Debug, Clone, PartialEq)]
+struct Label {
+    kind: &'static str,
+    owner: Option<String>,
+    name: Option<String>,
+    change: &'static str,
+}
+
+impl Label {
+    fn of(d: &Def, change: &'static str) -> Label {
+        Label { kind: d.kind, owner: d.owner.clone(), name: Some(d.name.clone()), change }
+    }
+
+    fn bare(kind: &'static str, change: &'static str) -> Label {
+        Label { kind, owner: None, name: None, change }
+    }
+
+    // a file taken whole - one the map does not read, or a change that will not split
+    fn file(fc: &edit::FileText) -> Label {
+        let change = match (&fc.before, &fc.after) {
+            (None, _) => "added",
+            (_, None) => "removed",
+            _ => "modified",
+        };
+        Label::bare("file", change)
+    }
+
+    // imports first, then what a step adds, changes and removes, then the rest
+    fn rank(&self) -> u8 {
+        match (self.kind, self.change) {
+            ("imports", _) => 0,
+            ("code", _) => 4,
+            (_, "added") => 1,
+            (_, "modified") => 2,
+            _ => 3,
+        }
+    }
+
+    // one part: every run of a definition's change, and all imports or other code together
+    fn joins(&self, o: &Label) -> bool {
+        self.kind == o.kind
+            && (matches!(self.kind, "imports" | "code") || (self.owner == o.owner && self.name == o.name && self.change == o.change))
+    }
+}
+
+// a definition one side of a change holds, and the lines it spans, 1-based
+struct Def {
+    kind: &'static str,
+    owner: Option<String>,
+    name: String,
+    start: usize,
+    end: usize,
+}
+
+// one side of a file's change, as the splitter reads it
+struct Side<'s> {
+    // each line with its ending, so the text comes back exactly
+    lines: Vec<&'s str>,
+    tree: Option<tree_sitter::Tree>,
+    defs: Vec<Def>,
+    imports: Vec<usize>,
+}
+
+impl<'s> Side<'s> {
+    fn read(lang: Language, src: &'s str) -> Side<'s> {
+        let mut parser = Parser::new();
+        let tree = parser.set_language(&lang.ts_language()).ok().and_then(|_| parser.parse(src, None));
+        let mut defs = Vec::new();
+        let mut imports = Vec::new();
+        // every definition, `ccc:skip` or not - a part is about the text
+        if let Some(read) = extract::extract_with(lang, src, false) {
+            let span = |line: usize| {
+                let node = tree.as_ref().and_then(|t| outer_at(t.root_node(), line.saturating_sub(1)));
+                node.map_or((line, line), |n| (n.start_position().row + 1, end_row(n) + 1))
+            };
+            for f in read.funcs {
+                defs.push(Def { kind: "function", owner: f.owner, name: f.name, start: f.start_line, end: f.end_line });
+            }
+            for t in read.types {
+                let (start, end) = span(t.line);
+                defs.push(Def { kind: "type", owner: None, name: t.name, start, end });
+            }
+            for c in read.consts {
+                let (start, end) = span(c.line);
+                defs.push(Def { kind: "const", owner: None, name: c.name, start, end });
+            }
+            imports = read.imports.iter().map(|i| i.line).collect();
+        }
+        Side { lines: src.split_inclusive('\n').collect(), tree, defs, imports }
+    }
+
+    // a line as the diff compared it, without its ending
+    fn text(&self, i: usize) -> &str {
+        let l = self.lines[i];
+        let l = l.strip_suffix('\n').unwrap_or(l);
+        l.strip_suffix('\r').unwrap_or(l)
+    }
+
+    // the innermost function holding every one of `rows` (0-based, end exclusive)
+    fn function_holding(&self, rows: (usize, usize)) -> Option<&Def> {
+        let (s, e) = (rows.0 + 1, rows.1);
+        self.defs
+            .iter()
+            .filter(|d| d.kind == "function" && d.start <= s && e <= d.end)
+            .min_by_key(|d| d.end - d.start)
+    }
+
+    // how many definitions `rows` cut through, rather than hold whole or sit inside
+    fn cuts(&self, rows: (usize, usize)) -> usize {
+        let (s, e) = (rows.0 + 1, rows.1);
+        let inside = |d: &&Def| (s <= d.start && d.end <= e) || (d.start <= s && e <= d.end);
+        self.defs.iter().filter(|d| d.start <= e && s <= d.end).filter(|d| !inside(d)).count()
+    }
+
+    // What `rows` are about: the outermost definition they hold whole, the
+    // imports among them, or else the definition they sit inside.
+    fn label(&self, rows: (usize, usize), change: &'static str) -> Label {
+        let (s, e) = (rows.0 + 1, rows.1);
+        let whole = self
+            .defs
+            .iter()
+            .filter(|d| s <= d.start && d.end <= e)
+            .max_by_key(|d| (d.end - d.start, std::cmp::Reverse(d.start)));
+        if let Some(d) = whole {
+            return Label::of(d, change);
+        }
+        if self.imports.iter().any(|&l| s <= l && l <= e) {
+            return Label::bare("imports", change);
+        }
+        match self.defs.iter().filter(|d| d.start <= s && e <= d.end).min_by_key(|d| d.end - d.start) {
+            Some(d) => Label::of(d, "modified"),
+            None => Label::bare("code", change),
+        }
+    }
+
+    // `rows` cut into pieces at the line each next definition's lead begins -
+    // a comment or attribute goes with what follows it. None unless the rows
+    // hold only whole nodes of one parent, so no piece leaves a brace open.
+    fn pieces(&self, rows: (usize, usize)) -> Option<Vec<(usize, usize)>> {
+        let tree = self.tree.as_ref()?;
+        let mut nodes = Vec::new();
+        within(tree.root_node(), rows, &mut nodes);
+        let parent = nodes.first()?.parent();
+        if nodes.iter().any(|n| n.parent() != parent) {
+            return None;
+        }
+        let held = |r: usize| nodes.iter().any(|n| n.start_position().row <= r && r <= end_row(*n));
+        if (rows.0..rows.1).any(|r| !self.lines[r].trim().is_empty() && !held(r)) {
+            return None;
+        }
+        let lead = |n: &Node| {
+            !n.is_named() || n.kind().contains("comment") || n.kind().contains("attribute") || n.kind() == "decorator"
+        };
+        let mut cuts = vec![rows.0];
+        let mut last: Option<usize> = None;
+        for n in nodes.iter().filter(|n| !lead(n)) {
+            let (start, end) = (n.start_position().row, end_row(*n));
+            if let Some(prev) = last.filter(|&prev| start > prev) {
+                cuts.push(prev + 1);
+            }
+            last = Some(last.map_or(end, |prev| prev.max(end)));
+        }
+        cuts.push(rows.1);
+        Some(cuts.windows(2).map(|w| (w[0], w[1])).filter(|w| w.0 < w.1).collect())
+    }
+}
+
+// the last row a node holds - one ending at a line's start ended on the row before
+fn end_row(n: Node) -> usize {
+    let (s, e) = (n.start_position(), n.end_position());
+    if e.column == 0 && e.row > s.row {
+        e.row - 1
+    } else {
+        e.row
+    }
+}
+
+// the outermost node that starts on `row`
+fn outer_at(node: Node<'_>, row: usize) -> Option<Node<'_>> {
+    let mut cur = node.walk();
+    let kids: Vec<Node> = node.children(&mut cur).collect();
+    for child in kids {
+        let start = child.start_position().row;
+        if start == row {
+            return Some(child);
+        }
+        if start < row && row <= end_row(child) {
+            return outer_at(child, row);
+        }
+    }
+    None
+}
+
+// the outermost nodes lying wholly inside `rows`, in order
+fn within<'t>(node: Node<'t>, rows: (usize, usize), out: &mut Vec<Node<'t>>) {
+    let mut cur = node.walk();
+    let kids: Vec<Node> = node.children(&mut cur).collect();
+    for child in kids {
+        let (s, e) = (child.start_position().row, end_row(child));
+        if e < rows.0 || s >= rows.1 {
+            continue;
+        }
+        if rows.0 <= s && e < rows.1 {
+            out.push(child);
+        } else {
+            within(child, rows, out);
+        }
+    }
+}
+
+// one run of a change: lines `b` of the before side give way to lines `a` of
+// the after side, both 0-based and end exclusive
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    b: (usize, usize),
+    a: (usize, usize),
+}
+
+// A run that only adds or only takes lines, moved along the lines that repeat
+// around it to where it cuts through the fewest definitions - so a function
+// added after another reads as that function, not as the brace closing the
+// one before it and most of itself. `lo` and `hi` bound it on each side.
+fn slide(r: Run, was: &Side, now: &Side, lo: (usize, usize), hi: (usize, usize)) -> Run {
+    let adds = r.b.0 == r.b.1;
+    if adds == (r.a.0 == r.a.1) {
+        return r;
+    }
+    let (side, (s, e), lo, hi) = if adds { (now, r.a, lo.1, hi.1) } else { (was, r.b, lo.0, hi.0) };
+    let mut shifts = vec![0isize];
+    let mut k = 1;
+    while s >= lo + k && side.text(s - k) == side.text(e - k) {
+        shifts.push(-(k as isize));
+        k += 1;
+    }
+    let mut k = 1;
+    while e + k <= hi && side.text(s + k - 1) == side.text(e + k - 1) {
+        shifts.push(k as isize);
+        k += 1;
+    }
+    let by = |v: usize, d: isize| (v as isize + d) as usize;
+    let d = shifts
+        .into_iter()
+        // a block that opens on a blank line carries its own separator
+        .min_by_key(|&d| (side.cuts((by(s, d), by(e, d))), !side.text(by(s, d)).trim().is_empty(), d.unsigned_abs(), d))
+        .unwrap_or(0);
+    Run { b: (by(r.b.0, d), by(r.b.1, d)), a: (by(r.a.0, d), by(r.a.1, d)) }
+}
+
+// a rewrite past this many lines is taken as it is rather than tried every way
+const SETTLE_LINES: usize = 400;
+
+// A run settled where it reads best. One that only adds or takes lines is
+// slid to the definitions' edges; one that rewrites lines with some to spare
+// is split into the rewrite and a run adding or taking the rest, wherever
+// that cuts through fewer definitions - so a call written into one function
+// and a function added after it come apart, though the diff paired the new
+// function's closing brace with the old one's.
+fn settle(r: Run, was: &Side, now: &Side, lo: (usize, usize), hi: (usize, usize)) -> Vec<Run> {
+    let (bl, al) = (r.b.1 - r.b.0, r.a.1 - r.a.0);
+    if bl == 0 || al == 0 {
+        return vec![slide(r, was, now, lo, hi)];
+    }
+    let cost = |rs: &[Run]| -> usize { rs.iter().map(|x| now.cuts(x.a) + was.cuts(x.b)).sum() };
+    let mut best = vec![r];
+    let mut least = cost(&best);
+    if least == 0 || bl == al || bl.max(al) > SETTLE_LINES {
+        return best;
+    }
+    let (b0, b1, a0, a1) = (r.b.0, r.b.1, r.a.0, r.a.1);
+    for k in 1..bl.max(al) {
+        let options = if al > bl {
+            // rewrite then add, or add then rewrite
+            [
+                (Run { b: (b0, b1), a: (a0, a0 + k) }, Run { b: (b1, b1), a: (a0 + k, a1) }),
+                (Run { b: (b0, b0), a: (a0, a0 + k) }, Run { b: (b0, b1), a: (a0 + k, a1) }),
+            ]
+        } else {
+            // rewrite then take, or take then rewrite
+            [
+                (Run { b: (b0, b0 + k), a: (a0, a1) }, Run { b: (b0 + k, b1), a: (a1, a1) }),
+                (Run { b: (b0, b0 + k), a: (a0, a0) }, Run { b: (b0 + k, b1), a: (a0, a1) }),
+            ]
+        };
+        for (head, tail) in options {
+            let pure = |x: &Run| x.b.0 == x.b.1 || x.a.0 == x.a.1;
+            let pair = if pure(&head) {
+                [slide(head, was, now, lo, (tail.b.0, tail.a.0)), tail]
+            } else {
+                [head, slide(tail, was, now, (head.b.1, head.a.1), hi)]
+            };
+            let c = cost(&pair);
+            if c < least {
+                least = c;
+                best = pair.to_vec();
+            }
+        }
+    }
+    best
+}
+
+// the before side with the runs switched on taken from the after side
+fn build(was: &[&str], now: &[&str], runs: &[(Run, Label)], order: &[usize], on: &[bool]) -> String {
+    let mut out = String::new();
+    let mut at = 0;
+    for &i in order {
+        let r = runs[i].0;
+        let from = r.b.0.max(at);
+        out.extend(was[at..from].iter().copied());
+        let lines = if on[i] { &now[r.a.0..r.a.1] } else { &was[from..r.b.1.max(from)] };
+        out.extend(lines.iter().copied());
+        at = r.b.1.max(from);
+    }
+    out.extend(was[at..].iter().copied());
+    out
+}
+
+// The texts a file passes through when its change is made one part at a
+// time - each link the text before it, the text after it and what it is
+// about. None when the change does not come apart cleanly.
+#[allow(clippy::type_complexity)]
+fn chain(lang: Language, before: Option<&str>, after: &str) -> Option<Vec<(Option<String>, String, Label)>> {
+    let (was, now) = (Side::read(lang, before.unwrap_or_default()), Side::read(lang, after));
+    let hunks = edit::hunks(before, Some(after));
+    if hunks.is_empty() {
+        return None;
+    }
+    let runs: Vec<Run> = hunks
+        .iter()
+        .map(|h| Run {
+            b: (h.before.0 - 1, h.before.0 - 1 + h.before.1),
+            a: (h.after.0 - 1, h.after.0 - 1 + h.after.1),
+        })
+        .collect();
+    let mut settled: Vec<Run> = Vec::new();
+    for (i, r) in runs.iter().enumerate() {
+        let lo = settled.last().map_or((0, 0), |p| (p.b.1, p.a.1));
+        let hi = runs.get(i + 1).map_or((was.lines.len(), now.lines.len()), |n| (n.b.0, n.a.0));
+        settled.extend(settle(*r, &was, &now, lo, hi));
+    }
+
+    let mut pieces: Vec<(Run, Label)> = Vec::new();
+    for r in &settled {
+        let (adds, takes) = (r.a.0 < r.a.1, r.b.0 < r.b.1);
+        // a change inside one function is that function's
+        let inside = adds.then(|| now.function_holding(r.a)).flatten().or_else(|| takes.then(|| was.function_holding(r.b)).flatten());
+        if let Some(f) = inside {
+            pieces.push((*r, Label::of(f, "modified")));
+            continue;
+        }
+        match (adds, takes) {
+            (true, false) => match now.pieces(r.a) {
+                Some(cut) => pieces.extend(cut.into_iter().map(|a| (Run { b: r.b, a }, now.label(a, "added")))),
+                None => pieces.push((*r, now.label(r.a, "added"))),
+            },
+            (false, true) => match was.pieces(r.b) {
+                Some(cut) => pieces.extend(cut.into_iter().map(|b| (Run { b, a: r.a }, was.label(b, "removed")))),
+                None => pieces.push((*r, was.label(r.b, "removed"))),
+            },
+            _ => {
+                // a rewrite reads as the after side has it - changed, where the before side holds it too
+                let mut l = now.label(r.a, "added");
+                let held = was.defs.iter().any(|d| d.kind == l.kind && l.name.as_ref() == Some(&d.name) && d.owner == l.owner);
+                if held || matches!(l.kind, "imports" | "code") {
+                    l.change = "modified";
+                }
+                pieces.push((*r, l));
+            }
+        }
+    }
+
+    // a part per definition, each sitting where it first appears
+    let mut groups: Vec<(Label, usize, Vec<usize>)> = Vec::new();
+    for (i, (r, l)) in pieces.iter().enumerate() {
+        let at = if l.change == "removed" { r.b.0 } else { r.a.0 };
+        match groups.iter_mut().find(|g| g.0.joins(l)) {
+            Some(g) => {
+                if g.0.change != l.change {
+                    g.0.change = "modified";
+                }
+                g.1 = g.1.min(at);
+                g.2.push(i);
+            }
+            None => groups.push((l.clone(), at, vec![i])),
+        }
+    }
+    groups.sort_by_key(|g| (g.0.rank(), g.1));
+
+    // runs in the order they sit, so any set of them applies cleanly
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    order.sort_by_key(|&i| (pieces[i].0.b.0, pieces[i].0.a.0));
+    // every part together must come to the after side, or the parts are not to be trusted
+    if build(&was.lines, &now.lines, &pieces, &order, &vec![true; pieces.len()]) != after {
+        return None;
+    }
+    let mut on = vec![false; pieces.len()];
+    let mut prev = before.map(str::to_string);
+    let mut links = Vec::new();
+    for (n, (label, _, members)) in groups.iter().enumerate() {
+        for &i in members {
+            on[i] = true;
+        }
+        let text = if n + 1 == groups.len() { after.to_string() } else { build(&was.lines, &now.lines, &pieces, &order, &on) };
+        links.push((prev.replace(text.clone()), text, label.clone()));
+    }
+    Some(links)
+}
+
+// One look an agent took at the code through a read tool, as a timeline step:
+// the files its answer named and the functions holding the lines it named,
+// seen where its main sites are - a definition looked up, a file read.
+// `sites` are (file, line - none for a whole file, main) as the answer listed them.
+pub fn look(at_ms: u64, tool: &str, what: &str, sites: &[(String, usize, bool)], caches: &[FileCache]) -> Option<Event> {
+    let mut files: Vec<&str> = Vec::new();
+    let mut funcs: Vec<(Touched, bool)> = Vec::new();
+    let mut main_files: Vec<&str> = Vec::new();
+    for (path, line, main) in sites.iter().take(LOOK_SITES) {
+        let Some(c) = caches.iter().find(|c| changes::path_str(&c.rel_path) == *path) else {
+            continue;
+        };
+        if !files.contains(&path.as_str()) {
+            files.push(path);
+        }
+        if *main && !main_files.contains(&path.as_str()) {
+            main_files.push(path);
+        }
+        let line = *line;
+        let holding = c
+            .funcs
+            .iter()
+            .filter(|f| line > 0 && f.start_line <= line && line <= f.end_line)
+            .min_by_key(|f| f.end_line - f.start_line);
+        let Some(f) = holding else {
+            continue;
+        };
+        let span = (f.line, f.start_line, f.end_line);
+        match funcs.iter_mut().find(|(t, _)| t.file == *path && t.after == Some(span) && t.name == f.name) {
+            Some((t, m)) => {
+                *m |= *main;
+                if !t.lines_after.contains(&(line, line)) {
+                    t.lines_after.push((line, line));
+                }
+            }
+            None => funcs.push((
+                Touched {
+                    file: path.clone(),
+                    name: f.name.clone(),
+                    owner: f.owner.clone(),
+                    change: "inspect",
+                    before: None,
+                    after: Some(span),
+                    lines_before: Vec::new(),
+                    lines_after: vec![(line, line)],
+                    whitespace: false,
+                },
+                *main,
+            )),
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let main_funcs: Vec<&Touched> = funcs.iter().filter(|(_, m)| *m).map(|(t, _)| t).collect();
+    let at = if main_files.is_empty() { &files } else { &main_files };
+    let focus = match (main_funcs.as_slice(), at.as_slice()) {
+        ([one], _) => Focus::Flow((*one).clone()),
+        (_, [file]) => Focus::Code(file.to_string()),
+        _ => Focus::Overview,
+    };
+    // what it asked, in a line - the timeline's label for it
+    let asked = format!("{tool} {what}").trim().to_string();
+    let json = json!({
+        "seq": 0,
+        "at": at_ms,
+        "tool": tool,
+        "changeset": Value::Null,
+        "status": "inspect",
+        "by": "agent",
+        "intent": [asked],
+        "on_disk": "after",
+        "ops": [],
+        "files": files
+            .iter()
+            .map(|p| json!({"path": p, "change": "inspect", "added": 0, "removed": 0, "hunks": [], "diff": [], "diff_truncated": false, "whitespace": false}))
+            .collect::<Vec<_>>(),
+        "files_total": files.len(),
+        "whitespace": false,
+        "functions": funcs.iter().map(|(t, _)| t.json()).collect::<Vec<_>>(),
+        "focus": focus.json(),
+    });
+    Some(Event { json, focus })
+}
+
+// the whole system: what it holds, and in which languages
+fn system(caches: &[FileCache], out: &[Vec<(usize, usize)>], root_label: &str, grouping: &str) -> Value {
+    let mut langs: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for c in caches {
+        let e = langs.entry(c.language.as_str()).or_default();
+        e.0 += 1;
+        e.1 += c.lines;
+    }
+    let mut langs: Vec<(&str, (usize, usize))> = langs.into_iter().collect();
+    langs.sort_by_key(|&(l, (_, lines))| (std::cmp::Reverse(lines), l));
+    json!({
+        "name": root_label,
+        "files": caches.len(),
+        "lines": caches.iter().map(|c| c.lines).sum::<usize>(),
+        "functions": caches.iter().map(|c| c.funcs.len()).sum::<usize>(),
+        "edges": out.iter().map(Vec::len).sum::<usize>(),
+        "languages": langs
+            .iter()
+            .map(|(l, (files, lines))| json!({"language": l, "files": files, "lines": lines}))
+            .collect::<Vec<_>>(),
+        // how files were grouped into containers - map.json, or a fallback
+        "grouping": grouping,
+    })
+}
+
+// The services, each with the languages it is written in as its technology.
+// A service whose globs match nothing is still listed: the config names it.
+fn containers(
+    g: &insights::Graph,
+    ctx: &insights::ServiceCtx,
+    caches: &[FileCache],
+    paths: &[String],
+    container_of: &[String],
+) -> Vec<Value> {
+    #[derive(Default)]
+    struct Tally<'a> {
+        files: usize,
+        lines: usize,
+        funcs: usize,
+        entries: usize,
+        tests: usize,
+        langs: BTreeMap<&'a str, usize>,
+    }
+    let mut tally: BTreeMap<&str, Tally> = BTreeMap::new();
+    for (fi, c) in caches.iter().enumerate() {
+        let t = tally.entry(container_of[fi].as_str()).or_default();
+        t.files += 1;
+        t.lines += c.lines;
+        t.funcs += c.funcs.len();
+        *t.langs.entry(c.language.as_str()).or_default() += 1;
+        if changes::is_test_path(&paths[fi]) {
+            t.tests += 1;
+        }
+    }
+    for i in 0..g.nodes.len() {
+        if g.is_root(i) && !g.is_test(i) && !g.is_module(i) {
+            tally.entry(container_of[g.node_file(i)].as_str()).or_default().entries += 1;
+        }
+    }
+    let mut names: Vec<&str> = ctx.map.keys().map(String::as_str).collect();
+    if tally.contains_key(UNASSIGNED) {
+        names.push(UNASSIGNED);
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let t = tally.get(name);
+            let mut langs: Vec<(&str, usize)> =
+                t.map(|t| t.langs.iter().map(|(l, n)| (*l, *n)).collect()).unwrap_or_default();
+            langs.sort_by_key(|&(l, n)| (std::cmp::Reverse(n), l));
+            json!({
+                "id": name,
+                "name": name,
+                "globs": ctx.map.get(name).cloned().unwrap_or_default(),
+                "files": t.map_or(0, |t| t.files),
+                "lines": t.map_or(0, |t| t.lines),
+                "funcs": t.map_or(0, |t| t.funcs),
+                "entries": t.map_or(0, |t| t.entries),
+                "tests": t.map_or(0, |t| t.tests),
+                "languages": langs
+                    .iter()
+                    .map(|(l, n)| json!({"language": l, "files": n}))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+// The service edges the insights pass already resolved - detected calls,
+// declared relatives and annotated crossings alike - trimmed for drawing.
+fn container_edges(services: &Value) -> Vec<Value> {
+    let external: BTreeSet<&str> = services["external_names"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    services["edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let sites: Vec<&Value> = e["sites"].as_array().into_iter().flatten().collect();
+            let transports: BTreeSet<&str> = sites
+                .iter()
+                .filter_map(|s| s.get("transport").and_then(Value::as_str))
+                .collect();
+            json!({
+                "from": e["from"],
+                "to": e["to"],
+                "count": e["count"],
+                "symbols": e["symbols"].as_array().into_iter().flatten().take(EDGE_SYMBOLS).collect::<Vec<_>>(),
+                "declared": e["declared"],
+                "detected": e["detected"],
+                "transports": transports,
+                // the far end is a peer repository rather than a service here
+                "external": e["to"].as_str().is_some_and(|t| external.contains(t)),
+                "sites": sites
+                    .iter()
+                    .take(EDGE_SITES)
+                    .map(|s| json!({
+                        "symbol": s["symbol"],
+                        "caller": s["caller"],
+                        "caller_file": s["caller_file"],
+                        "caller_line": s["caller_line"],
+                        "target_file": s["target_file"],
+                        "target_line": s["target_line"],
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+// The system's edges to the world beyond the map: a `ccc:calls` nothing here
+// or in a peer answers, and a `ccc:serves` nothing here calls. They group by
+// transport and direction, because a key alone names no system.
+fn outside(ctx: &insights::ServiceCtx, caches: &[FileCache], container_of: &[String]) -> Vec<Value> {
+    let answered: BTreeSet<String> = ctx
+        .crossings
+        .iter()
+        .filter(|c| !c.to.is_empty())
+        .map(|c| norm_key(&c.key))
+        .collect();
+    let called: BTreeSet<String> = ctx
+        .crossings
+        .iter()
+        .filter(|c| !c.from.is_empty())
+        .map(|c| norm_key(&c.key))
+        .collect();
+    type Group<'a> = (BTreeSet<&'a str>, BTreeMap<&'a str, usize>);
+    let mut groups: BTreeMap<(&str, &str), Group> = BTreeMap::new();
+    for (fi, c) in caches.iter().enumerate() {
+        for a in &c.annotations {
+            let (direction, matched) = match a.boundary {
+                Boundary::Calls => ("out", &answered),
+                Boundary::Serves => ("in", &called),
+            };
+            if matched.contains(&norm_key(&a.key)) {
+                continue;
+            }
+            let g = groups.entry((direction, a.transport.as_str())).or_default();
+            g.0.insert(a.key.as_str());
+            *g.1.entry(container_of[fi].as_str()).or_default() += 1;
+        }
+    }
+    groups
+        .iter()
+        .map(|((direction, transport), (keys, by))| {
+            json!({
+                "id": format!("{direction}:{transport}"),
+                "direction": direction,
+                "transport": transport,
+                "keys": keys.iter().take(EDGE_SYMBOLS).collect::<Vec<_>>(),
+                "key_count": keys.len(),
+                "containers": by
+                    .iter()
+                    .map(|(c, n)| json!({"container": c, "count": n}))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+// every mapped file, as a component of the container that owns it
+fn components(
+    caches: &[FileCache],
+    paths: &[String],
+    container_of: &[String],
+    by_file: &BTreeMap<String, Vec<usize>>,
+    funcs: &[FnNode],
+) -> Vec<Value> {
+    caches
+        .iter()
+        .enumerate()
+        .map(|(fi, c)| {
+            let path = &paths[fi];
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let ids = by_file.get(path).map(Vec::as_slice).unwrap_or_default();
+            json!({
+                "id": path,
+                "container": container_of[fi],
+                "dir": dir,
+                "name": name,
+                "language": c.language.as_str(),
+                "lines": c.lines,
+                "funcs": c.funcs.len(),
+                "types": c.types.len(),
+                "entries": ids
+                    .iter()
+                    .filter(|&&i| funcs[i].entry && !funcs[i].test && !funcs[i].module)
+                    .count(),
+                "max_complexity": ids.iter().map(|&i| funcs[i].complexity).max().unwrap_or(0),
+                "test": changes::is_test_path(path),
+                "withdrawn": c.withdrawn.len(),
+            })
+        })
+        .collect()
+}
+
+// file-to-file edges, totalled from the function call graph
+fn component_edges(g: &insights::Graph, out: &[Vec<(usize, usize)>], paths: &[String]) -> Vec<Value> {
+    let mut edges: BTreeMap<(usize, usize), (usize, BTreeSet<&str>)> = BTreeMap::new();
+    for (i, calls) in out.iter().enumerate() {
+        for &(t, _) in calls {
+            let (a, b) = (g.node_file(i), g.node_file(t));
+            if a == b {
+                continue;
+            }
+            let e = edges.entry((a, b)).or_default();
+            e.0 += 1;
+            e.1.insert(g.name(t));
+        }
+    }
+    edges
+        .iter()
+        .map(|((a, b), (count, symbols))| {
+            json!({
+                "from": paths[*a],
+                "to": paths[*b],
+                "count": count,
+                "symbols": symbols.iter().take(EDGE_SYMBOLS).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+// The node a map entry was read from: the outermost function whose span is
+// exactly the one recorded. Subtrees that cannot hold it are never entered.
+fn definition<'t>(root: Node<'t>, lang: Language, start: usize, end: usize) -> Option<Node<'t>> {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        let (s, e) = (line(n), n.end_position().row + 1);
+        if s > end || e < start {
+            continue;
+        }
+        if s == start && e == end && lang.func_kinds().contains(&n.kind()) {
+            return Some(n);
+        }
+        let mut c = n.walk();
+        let kids: Vec<Node<'t>> = n.named_children(&mut c).collect();
+        stack.extend(kids.into_iter().rev());
+    }
+    None
+}
+
+// the parameter list as written, one entry per parameter
+fn params(def: Node, lang: Language, src: &str) -> Vec<String> {
+    let kinds = lang.param_list_kinds();
+    let list = def
+        .child_by_field_name("parameters")
+        .filter(|n| kinds.contains(&n.kind()))
+        .or_else(|| {
+            // the first list in source order, never one inside the body
+            let body = def.child_by_field_name("body");
+            let mut stack = vec![def];
+            while let Some(n) = stack.pop() {
+                if kinds.contains(&n.kind()) {
+                    return Some(n);
+                }
+                if Some(n) == body {
+                    continue;
+                }
+                let mut c = n.walk();
+                let kids: Vec<Node> = n.named_children(&mut c).collect();
+                stack.extend(kids.into_iter().rev());
+            }
+            None
+        });
+    let Some(list) = list else { return Vec::new() };
+    let mut c = list.walk();
+    list.named_children(&mut c)
+        .filter(|k| !lang.comment_kinds().contains(&k.kind()))
+        .map(|k| clip(&oneline(&src[k.byte_range()]), ARG_CHARS + 12))
+        .collect()
+}
+
+// Walks one function body into the steps a node graph draws: a call, a
+// branch with an arm per way through it, a loop with its body, an exit, a
+// closure. Anything else contributes the steps inside it, so an assignment
+// shows as the calls on its right-hand side - which is all of it that runs.
+struct Walker<'a> {
+    lang: Language,
+    src: &'a str,
+    steps: usize,
+    truncated: bool,
+    // per enclosing construct: does a `break` inside it end a case rather than a loop
+    breaks_case: Vec<bool>,
+    // what the function calls, with the line of the first call - how a call
+    // step finds the definition it reaches
+    calls: &'a [(usize, usize)],
+    funcs: &'a [FnNode],
+    // the functions defined in this file, so a nested one links to itself
+    siblings: &'a [usize],
+}
+
+impl<'a> Walker<'a> {
+    fn text(&self, n: Node) -> &'a str {
+        let src: &'a str = self.src;
+        &src[n.byte_range()]
+    }
+
+    fn label(&self, n: Node) -> String {
+        clip(&oneline(self.text(n)), LABEL_CHARS)
+    }
+
+    fn visit<'t>(&mut self, n: Node<'t>, nest: usize, depth: usize, out: &mut Vec<Value>) {
+        if self.steps >= MAX_STEPS || nest > MAX_NESTING || depth > MAX_TREE_DEPTH {
+            self.truncated = true;
+            return;
+        }
+        let kind = n.kind();
+        let lang = self.lang;
+        if !n.is_named() || lang.comment_kinds().contains(&kind) {
+            return;
+        }
+        if lang.func_kinds().contains(&kind) || lang.closure_kinds().contains(&kind) {
+            self.closure(n, nest, depth, out);
+        } else if lang.loop_kinds().contains(&kind) {
+            self.looped(n, nest, depth, out);
+        } else if self.is_if(kind) {
+            self.branch(n, nest, depth, out);
+        } else if lang.exit_kinds().contains(&kind) {
+            self.exit(n, nest, depth, out);
+        } else if self.is_call(kind) {
+            self.call(n, nest, depth, out);
+        } else {
+            self.children(n, nest, depth + 1, out);
+        }
+    }
+
+    // A node's children in order - unless some of them are the arms of a
+    // many-way choice, which sit together under the statement choosing.
+    fn children<'t>(&mut self, n: Node<'t>, nest: usize, depth: usize, out: &mut Vec<Value>) {
+        let mut c = n.walk();
+        let kids: Vec<Node<'t>> = n.named_children(&mut c).collect();
+        if kids.iter().any(|k| self.is_arm(k.kind())) {
+            self.cases(n, &kids, nest, depth, out);
+            return;
+        }
+        for k in kids {
+            self.visit(k, nest, depth, out);
+        }
+    }
+
+    // a two-way choice: an `if`, a ternary, an `if` expression
+    fn is_if(&self, kind: &str) -> bool {
+        self.lang.branch_kinds().contains(&kind)
+            && (kind.starts_with("if") || kind.contains("ternary") || kind == "conditional_expression")
+    }
+
+    // one arm of a many-way choice: a match arm, a case, a catch
+    fn is_arm(&self, kind: &str) -> bool {
+        // a default arm is no decision point, so the branch tables leave it out
+        matches!(kind, "switch_default" | "default_case")
+            || (self.lang.branch_kinds().contains(&kind) && !self.is_if(kind) && kind != "elif_clause")
+    }
+
+    // a call, a constructor call (js, ts, c++), or a rust macro - which runs
+    // code just as a call does
+    fn is_call(&self, kind: &str) -> bool {
+        self.lang.call_kinds().contains(&kind)
+            || kind == "new_expression"
+            || (self.lang == Language::Rust && kind == "macro_invocation")
+    }
+
+    fn branch<'t>(&mut self, n: Node<'t>, nest: usize, depth: usize, out: &mut Vec<Value>) {
+        let cond = n.child_by_field_name("condition");
+        // the condition is evaluated before either side runs
+        if let Some(c) = cond {
+            self.visit(c, nest, depth + 1, out);
+        }
+        let (then, rest) = self.if_parts(n, cond);
+        let mut yes = Vec::new();
+        if let Some(t) = then {
+            self.visit(t, nest + 1, depth + 1, &mut yes);
+        }
+        let no = self.else_steps(&rest, nest + 1, depth + 1);
+        let kind = if n.kind().starts_with("if") { "if" } else { "ternary" };
+        let label = cond.map(|c| self.label(c)).unwrap_or_else(|| kind.to_string());
+        self.push_branch(out, kind, label, line(n), yes, no, rest.is_empty());
+    }
+
+    // the side taken when the condition holds, then whatever else follows
+    fn if_parts<'t>(&self, n: Node<'t>, cond: Option<Node<'t>>) -> (Option<Node<'t>>, Vec<Node<'t>>) {
+        let then = n
+            .child_by_field_name("consequence")
+            .or_else(|| n.child_by_field_name("body"));
+        let mut rest = Vec::new();
+        let mut unlabelled = Vec::new();
+        let mut c = n.walk();
+        for (i, k) in n.children(&mut c).enumerate() {
+            if !k.is_named() || Some(k) == cond || Some(k) == then || self.lang.comment_kinds().contains(&k.kind()) {
+                continue;
+            }
+            let field = n.field_name_for_child(i as u32);
+            if field == Some("alternative") || matches!(k.kind(), "else_clause" | "elif_clause" | "else_if_clause") {
+                rest.push(k);
+            } else if field.is_none() {
+                unlabelled.push(k);
+            }
+        }
+        // zig's `if` expression labels nothing but its condition: the two
+        // unlabelled children are the branches, in order
+        if then.is_none() && !unlabelled.is_empty() {
+            let then = unlabelled.remove(0);
+            if rest.is_empty() {
+                rest = unlabelled;
+            }
+            return (Some(then), rest);
+        }
+        (then, rest)
+    }
+
+    fn else_steps<'t>(&mut self, rest: &[Node<'t>], nest: usize, depth: usize) -> Vec<Value> {
+        let mut out = Vec::new();
+        let Some((&first, tail)) = rest.split_first() else {
+            return out;
+        };
+        match first.kind() {
+            // python's `elif` and odin's `else if` sit beside the `if`: each is
+            // a branch of its own, with the rest of the chain as its else
+            "elif_clause" | "else_if_clause" => {
+                let cond = first.child_by_field_name("condition");
+                if let Some(c) = cond {
+                    self.visit(c, nest, depth, &mut out);
+                }
+                let mut yes = Vec::new();
+                if let Some(t) = first.child_by_field_name("consequence") {
+                    self.visit(t, nest + 1, depth + 1, &mut yes);
+                }
+                let no = self.else_steps(tail, nest + 1, depth + 1);
+                let label = cond.map(|c| self.label(c)).unwrap_or_else(|| "elif".into());
+                self.push_branch(&mut out, "if", label, line(first), yes, no, tail.is_empty());
+            }
+            // a wrapper around the else body, which may itself be an `if`
+            "else_clause" => {
+                let inner = ["alternative", "body", "consequence"]
+                    .iter()
+                    .find_map(|f| first.child_by_field_name(f))
+                    .or_else(|| {
+                        let mut c = first.walk();
+                        let kids: Vec<Node<'t>> = first.named_children(&mut c).collect();
+                        kids.into_iter().find(|k| !self.lang.comment_kinds().contains(&k.kind()))
+                    });
+                if let Some(i) = inner {
+                    self.visit(i, nest, depth, &mut out);
+                }
+            }
+            // go and c# put the else body, or the next `if`, there directly
+            _ => self.visit(first, nest, depth, &mut out),
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_branch(
+        &mut self,
+        out: &mut Vec<Value>,
+        kind: &str,
+        label: String,
+        at: usize,
+        yes: Vec<Value>,
+        no: Vec<Value>,
+        implicit_else: bool,
+    ) {
+        self.steps += 1;
+        out.push(json!({
+            "t": "branch",
+            "kind": kind,
+            "label": label,
+            "line": at,
+            "arms": [
+                {"label": "true", "steps": yes},
+                // no `else` written: the false side carries straight on
+                {"label": "false", "steps": no, "implicit": implicit_else},
+            ],
+        }));
+    }
+
+    // A many-way choice: a match, a switch, a select, a try with its catches.
+    // `n` holds the arms; the statement doing the choosing is `n` itself (go,
+    // zig, odin, a try) or the one holding the block they sit in (rust, js, c,
+    // c#, python's match).
+    fn cases<'t>(&mut self, n: Node<'t>, kids: &[Node<'t>], nest: usize, depth: usize, out: &mut Vec<Value>) {
+        let subject_of = |s: Node<'t>| {
+            ["value", "subject", "condition"]
+                .iter()
+                .find_map(|f| s.child_by_field_name(f))
+        };
+        let is_try = |s: Node<'t>| s.kind().contains("try");
+        let (stmt, own) = if subject_of(n).is_some() || is_try(n) {
+            (n, true)
+        } else {
+            match n.parent().filter(|p| subject_of(*p).is_some() || is_try(*p)) {
+                Some(p) => (p, false),
+                None => (n, true),
+            }
+        };
+        let tried = is_try(stmt);
+        let mut subject = subject_of(stmt);
+        if own && subject.is_none() && !tried {
+            // zig and c# switch expressions name their subject first, unlabelled
+            subject = kids.iter().copied().find(|k| !self.is_arm(k.kind()));
+        }
+        // the subject is read once, before any arm; when the arms sit in a
+        // block, the walk over the statement has already passed it
+        if own {
+            if let Some(s) = subject {
+                self.visit(s, nest, depth + 1, out);
+            }
+        }
+        let body = stmt.child_by_field_name("body").filter(|_| tried);
+        let mut arms = Vec::new();
+        if let Some(b) = body {
+            let mut steps = Vec::new();
+            self.visit(b, nest + 1, depth + 1, &mut steps);
+            arms.push(json!({"label": "try", "line": line(b), "steps": steps}));
+        }
+        let ends_case = !tried && self.lang.break_ends_case();
+        let mut after = Vec::new();
+        for &k in kids {
+            if self.is_arm(k.kind()) {
+                self.breaks_case.push(ends_case);
+                let steps = self.arm_steps(k, nest + 1, depth + 1);
+                self.breaks_case.pop();
+                arms.push(json!({"label": self.arm_label(k), "line": line(k), "steps": steps}));
+            } else if Some(k) != subject && Some(k) != body {
+                // `finally`, python's `try ... else`: they run once the arms are done
+                after.push(k);
+            }
+        }
+        let kind = if tried {
+            "try"
+        } else if stmt.kind().contains("match") {
+            "match"
+        } else if stmt.kind().contains("select") {
+            "select"
+        } else {
+            "switch"
+        };
+        let label = subject.map(|s| self.label(s)).unwrap_or_else(|| kind.to_string());
+        self.steps += 1;
+        out.push(json!({"t": "branch", "kind": kind, "label": label, "line": line(stmt), "arms": arms}));
+        for k in after {
+            self.visit(k, nest, depth + 1, out);
+        }
+    }
+
+    // What an arm matches on - its pattern, case value or caught exception.
+    // Rust calls an arm's result `value`, so a pattern always wins.
+    fn arm_head<'t>(&self, arm: Node<'t>) -> Option<Node<'t>> {
+        ["pattern", "value", "type", "communication", "parameter", "parameters", "condition"]
+            .iter()
+            .find_map(|f| arm.child_by_field_name(f))
+            .or_else(|| {
+                arm.named_child(0).filter(|c| {
+                    let k = c.kind();
+                    k.ends_with("pattern") || k == "catch_declaration" || k == "discard"
+                })
+            })
+    }
+
+    fn arm_label(&self, arm: Node) -> String {
+        let kind = arm.kind();
+        let head = self.arm_head(arm).map(|h| self.label(h));
+        if kind.contains("catch") {
+            return match head {
+                Some(h) if h.starts_with('(') => format!("catch {h}"),
+                Some(h) => format!("catch ({h})"),
+                None => "catch".into(),
+            };
+        }
+        if kind.contains("except") {
+            return head.map_or_else(|| "except".into(), |h| format!("except {h}"));
+        }
+        let text = head.unwrap_or_else(|| arm_text(self.text(arm)));
+        if text.is_empty() || kind.contains("default") {
+            "default".into()
+        } else {
+            text
+        }
+    }
+
+    fn arm_steps<'t>(&mut self, arm: Node<'t>, nest: usize, depth: usize) -> Vec<Value> {
+        let head = self.arm_head(arm);
+        let mut out = Vec::new();
+        let mut c = arm.walk();
+        let kids: Vec<Node<'t>> = arm.named_children(&mut c).collect();
+        for k in kids {
+            if Some(k) != head {
+                self.visit(k, nest, depth, &mut out);
+            }
+        }
+        out
+    }
+
+    fn looped<'t>(&mut self, n: Node<'t>, nest: usize, depth: usize, out: &mut Vec<Value>) {
+        // odin keeps a loop's body under `consequence`
+        let body = n
+            .child_by_field_name("body")
+            .or_else(|| n.child_by_field_name("consequence"));
+        let label = match body {
+            Some(b) => {
+                let head = format!(
+                    "{} {}",
+                    &self.src[n.start_byte()..b.start_byte()],
+                    &self.src[b.end_byte()..n.end_byte()]
+                );
+                clip(oneline(&head).trim_end_matches([';', ':', '{', ' ']), LABEL_CHARS)
+            }
+            None => self.label(n),
+        };
+        let mut inner = Vec::new();
+        let mut c = n.walk();
+        let kids: Vec<Node<'t>> = n.named_children(&mut c).collect();
+        self.breaks_case.push(false);
+        match body {
+            // a `do ... while` tests its condition after each pass, not before
+            Some(b) if n.kind().starts_with("do") => {
+                self.visit(b, nest + 1, depth + 1, &mut inner);
+                for k in kids.into_iter().filter(|k| *k != b) {
+                    self.visit(k, nest + 1, depth + 1, &mut inner);
+                }
+            }
+            Some(b) => {
+                // the header - the iterable, the condition - is read before the first pass
+                for k in kids.into_iter().filter(|k| *k != b) {
+                    self.visit(k, nest, depth + 1, out);
+                }
+                self.visit(b, nest + 1, depth + 1, &mut inner);
+            }
+            // a comprehension is all body
+            None => {
+                for k in kids {
+                    self.visit(k, nest + 1, depth + 1, &mut inner);
+                }
+            }
+        }
+        self.breaks_case.pop();
+        self.steps += 1;
+        out.push(json!({
+            "t": "loop",
+            "kind": loop_label(n.kind()),
+            "label": label,
+            "line": line(n),
+            "body": inner,
+        }));
+    }
+
+    fn exit<'t>(&mut self, n: Node<'t>, nest: usize, depth: usize, out: &mut Vec<Value>) {
+        let kind = n.kind();
+        let what = ["return", "throw", "raise", "break", "continue"]
+            .into_iter()
+            .find(|w| kind.starts_with(w))
+            .unwrap_or("return");
+        // in a c-family or go switch `break` ends the case, which the end of
+        // the arm already draws
+        if what == "break" && self.breaks_case.last() == Some(&true) {
+            return;
+        }
+        // the value returned or thrown is computed first
+        let mut c = n.walk();
+        let kids: Vec<Node<'t>> = n.named_children(&mut c).collect();
+        for k in kids {
+            self.visit(k, nest, depth + 1, out);
+        }
+        self.steps += 1;
+        out.push(json!({"t": "exit", "kind": what, "label": self.label(n), "line": line(n)}));
+    }
+
+    fn call<'t>(&mut self, n: Node<'t>, nest: usize, depth: usize, out: &mut Vec<Value>) {
+        let callee = ["function", "constructor", "type", "macro"]
+            .iter()
+            .find_map(|f| n.child_by_field_name(f));
+        // the callee expression runs first - `a().b()` calls `a` before `b` -
+        // then each argument, in order
+        if let Some(c) = callee {
+            self.visit(c, nest, depth + 1, out);
+        }
+        let mut c = n.walk();
+        let rest: Vec<Node<'t>> = n.named_children(&mut c).filter(|k| Some(*k) != callee).collect();
+        for &k in &rest {
+            self.visit(k, nest, depth + 1, out);
+        }
+
+        let macro_call = n.kind() == "macro_invocation";
+        let args: Vec<String> = match n.child_by_field_name("arguments") {
+            Some(a) => {
+                let mut c = a.walk();
+                let list: Vec<Node> = a
+                    .named_children(&mut c)
+                    .filter(|k| !self.lang.comment_kinds().contains(&k.kind()))
+                    .collect();
+                list.iter()
+                    .take(MAX_ARGS)
+                    .map(|k| clip(&oneline(self.text(*k)), ARG_CHARS))
+                    .collect()
+            }
+            // a macro's tokens are not parsed, so they are shown as written
+            None if macro_call => rest
+                .iter()
+                .map(|k| {
+                    let t = oneline(self.text(*k));
+                    clip(t.trim_start_matches(['(', '[', '{']).trim_end_matches([')', ']', '}']), ARG_CHARS * 2)
+                })
+                .filter(|t| !t.is_empty())
+                .collect(),
+            None => Vec::new(),
+        };
+        // a function written and called on the spot - `go func() { .. }()`, an
+        // iife - has no name, and its text is already drawn as the closure
+        let inline = callee.is_some_and(|c| {
+            self.lang.func_kinds().contains(&c.kind()) || self.lang.closure_kinds().contains(&c.kind())
+        });
+        let text = match callee {
+            Some(_) if inline => "(closure)".to_string(),
+            Some(c) => oneline(self.text(c)),
+            None => String::new(),
+        };
+        let (qual, name) = split_callee(&text);
+        let mut name = clip(&name, LABEL_CHARS);
+        let target = self.resolve(&name, line(n));
+        if macro_call {
+            name.push('!');
+        }
+        let mode = match n.parent().map(|p| p.kind()) {
+            Some("await_expression" | "await") => Some("await"),
+            Some("defer_statement") => Some("defer"),
+            Some("go_statement") => Some("go"),
+            Some("try_expression") => Some("try"),
+            _ if matches!(n.kind(), "new_expression" | "object_creation_expression") => Some("new"),
+            _ => None,
+        };
+        self.steps += 1;
+        out.push(json!({
+            "t": "call",
+            "name": name,
+            "qual": qual,
+            "line": line(n),
+            "args": args,
+            "mode": mode,
+            "target": target,
+        }));
+    }
+
+    // The definition a call reaches, when the resolver found evidence for one:
+    // the same name, nearest the call's own line. An rpc stub's spelling can
+    // differ from its handler's by case and underscores alone.
+    fn resolve(&self, name: &str, at: usize) -> Value {
+        let norm = |s: &str| s.replace('_', "").to_ascii_lowercase();
+        let want = norm(name);
+        let named: Vec<(usize, usize)> = self
+            .calls
+            .iter()
+            .copied()
+            .filter(|&(t, _)| norm(&self.funcs[t].name) == want)
+            .collect();
+        named
+            .iter()
+            .find(|&&(_, l)| l == at)
+            .or(named.first())
+            .map_or(Value::Null, |&(t, _)| self.funcs[t].brief(t))
+    }
+
+    // A function written inside this one. A named definition is a node of its
+    // own in the map, so it is linked rather than drawn twice; an anonymous
+    // closure has no other home, so its body is drawn here.
+    fn closure<'t>(&mut self, n: Node<'t>, nest: usize, depth: usize, out: &mut Vec<Value>) {
+        let (s, e) = (line(n), n.end_position().row + 1);
+        let own = self
+            .siblings
+            .iter()
+            .copied()
+            .find(|&i| self.funcs[i].start == s && self.funcs[i].end == e && !self.funcs[i].module);
+        if let Some(id) = own {
+            self.steps += 1;
+            out.push(json!({
+                "t": "def",
+                "label": self.funcs[id].name,
+                "line": s,
+                "target": self.funcs[id].brief(id),
+            }));
+            return;
+        }
+        let params = n.child_by_field_name("parameters");
+        let label = params.map_or_else(|| "closure".to_string(), |p| format!("closure {}", oneline(self.text(p))));
+        let mut inner = Vec::new();
+        self.breaks_case.push(false);
+        match n.child_by_field_name("body") {
+            Some(b) => self.visit(b, nest + 1, depth + 1, &mut inner),
+            None => {
+                let mut c = n.walk();
+                let kids: Vec<Node<'t>> = n.named_children(&mut c).filter(|k| Some(*k) != params).collect();
+                for k in kids {
+                    self.visit(k, nest + 1, depth + 1, &mut inner);
+                }
+            }
+        }
+        self.breaks_case.pop();
+        self.steps += 1;
+        out.push(json!({"t": "closure", "label": clip(&label, LABEL_CHARS), "line": s, "body": inner}));
+    }
+}
+
+fn line(n: Node) -> usize {
+    n.start_position().row + 1
+}
+
+fn oneline(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+// An arm's head when the grammar labels none of it: the text up to `=>`, or
+// to a `:` that is not part of `::`, with a leading `case` dropped.
+fn arm_text(arm: &str) -> String {
+    let first = arm.lines().next().unwrap_or_default();
+    let bytes = first.as_bytes();
+    let mut end = first.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'=' if bytes.get(i + 1) == Some(&b'>') => {
+                end = i;
+                break;
+            }
+            b':' if bytes.get(i + 1) == Some(&b':') => i += 1,
+            b':' | b'{' => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let head = first[..end].trim();
+    let head = head.strip_prefix("case ").unwrap_or(if head == "case" { "" } else { head });
+    clip(head.trim(), LABEL_CHARS)
+}
+
+// `billing::charge` -> (Some("billing"), "charge"); generic arguments name no
+// part of the callee, so `Vec::<u8>::new` reads as `Vec::new`
+fn split_callee(text: &str) -> (Option<String>, String) {
+    let mut plain = String::new();
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => plain.push(ch),
+            _ => {}
+        }
+    }
+    let plain = plain.replace("::::", "::");
+    let cut = ["::", "->", "."]
+        .iter()
+        .filter_map(|sep| plain.rfind(sep).map(|i| (i, sep.len())))
+        .max_by_key(|&(i, _)| i);
+    match cut {
+        Some((i, len)) if i > 0 => (
+            Some(clip(plain[..i].trim_end_matches('?'), 32)),
+            plain[i + len..].trim().to_string(),
+        ),
+        _ => (None, plain.trim().to_string()),
+    }
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+// The page `ccc run --vis` serves at `/vis`: one self-contained document - no
+// CDN, no build step - so it works offline. Its stylesheet and script are
+// kept as files of their own so they read, diff and lint as what they are.
+pub fn page(root_label: &str) -> String {
+    const HTML: &str = include_str!("../assets/vis/vis.html");
+    const CSS: &str = include_str!("../assets/vis/vis.css");
+    const JS: &str = include_str!("../assets/vis/vis.js");
+    // inline, as a webview loads no image but a `data:` one
+    const LOGO: &[u8] = include_bytes!("../ccc.png");
+    HTML.replace("__CCC_ROOT__", &esc(root_label))
+        .replace("/*__CCC_VIS_CSS__*/", &CSS.replace("__CCC_LOGO__", &base64(LOGO)))
+        // `<\/` keeps a `</script` inside the script from closing the element
+        .replace("/*__CCC_VIS_JS__*/", &JS.replace("</script", "<\\/script"))
+}
+
+// bytes as base64, for an image the page carries inline
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        // a short last chunk fills out with `=`
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan;
+    use std::fs;
+    use std::path::PathBuf;
+
+    // a project on disk, removed on drop; `tag` keeps parallel tests apart
+    struct Project(PathBuf);
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn project(tag: &str, files: &[(&str, &str)]) -> (Project, Vec<FileCache>, Model) {
+        let dir = std::env::temp_dir().join(format!("ccc-vis-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let p = dir.join(path);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        }
+        let caches = scan::build_caches(&dir, &scan::collect_files(&dir).unwrap());
+        let contracts = ContractIndex::for_root(&dir, &caches);
+        let model = Model::build(&caches, &dir, "demo", "now", &contracts);
+        (Project(dir), caches, model)
+    }
+
+    // a flow as one line per step, in drawing order: arms and bodies follow
+    // the step that owns them
+    fn shape(steps: &Value, out: &mut Vec<String>) {
+        for s in steps.as_array().into_iter().flatten() {
+            let field = |k: &str| s[k].as_str().unwrap_or_default().to_string();
+            match field("t").as_str() {
+                "call" => out.push(format!("call {}", field("name"))),
+                "branch" => {
+                    out.push(format!("branch {} {}", field("kind"), field("label")));
+                    for arm in s["arms"].as_array().into_iter().flatten() {
+                        out.push(format!("arm {}", arm["label"].as_str().unwrap_or_default()));
+                        shape(&arm["steps"], out);
+                    }
+                }
+                "loop" => {
+                    out.push(format!("loop {}", field("kind")));
+                    shape(&s["body"], out);
+                }
+                "closure" => {
+                    out.push("closure".into());
+                    shape(&s["body"], out);
+                }
+                "exit" => out.push(format!("exit {}", field("kind"))),
+                other => out.push(format!("{other} {}", field("label"))),
+            }
+        }
+    }
+
+    // the logo rides in the page as base64, padded the standard way
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+        let html = page("demo");
+        assert!(!html.contains("__CCC_LOGO__") && html.contains("data:image/png;base64,iVBORw0KGgo"), "the logo is inlined");
+    }
+
+    // An address written before its file changed holds a stale line; the
+    // function's name finds it again, wherever it moved to.
+    #[test]
+    fn a_function_that_moved_is_found_again_by_its_name() {
+        let (p, caches, m) = project("moved", &[("src/a.rs", "fn one() {}\n\n\nfn two() {\n    one();\n}\n")]);
+        let v = m.flow(&caches, &p.0, "src/a.rs", 2, Some("two")).unwrap();
+        assert_eq!((v["function"]["name"].as_str(), v["function"]["line"].as_u64()), (Some("two"), Some(4)));
+        assert!(m.flow(&caches, &p.0, "src/a.rs", 2, None).is_err(), "a stale line alone still names nothing");
+        assert!(m.flow(&caches, &p.0, "src/a.rs", 2, Some("ghost")).is_err());
+    }
+
+    fn flow_of(p: &Project, caches: &[FileCache], m: &Model, file: &str, name: &str) -> Vec<String> {
+        let id = m.by_file[file]
+            .iter()
+            .copied()
+            .find(|&i| m.funcs[i].name == name)
+            .unwrap_or_else(|| panic!("no `{name}` in {file}"));
+        let v = m.flow(caches, &p.0, file, m.funcs[id].line, Some(name)).unwrap();
+        let mut out = Vec::new();
+        shape(&v["steps"], &mut out);
+        out
+    }
+
+    // every `want` appears in `got`, in this order, with anything between
+    fn in_order(got: &[String], want: &[&str]) -> bool {
+        let mut at = 0;
+        for w in want {
+            match got[at..].iter().position(|g| g == w) {
+                Some(i) => at += i + 1,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    const RUST: &str = "fn f(x: i32) -> i32 {
+    if x > 0 { a(); } else if x < 0 { b(); } else { c(); }
+    match x { 1 => d(), _ => { e(); } }
+    for i in items() { if i { break; } continue; }
+    while g() { h(); }
+    loop { return k(x).m(); }
+    let f = |y| n(y);
+    println!(\"{}\", p());
+    q()?;
+}
+";
+    const PYTHON: &str = "def f(x):
+    if x > 0:
+        a()
+    elif x < 0:
+        b()
+    else:
+        c()
+    match x:
+        case 1:
+            d()
+        case _:
+            e()
+    for i in items():
+        break
+    while g():
+        h()
+    try:
+        k()
+    except ValueError as e:
+        m()
+    finally:
+        n()
+    raise X()
+    return p(x) if q() else r()
+";
+    const JS: &str = "function f(x) {
+  if (x > 0) { a(); } else if (x < 0) { b(); } else { c(); }
+  switch (x) { case 1: d(); break; default: e(); }
+  for (const i of items()) { continue; }
+  while (g()) { h(); }
+  do { k(); } while (m());
+  try { n(); } catch (e) { p(); } finally { q(); }
+  const z = x ? r() : s();
+  items().map((y) => t(y));
+  throw new Error(u());
+}
+";
+    const TS: &str = "function f(x: number): number {
+  if (x > 0) { a(); } else { c(); }
+  for (const i of items()) { continue; }
+  const z = x ? r() : s();
+  return v();
+}
+";
+    const GO: &str = "package p
+func f(x int) int {
+	if x > 0 { a() } else if x < 0 { b() } else { c() }
+	switch x { case 1: d(); default: e() }
+	switch v := y.(type) { case int: g() }
+	select { case <-ch: h() }
+	for i := range items() { break }
+	go func() { k() }()
+	return m()
+}
+";
+    const C: &str = "int f(int x) {
+  if (x > 0) { a(); } else if (x < 0) { b(); } else { c(); }
+  switch (x) { case 1: d(); break; default: e(); }
+  while (g()) { h(); }
+  do { k(); } while (m());
+  return x ? n() : p();
+}
+";
+    const CPP: &str = "int f(int x) {
+  switch (x) { case 1: d(); break; default: e(); }
+  for (auto i : items()) { continue; }
+  try { n(); } catch (const std::exception& e) { p(); }
+  auto l = [](int y) { return q(y); };
+  obj.method(z());
+  throw std::runtime_error(r());
+}
+";
+    const CSHARP: &str = "class C { int F(int x) {
+  if (x > 0) { A(); } else if (x < 0) { B(); } else { Cc(); }
+  switch (x) { case 1: D(); break; default: E(); break; }
+  var y = x switch { 1 => G(), _ => H() };
+  foreach (var i in Items()) { continue; }
+  try { N(); } catch (Exception e) { P(); } finally { Q(); }
+  var o = new Foo(R());
+  return x > 0 ? S() : T();
+} }
+";
+    const ZIG: &str = "fn f(x: i32) i32 {
+    if (x > 0) { a(); } else if (x < 0) { b(); } else { c(); }
+    switch (x) { 1 => d(), else => e() }
+    for (items()) |i| { _ = i; break; }
+    while (g()) { h(); continue; }
+    const y = if (x > 0) k() else m();
+    return n();
+}
+";
+    const ODIN: &str = "package p
+f :: proc(x: int) -> int {
+	if x > 0 { a() } else if x < 0 { b() } else { c() }
+	switch x { case 1: d() case: e() }
+	for i in items() { break }
+	defer k()
+	return m()
+}
+";
+
+    // One function per language, written with the same shapes: an if chain,
+    // a many-way choice, loops, closures, exits. The walker knows a grammar
+    // only through the kind tables, so each has to come out drawn alike - in
+    // the order the code runs, with a c-family `break` ending its case rather
+    // than drawn as an exit.
+    #[test]
+    fn the_flow_walker_draws_every_language_alike() {
+        let (p, caches, m) = project(
+            "flow",
+            &[
+                ("f.rs", RUST),
+                ("f.py", PYTHON),
+                ("f.js", JS),
+                ("f.ts", TS),
+                ("f.go", GO),
+                ("f.c", C),
+                ("f.cpp", CPP),
+                ("f.cs", CSHARP),
+                ("f.zig", ZIG),
+                ("f.odin", ODIN),
+            ],
+        );
+        let cases: &[(&str, &str, &[&str], &[&str])] = &[
+            (
+                "f.rs",
+                "f",
+                &[
+                    "branch if x > 0", "arm true", "call a", "arm false", "branch if x < 0", "call b", "call c",
+                    "branch match x", "arm 1", "call d", "arm _", "call e",
+                    "call items", "loop for", "branch if i", "exit break", "exit continue",
+                    "call g", "loop while", "call h",
+                    "loop loop", "call k", "call m", "exit return",
+                    "closure", "call n", "call println!", "call q",
+                ],
+                &[],
+            ),
+            (
+                "f.py",
+                "f",
+                &[
+                    "branch if x > 0", "call a", "branch if x < 0", "call b", "call c",
+                    "branch match x", "arm 1", "call d", "arm _", "call e",
+                    "call items", "loop for", "exit break", "call g", "loop while", "call h",
+                    "branch try try", "arm try", "call k", "arm except ValueError as e", "call m", "call n",
+                    "call X", "exit raise", "call p", "call q", "call r", "exit return",
+                ],
+                &[],
+            ),
+            (
+                "f.js",
+                "f",
+                &[
+                    "branch if (x > 0)", "call a", "branch if (x < 0)", "call b", "call c",
+                    "branch switch (x)", "arm 1", "call d", "arm default", "call e",
+                    "call items", "loop for", "exit continue", "call g", "loop while", "call h",
+                    "loop do", "call k", "call m",
+                    "branch try try", "arm try", "call n", "arm catch (e)", "call p", "call q",
+                    "branch ternary x", "arm true", "call r", "arm false", "call s",
+                    "call items", "closure", "call t", "call map",
+                    "call u", "call Error", "exit throw",
+                ],
+                &["exit break"],
+            ),
+            (
+                "f.ts",
+                "f",
+                &["branch if (x > 0)", "call a", "call c", "call items", "loop for", "exit continue", "branch ternary x", "call r", "call s", "call v", "exit return"],
+                &[],
+            ),
+            (
+                "f.go",
+                "f",
+                &[
+                    "branch if x > 0", "call a", "branch if x < 0", "call b", "call c",
+                    "branch switch x", "arm 1", "call d", "arm default", "call e",
+                    "branch switch y", "arm int", "call g",
+                    "branch select select", "arm <-ch", "call h",
+                    "call items", "loop for", "exit break",
+                    "closure", "call k", "call (closure)", "call m", "exit return",
+                ],
+                &[],
+            ),
+            (
+                "f.c",
+                "f",
+                &[
+                    "branch if (x > 0)", "call a", "branch if (x < 0)", "call b", "call c",
+                    "branch switch (x)", "arm 1", "call d", "arm default", "call e",
+                    "call g", "loop while", "call h", "loop do", "call k", "call m",
+                    "branch ternary x", "call n", "call p", "exit return",
+                ],
+                &["exit break"],
+            ),
+            (
+                "f.cpp",
+                "f",
+                &[
+                    "branch switch (x)", "arm 1", "call d", "arm default", "call e",
+                    "call items", "loop for", "exit continue",
+                    "branch try try", "arm try", "call n", "arm catch (const std::exception& e)", "call p",
+                    "closure", "call q", "exit return",
+                    "call z", "call method", "call r", "call runtime_error", "exit throw",
+                ],
+                &["exit break"],
+            ),
+            (
+                "f.cs",
+                "F",
+                &[
+                    "branch if x > 0", "call A", "branch if x < 0", "call B", "call Cc",
+                    "branch switch x", "arm 1", "call D", "arm default", "call E",
+                    "branch switch x", "arm 1", "call G", "arm _", "call H",
+                    "call Items", "loop for", "exit continue",
+                    "branch try try", "call N", "arm catch (Exception e)", "call P", "call Q",
+                    "call R", "call Foo", "branch ternary x > 0", "call S", "call T", "exit return",
+                ],
+                &["exit break"],
+            ),
+            (
+                "f.zig",
+                "f",
+                &[
+                    "branch if x > 0", "call a", "branch if x < 0", "call b", "call c",
+                    "branch switch x", "arm 1", "call d", "arm else", "call e",
+                    "call items", "loop for", "exit break",
+                    "call g", "loop while", "call h", "exit continue",
+                    "branch if x > 0", "call k", "call m", "call n", "exit return",
+                ],
+                &[],
+            ),
+            (
+                "f.odin",
+                "f",
+                &[
+                    "branch if x > 0", "call a", "branch if x < 0", "call b", "call c",
+                    "branch switch x", "arm 1", "call d", "arm default", "call e",
+                    "call items", "loop for", "exit break", "call k", "call m", "exit return",
+                ],
+                &[],
+            ),
+        ];
+        for (file, name, want, never) in cases {
+            let got = flow_of(&p, &caches, &m, file, name);
+            assert!(in_order(&got, want), "{file}: wanted, in order:\n  {}\ngot:\n  {}", want.join("\n  "), got.join("\n  "));
+            for n in *never {
+                assert!(!got.iter().any(|g| g == n), "{file}: `{n}` should not be drawn:\n  {}", got.join("\n  "));
+            }
+        }
+    }
+
+    // a schema's rpc has no body: its flow is empty, not an error
+    #[test]
+    fn an_rpc_has_an_empty_flow() {
+        let (p, caches, m) = project(
+            "rpc",
+            &[("billing.proto", "syntax = \"proto3\";\nservice Billing {\n  rpc Charge(Req) returns (Res);\n}\nmessage Req {}\nmessage Res {}\n")],
+        );
+        assert!(flow_of(&p, &caches, &m, "billing.proto", "Charge").is_empty());
+    }
+
+    // The levels above the code - containers from directories, the calls
+    // between them, the components inside each, a call nothing answers - and
+    // the code of one file with stand-ins for what it reaches beyond itself.
+    #[test]
+    fn the_levels_roll_calls_up_from_functions_to_containers() {
+        let (p, caches, m) = project(
+            "levels",
+            &[
+                (
+                    "api/server.py",
+                    "from core.store import save\n\n# ccc:calls http billing.charge\ndef handle(x):\n    return save(x)\n",
+                ),
+                ("core/store.py", "def save(x):\n    return clean(x)\n\ndef clean(x):\n    return x\n"),
+            ],
+        );
+        let o = m.overview();
+        assert_eq!(o["schema"], SCHEMA);
+        let names: Vec<&str> = o["containers"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["api", "core"]);
+        let edge = o["container_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["from"] == "api" && e["to"] == "core")
+            .unwrap_or_else(|| panic!("api calls core: {o:#}"));
+        assert_eq!(edge["detected"], true);
+        assert!(edge["symbols"].as_array().unwrap().iter().any(|s| s == "save"));
+        assert!(o["component_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["from"] == "api/server.py" && e["to"] == "core/store.py"));
+        // nothing answers the annotated call, so it leaves the map
+        let outside = &o["outside"][0];
+        assert_eq!(outside["direction"], "out");
+        assert_eq!(outside["transport"], "http");
+        assert_eq!(outside["containers"][0]["container"], "api");
+
+        let code = m.code(&caches, "core/store.py").unwrap();
+        let fns: Vec<&str> = code["functions"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(fns, ["save", "clean"]);
+        assert!(code["proxies"].as_array().unwrap().iter().any(|x| x["name"] == "handle" && x["file"] == "api/server.py"));
+        let clean = code["functions"][1]["id"].clone();
+        assert!(code["functions"][0]["calls"].as_array().unwrap().iter().any(|c| c["to"] == clean));
+        assert!(m.code(&caches, "nowhere.py").is_err());
+
+        // a call step names the definition it reaches, across files
+        let v = m.flow(&caches, &p.0, "api/server.py", 4, Some("handle")).unwrap();
+        assert_eq!(v["steps"][0]["name"], "save");
+        assert_eq!(v["steps"][0]["target"]["file"], "core/store.py");
+        assert_eq!(v["params"][0], "x");
+        assert!(m.flow(&caches, &p.0, "api/server.py", 99, None).is_err());
+    }
+
+    fn step(status: &'static str, files: &[(&str, Option<&str>, Option<&str>)]) -> edit::Activity {
+        edit::Activity {
+            changeset: "c1-test".into(),
+            status,
+            ops: vec!["text".into()],
+            intent: Vec::new(),
+            files: files
+                .iter()
+                .map(|(path, before, after)| edit::FileText {
+                    path: path.to_string(),
+                    before: before.map(str::to_string),
+                    after: after.map(str::to_string),
+                })
+                .collect(),
+        }
+    }
+
+    fn lang_of(path: &str) -> Option<Language> {
+        Language::from_path(Path::new(path))
+    }
+
+    // Reflowing a function - re-indenting it, wrapping a long call - moves none
+    // of its logic: the step says so, and is seen where something did change.
+    #[test]
+    fn a_change_of_layout_alone_is_no_change() {
+        let before = "fn a(x: i32) -> i32 {\n    b(x, 1)\n}\n\nfn b(x: i32, y: i32) -> i32 {\n    x + y\n}\n";
+        let after = "fn a(x: i32) -> i32 {\n    b(\n        x,\n        1,\n    )\n}\n\nfn b(x: i32, y: i32) -> i32 {\n    x - y\n}\n";
+        let ev = event(1, 0, "edit_text", &step("applied", &[("src/a.rs", Some(before), Some(after))]), lang_of);
+        let ws: Vec<(&str, bool)> = ev.json["functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| (t["name"].as_str().unwrap(), t["whitespace"].as_bool().unwrap()))
+            .collect();
+        assert_eq!(ws, [("a", true), ("b", false)], "wrapping a call is layout, a new operator is not");
+        assert_eq!(ev.json["whitespace"], false);
+        // seen where its logic changed, not where it was only rewrapped
+        let Focus::Flow(t) = &ev.focus else { panic!("{:?}", ev.focus) };
+        assert_eq!(t.name, "b");
+
+        let spaced = before.replace("b(x, 1)", "b(x,   1)");
+        let only = event(2, 0, "edit_text", &step("applied", &[("src/a.rs", Some(before), Some(&spaced))]), lang_of);
+        assert_eq!(only.json["whitespace"], true);
+        assert_eq!(only.json["files"][0]["whitespace"], true);
+    }
+
+    // One line written into one function: the step is seen at that function's
+    // logic, both sides of it draw, and the lines it moved are named on each.
+    #[test]
+    fn an_edit_inside_one_function_is_seen_at_its_logic() {
+        let before = "fn a() {\n    b();\n}\n\nfn b() {}\n\nfn c() {\n    b();\n}\n";
+        let after = "fn a() {\n    b();\n    c();\n}\n\nfn b() {}\n\nfn c() {\n    b();\n}\n";
+        let (_p, caches, m) = project("event-one", &[("src/calls.rs", before)]);
+        let s = step("staged", &[("src/calls.rs", Some(before), Some(after))]);
+        let ev = event(1, 0, "edit_text", &s, lang_of);
+        let Focus::Flow(t) = &ev.focus else { panic!("{:?}", ev.focus) };
+        assert_eq!((t.name.as_str(), t.change), ("a", "modified"));
+        assert_eq!((t.before, t.after), (Some((1, 1, 3)), Some((1, 1, 4))));
+        // the new call is line 3 after; before, it lands ahead of the `}` on line 3
+        assert_eq!((t.lines_before.as_slice(), t.lines_after.as_slice()), (&[(3, 3)][..], &[(3, 3)][..]));
+        assert_eq!(ev.json["on_disk"], "before");
+        assert_eq!((ev.json["files"][0]["added"].as_u64(), ev.json["files"][0]["removed"].as_u64()), (Some(1), Some(0)));
+        assert_eq!(ev.json["functions"].as_array().map(Vec::len), Some(1), "b and c only moved");
+
+        let calls = |v: Option<Arc<Value>>| {
+            let mut out = Vec::new();
+            shape(&v.expect("a snapshot")["steps"], &mut out);
+            out
+        };
+        assert_eq!(calls(m.snapshot(&caches, &s, &ev.focus, false)), ["call b"]);
+        // the step is not written, yet its logic draws from the text it carries
+        assert_eq!(calls(m.snapshot(&caches, &s, &ev.focus, true)), ["call b", "call c"]);
+    }
+
+    // a step widens from one function to its file, to the whole map, and to
+    // nothing the map draws as it touches more
+    #[test]
+    fn a_step_is_seen_at_the_narrowest_level_that_holds_it() {
+        let two = ("a.rs", Some("fn a() { x(); }\nfn b() { x(); }\n"), Some("fn a() { y(); }\nfn b() { y(); }\n"));
+        let doc = ("README.md", Some("# a\n"), Some("# b\n"));
+        let other = ("b.rs", Some("fn c() {}\n"), Some("fn c() { z(); }\n"));
+        let focus = |files: &[(&str, Option<&str>, Option<&str>)]| event(1, 0, "t", &step("applied", files), lang_of).focus;
+        assert_eq!(focus(&[two]), Focus::Code("a.rs".into()));
+        assert_eq!(focus(&[two, other]), Focus::Overview);
+        assert_eq!(focus(&[doc]), Focus::Nowhere);
+        // one function and a note elsewhere is still that function's logic
+        let Focus::Flow(t) = focus(&[other, doc]) else { panic!() };
+        assert_eq!(t.name, "c");
+
+        // a new function has no before side; where it lands is kept instead
+        let add = ("a.rs", Some("fn a() {}\n"), Some("fn a() {}\n\nfn n() { a(); }\n"));
+        let Focus::Flow(t) = focus(&[add]) else { panic!() };
+        assert_eq!((t.name.as_str(), t.change, t.before), ("n", "added", None));
+        assert_eq!(t.lines_before, [(2, 2)]);
+        let gone = ("a.rs", Some("fn a() {}\n\nfn n() { a(); }\n"), Some("fn a() {}\n"));
+        let Focus::Flow(t) = focus(&[gone]) else { panic!() };
+        assert_eq!((t.change, t.after), ("removed", None));
+
+        // a change inside a nested function is seen at the innermost one
+        let nested = (
+            "n.py",
+            Some("def outer():\n    def inner():\n        x()\n    inner()\n"),
+            Some("def outer():\n    def inner():\n        y()\n    inner()\n"),
+        );
+        let Focus::Flow(t) = focus(&[nested]) else { panic!() };
+        assert_eq!(t.name, "inner");
+    }
+
+    #[test]
+    fn a_callee_reads_as_its_name_and_qualifier() {
+        assert_eq!(split_callee("billing::charge"), (Some("billing".into()), "charge".into()));
+        assert_eq!(split_callee("Vec::<u8>::new"), (Some("Vec".into()), "new".into()));
+        assert_eq!(split_callee("self.client.send"), (Some("self.client".into()), "send".into()));
+        assert_eq!(split_callee("ptr->run"), (Some("ptr".into()), "run".into()));
+        assert_eq!(split_callee("plain"), (None, "plain".into()));
+        assert_eq!(arm_text("Some(x) if x > 0 => {"), "Some(x) if x > 0");
+        assert_eq!(arm_text("case Foo::Bar: go();"), "Foo::Bar");
+        assert_eq!(arm_text("default: e();"), "default");
+        assert_eq!(arm_text("case: e()"), "");
+    }
+
+    // A step that adds an import, a constant and a function, and calls the new
+    // function from an old one, plays as a part per definition - imports, then
+    // what it adds, then what it changes - each part starting where the last
+    // left off, and the last leaving exactly what the step wrote.
+    #[test]
+    fn a_step_comes_apart_a_definition_at_a_time() {
+        let before = "use std::fs;\n\npub fn build(files: &[u8]) -> usize {\n    let n = files.len();\n    n\n}\n\nfn other() {}\n";
+        let after = "use std::fs;\nuse std::thread;\n\npub fn build(files: &[u8]) -> usize {\n    let n = parse_all(files);\n    n\n}\n\n// how many workers\nconst WORKERS: usize = 4;\n\n// parse on every core\nfn parse_all(files: &[u8]) -> usize {\n    files.len() / WORKERS\n}\n\nfn other() {}\n";
+        let parts = split(&step("applied", &[("src/a.rs", Some(before), Some(after))]), lang_of);
+        let labels: Vec<(&str, Option<&str>, &str)> = parts
+            .iter()
+            .map(|(_, p)| {
+                let p = p.as_ref().expect("a part");
+                (p.kind, p.name.as_deref(), p.change)
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("imports", None, "added"),
+                ("const", Some("WORKERS"), "added"),
+                ("function", Some("parse_all"), "added"),
+                ("function", Some("build"), "modified"),
+            ]
+        );
+        for w in parts.windows(2) {
+            assert_eq!(w[0].0.files[0].after, w[1].0.files[0].before);
+        }
+        assert_eq!(parts[0].0.files[0].before.as_deref(), Some(before));
+        assert_eq!(parts[3].0.files[0].after.as_deref(), Some(after));
+        // a new function arrives whole, its comment with it, before anything calls it
+        let added = parts[2].0.files[0].after.as_deref().unwrap();
+        assert_eq!(added, after.replace("let n = parse_all(files);", "let n = files.len();"));
+        let ev = event(1, 0, "edit_text", &parts[2].0, lang_of);
+        let Focus::Flow(t) = &ev.focus else { panic!("{:?}", ev.focus) };
+        assert_eq!((t.name.as_str(), t.change), ("parse_all", "added"));
+
+        // a function added after the one that calls it comes apart from the call,
+        // though the diff paired its closing brace with the caller's
+        let before = "pub fn charge(n: i32) -> i32 {\n    n\n}\n";
+        let after = "pub fn charge(n: i32) -> i32 {\n    fee(n)\n}\n\npub fn fee(n: i32) -> i32 {\n    n / 100\n}\n";
+        let parts = split(&step("staged", &[("src/pay.rs", Some(before), Some(after))]), lang_of);
+        let labels: Vec<(Option<&str>, &str)> =
+            parts.iter().filter_map(|(_, p)| p.as_ref()).map(|p| (p.name.as_deref(), p.change)).collect();
+        assert_eq!(labels, [(Some("fee"), "added"), (Some("charge"), "modified")]);
+        assert_eq!(parts[0].0.files[0].after.as_deref(), Some("pub fn charge(n: i32) -> i32 {\n    n\n}\n\npub fn fee(n: i32) -> i32 {\n    n / 100\n}\n"));
+
+        // a change to one definition is one part, so the step stays whole
+        let one = before.replace("files.len()", "files.len() + 1");
+        let whole = split(&step("applied", &[("src/a.rs", Some(before), Some(&one))]), lang_of);
+        assert_eq!((whole.len(), whole[0].1.is_none()), (1, true));
+    }
+
+    // what an agent read, it is seen looking at: the definition it looked up,
+    // with the functions that call it marked alongside
+    #[test]
+    fn a_look_is_seen_at_what_it_looked_up() {
+        let src = "fn charge() {}\n\nfn refund() {\n    charge();\n}\n";
+        let (_p, caches, _m) = project("look", &[("src/pay.rs", src)]);
+        let sites = [("src/pay.rs".to_string(), 1, true), ("src/pay.rs".to_string(), 4, false)];
+        let ev = look(0, "references", "charge", &sites, &caches).expect("a look");
+        let Focus::Flow(t) = &ev.focus else { panic!("{:?}", ev.focus) };
+        assert_eq!((t.name.as_str(), t.change), ("charge", "read"));
+        assert_eq!(ev.json["status"], "read");
+        assert_eq!(ev.json["intent"], json!(["references charge"]));
+        let names: Vec<&str> = ev.json["functions"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["charge", "refund"]);
+        let file = look(0, "file", "src/pay.rs", &[("src/pay.rs".to_string(), 0, true)], &caches).expect("a look");
+        assert_eq!(file.focus, Focus::Code("src/pay.rs".into()));
+        assert!(look(0, "file", "ghost.rs", &[("ghost.rs".to_string(), 0, true)], &caches).is_none());
+    }
+}

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__CCC_ROOT__ · ccc vis</title>
+<style>/*__CCC_VIS_CSS__*/</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><i class="logo" role="img" aria-label="ccc"></i></div>
+  <nav class="crumbs" id="crumbs" aria-label="level"></nav>
+  <div class="spacer"></div>
+  <div class="search">
+    <svg viewBox="0 0 16 16" fill="none" stroke-width="2"><circle cx="7" cy="7" r="5"/><path d="M11 11l4 4"/></svg>
+    <input id="search" type="search" placeholder="Find a function or file  ( / )" autocomplete="off" spellcheck="false">
+    <div class="results" id="results" hidden></div>
+  </div>
+  <div class="tools">
+    <button class="chip" id="lib" title="Calls that reach no function in this project - the standard library, a dependency, anything the resolver had no evidence for">library calls</button>
+    <button class="chip" id="tests" title="Test files and test functions">tests</button>
+    <button class="chip" id="theme" title="Colour scheme">light</button>
+  </div>
+</header>
+
+<main class="viewport" id="viewport" tabindex="0" aria-label="architecture canvas">
+  <div class="surface" id="surface">
+    <div id="frames"></div>
+    <svg class="wires" id="wires" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path class="arrowhead" d="M 0 0 L 10 5 L 0 10 z"/>
+        </marker>
+        <marker id="arrow-hot" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path class="arrowhead hot" d="M 0 0 L 10 5 L 0 10 z"/>
+        </marker>
+      </defs>
+      <g id="wire-layer"></g>
+    </svg>
+    <svg class="wires lit" id="lit-wires" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div class="labels" id="labels"></div>
+    <div id="nodes"></div>
+    <div class="groups" id="groups"></div>
+    <svg class="wires group-wires" id="group-wires" xmlns="http://www.w3.org/2000/svg"></svg>
+  </div>
+</main>
+
+<aside class="panel" id="panel" hidden>
+  <header>
+    <div><div class="what" id="panel-what"></div><h2 id="panel-title"></h2></div>
+    <button id="panel-close" title="Close (Esc)" aria-label="close">×</button>
+  </header>
+  <div class="content" id="panel-body"></div>
+</aside>
+
+<div class="zoom" id="zoombar">
+  <button id="zoom-out" title="Zoom out (-)" aria-label="zoom out">−</button>
+  <output id="zoom-level">100%</output>
+  <button id="zoom-in" title="Zoom in (+)" aria-label="zoom in">+</button>
+  <button id="zoom-fit" title="Fit everything (F)">Fit</button>
+  <button id="layout-reset" title="Forget dragged positions in this view">Re-layout</button>
+</div>
+<div class="legend" id="legend"></div>
+<!-- what the view is, and under it what a proposed or replayed step on show is, centred at the top -->
+<div class="top-notes">
+  <div class="note-bar" id="note" hidden></div>
+  <div class="replay-badge" id="replay-badge" hidden></div>
+</div>
+<div class="message" id="message" hidden></div>
+<div class="replay-badge" id="replay-badge" hidden></div>
+
+<section class="timeline" id="timeline" aria-label="edit timeline" hidden>
+  <button class="tl-unfold" id="tl-unfold" title="Show the step controls" aria-label="show the step controls" aria-expanded="false" hidden>»</button>
+  <div class="tl-controls" id="tl-controls">
+    <button id="tl-prev" title="Previous step (,)" aria-label="previous step">‹</button>
+    <button id="tl-play" title="Replay the steps from here" aria-label="replay">▶</button>
+    <button id="tl-next" title="Next step (.)" aria-label="next step">›</button>
+  </div>
+  <div class="tl-track" id="tl-track" tabindex="0" role="slider" aria-label="scrub through edit steps"><div class="tl-ticks" id="tl-ticks"></div></div>
+  <button class="tl-ask" id="tl-ask" hidden>Asks</button>
+  <button class="tl-step" id="tl-step"></button>
+  <div class="tl-side" id="tl-side" role="group" aria-label="which side of the step" hidden>
+    <button data-side="before" title="The code as it was before this step">before</button>
+    <button data-side="after" title="The code as this step left it">after</button>
+  </div>
+  <button class="tl-speed" id="tl-speed" title="Replay speed - Live keeps the time between steps as it was, slower stretches it (shift-click goes back up)" aria-label="replay speed">Live</button>
+  <button class="tl-focus" id="tl-focus" title="Granular Changes - each step seen on its own: what it did not touch fades back, and a big scene keeps only what is wired to it" aria-label="granular changes" aria-pressed="true">◎</button>
+  <button class="tl-ws" id="tl-ws" title="Show whitespace changes - steps that only move whitespace or wrap lines" aria-label="show whitespace changes" aria-pressed="false">¶</button>
+  <button class="tl-follow" id="tl-follow" role="switch" aria-checked="true" title="Follow live changes - each edit shown as it lands (L)"><span class="switch" aria-hidden="true"></span><span>Follow<span class="tl-follow-more"> live changes</span></span><span id="tl-behind"></span></button>
+</section>
+
+<script>/*__CCC_VIS_JS__*/</script>
+</body>
+</html>
