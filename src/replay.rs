@@ -21,8 +21,8 @@ const FETCH_SPEC: &str = "+refs/ccc/replay/*:refs/ccc/replay/*";
 const HOOK_MARK: &str = "# ccc: save the replay of each branch pushed";
 // the format a session file declares on its first line
 const FORMAT: u64 = 1;
-// an ask's request kept on its steps, cut past this
-const PROMPT_CHARS: usize = 2000;
+// where a branch's narration lives - beside its replay but out of the default fetch, so only a reviewer who opens the replay fetches it
+pub const VOICE_PREFIX: &str = "refs/ccc/voice/";
 // asks are looked for this long before a replay's first new step
 const ASK_LEAD_SECS: i64 = 4 * 3600;
 // the session of steps no ask accounts for, before any that one does
@@ -218,6 +218,22 @@ pub struct Saved {
     pub skipped: Option<String>,
     // the remote the replay went to, or why it did not
     pub pushed: Option<Result<String, String>>,
+    // the narration that went with it
+    pub voice: Option<Voiced>,
+}
+
+// what a save did with a replay's narration
+#[derive(Debug, Default)]
+pub struct Voiced {
+    // turned off, for the branch or everywhere
+    pub off: bool,
+    // the lines the narration ref holds now, and those this save added
+    pub lines: usize,
+    pub added: usize,
+    // steps of the replay no line reads yet
+    pub unvoiced: usize,
+    // the remote it went to, or why it did not
+    pub pushed: Option<Result<String, String>>,
 }
 
 impl Saved {
@@ -241,7 +257,38 @@ impl Saved {
             Some(Err(e)) => out.push_str(&format!("\nccc: the replay was not pushed: {e}")),
             None => {}
         }
+        if let Some(v) = &self.voice {
+            if v.off {
+                out.push_str("\nccc: its narration is not shared (`git config ccc.replay.voice` or `branch.<name>.cccVoice` is false)");
+            } else if v.lines > 0 {
+                let new = if v.added > 0 { format!(" ({} new)", v.added) } else { String::new() };
+                let sent = match &v.pushed {
+                    Some(Ok(remote)) => format!(", pushed to {remote}"),
+                    _ => String::new(),
+                };
+                out.push_str(&format!(
+                    "\nccc: its narration, {} line(s){new}, is in {VOICE_PREFIX}{}{sent} - reviewers play it without the voice",
+                    v.lines, self.branch
+                ));
+            }
+            if let Some(Err(e)) = &v.pushed {
+                out.push_str(&format!("\nccc: its narration was not pushed: {e}"));
+            }
+            if !v.off && v.unvoiced > 0 && crate::voice::ready() {
+                out.push_str(&format!(
+                    "\nccc: {} step(s) are not voiced yet - play the replay in the visualiser to voice them, and they go with the next push",
+                    v.unvoiced
+                ));
+            }
+        }
         out
+    }
+
+    // something worth saying even when asked to be quiet - steps saved, narration sent, or a push that failed
+    pub fn news(&self) -> bool {
+        self.skipped.is_none()
+            || matches!(self.pushed, Some(Err(_)))
+            || self.voice.as_ref().is_some_and(|v| v.added > 0 || matches!(v.pushed, Some(Err(_))))
     }
 }
 
@@ -311,15 +358,10 @@ pub fn save(root: &Path, opts: &SaveOptions) -> Result<Saved> {
                 session = Some(t.session.clone());
             }
             let s = session.clone().unwrap_or_else(|| UNATTRIBUTED.to_string());
-            v["ask"] = ask.map_or(Value::Null, |t| {
-                json!({
-                    "id": t.id,
-                    "agent": t.agent,
-                    "model": t.model,
-                    "at": t.epoch * 1000,
-                    "prompt": t.prompt.chars().take(PROMPT_CHARS).collect::<String>(),
-                })
-            });
+            // the story goes with the replay - the ask, the agent's plan, its beats and its last word - so a reviewer needs no transcript
+            let beat = ask.and_then(|t| crate::serve::beat_at(v["at"].as_u64().unwrap_or(0), v["changeset"].as_str(), v["call"].as_str(), t));
+            v["ask"] = ask.map_or(Value::Null, crate::serve::ask_json);
+            v["beat"] = json!(beat);
             for t in v["texts"].as_array().into_iter().flatten() {
                 texts.extend(["before", "after"].iter().filter_map(|side| t[*side].as_str().map(str::to_string)));
             }
@@ -344,7 +386,154 @@ pub fn save(root: &Path, opts: &SaveOptions) -> Result<Saved> {
         let pushed = git_in(root, &["push", "--quiet", "--no-verify", r, &format!("{refname}:{refname}")], b"", &[]);
         saved.pushed = Some(pushed.map(|_| r.clone()).map_err(|e| e.to_string()));
     }
+    saved.voice = share_voice(root, &branch, remote.as_deref(), opts.push);
     Ok(saved)
+}
+
+// the lines the replay's steps were read with, committed beside it under a ref of their own and pushed with it - unless narration is not shared
+fn share_voice(root: &Path, branch: &str, remote: Option<&str>, push: bool) -> Option<Voiced> {
+    let off = |key: &str| git(root, &["config", "--bool", key]).as_deref() == Some("false");
+    if off("ccc.replay.voice") || off(&format!("branch.{branch}.cccVoice")) {
+        return Some(Voiced { off: true, ..Default::default() });
+    }
+    let steps = steps_of(root, &format!("{REF_PREFIX}{branch}"));
+    if steps.is_empty() {
+        return None;
+    }
+    let read = crate::voice::lines_for(root, &steps);
+    // the steps the visualiser reads - a proposal written later is read as its write
+    let written: BTreeSet<&str> = steps.iter().filter(|v| v["status"] == "applied").filter_map(|v| v["changeset"].as_str()).collect();
+    let heard: BTreeSet<String> = steps
+        .iter()
+        .filter(|v| !(v["status"] == "staged" && v["changeset"].as_str().is_some_and(|c| written.contains(c))))
+        .map(crate::voice::step_key)
+        .collect();
+    let refname = format!("{VOICE_PREFIX}{branch}");
+    let base = git(root, &["rev-parse", "--verify", "--quiet", &format!("{refname}^{{commit}}")]);
+    let held: BTreeSet<String> = base
+        .as_deref()
+        .and_then(|b| git(root, &["ls-tree", "-r", "--name-only", b, "lines"]))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut voiced = Voiced { unvoiced: heard.iter().filter(|k| !read.contains_key(*k)).count(), ..Default::default() };
+    let mut info = String::new();
+    for fp in read.values().collect::<BTreeSet<_>>() {
+        for ext in ["webm", "json"] {
+            let name = format!("lines/{fp}.{ext}");
+            if held.contains(&name) {
+                continue;
+            }
+            let Some((bytes, _)) = crate::voice::line(&format!("{fp}.{ext}")) else { continue };
+            let Ok(id) = git_in(root, &["hash-object", "-w", "--stdin"], &bytes, &[]) else { continue };
+            info.push_str(&format!("100644 blob {id}\t{name}\n"));
+            if ext == "webm" {
+                voiced.added += 1;
+            }
+        }
+    }
+    voiced.lines = held.iter().filter(|n| n.ends_with(".webm")).count() + voiced.added;
+    if !info.is_empty() {
+        let message = format!("ccc narration: {branch} - {} line(s)", voiced.lines);
+        if let Err(e) = write_ref(root, &refname, base.as_deref(), &info, &message) {
+            voiced.pushed = Some(Err(e.to_string()));
+            return Some(voiced);
+        }
+    }
+    let local = git(root, &["rev-parse", "--verify", "--quiet", &refname]);
+    if let (true, Some(r), Some(_)) = (push, remote, local) {
+        let pushed = git_in(root, &["push", "--quiet", "--no-verify", r, &format!("{refname}:{refname}")], b"", &[]);
+        voiced.pushed = Some(pushed.map(|_| r.to_string()).map_err(|e| e.to_string()));
+    }
+    Some(voiced)
+}
+
+// every step a replay ref holds, as its session files keep them
+fn steps_of(root: &Path, refname: &str) -> Vec<Value> {
+    let Some(commit) = git(root, &["rev-parse", "--verify", "--quiet", &format!("{refname}^{{commit}}")]) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in git(root, &["ls-tree", "-r", "--name-only", &commit, "sessions"]).unwrap_or_default().lines() {
+        let text = git_raw(root, &["cat-file", "blob", &format!("{commit}:{name}")]).unwrap_or_default();
+        out.extend(text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v.get("status").is_some()));
+    }
+    out
+}
+
+// a branch name a request may name a ref by - nothing that could step outside `refs/ccc/` or read as an option
+pub fn branch_ok(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '/', '.'])
+        && !name.contains("..")
+        && !name.ends_with(['/', '.'])
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+}
+
+// the steps of a branch's replay, oldest first and numbered - what a reviewer's visualiser plays
+pub fn steps(root: &Path, branch: &str) -> Vec<Value> {
+    let mut steps = steps_of(root, &format!("{REF_PREFIX}{branch}"));
+    steps.sort_by_key(|v| v["at"].as_u64().unwrap_or(0));
+    for (i, v) in steps.iter_mut().enumerate() {
+        v["seq"] = json!(i + 1);
+        if let Some(o) = v.as_object_mut() {
+            o.remove("server");
+        }
+    }
+    steps
+}
+
+// the replays this repository holds, newest first
+pub fn list(root: &Path) -> Vec<Value> {
+    git(root, &["for-each-ref", "--sort=-committerdate", "--format=%(refname)%09%(committerdate:unix)%09%(contents:subject)", REF_PREFIX])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, '\t');
+            let branch = parts.next()?.strip_prefix(REF_PREFIX)?.to_string();
+            let at = parts.next()?.parse::<i64>().ok()?;
+            Some(json!({"branch": branch, "at": at * 1000, "subject": parts.next().unwrap_or("")}))
+        })
+        .collect()
+}
+
+// the remote a reviewer's replays come from - the checked-out branch's, else `origin`
+fn remote_here(root: &Path) -> Option<String> {
+    branch_of(root).and_then(|b| remote_for(root, &b)).or_else(|| remote_for(root, ""))
+}
+
+// teammates' replays fetched - every branch's, its narration left until it is opened
+pub fn fetch_replays(root: &Path) -> Result<String> {
+    let remote = remote_here(root).context("this repository has no remote to fetch replays from")?;
+    git_in(root, &["fetch", "--quiet", "--no-tags", &remote, FETCH_SPEC], b"", &[])?;
+    share(root, &remote);
+    Ok(remote)
+}
+
+// a branch's narration fetched as its replay is opened - it stays out of every other fetch
+pub fn fetch_voice(root: &Path, branch: &str) {
+    if let Some(remote) = remote_here(root) {
+        let spec = format!("+{VOICE_PREFIX}{branch}:{VOICE_PREFIX}{branch}");
+        let _ = git_in(root, &["fetch", "--quiet", "--no-tags", &remote, &spec], b"", &[]);
+    }
+}
+
+// a kept line found in the narration a replay carries - for a reviewer whose machine never read it
+pub fn voice_line(root: &Path, name: &str) -> Option<Vec<u8>> {
+    for r in git(root, &["for-each-ref", "--format=%(refname)", VOICE_PREFIX]).unwrap_or_default().lines() {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["cat-file", "blob", &format!("{r}:lines/{name}")])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if out.status.success() {
+            return Some(out.stdout);
+        }
+    }
+    None
 }
 
 // The replay's next commit: the session files that gained steps, and every
@@ -359,6 +548,24 @@ fn commit(
     texts: &BTreeSet<String>,
     steps: usize,
 ) -> Result<()> {
+    let mut info = String::new();
+    for name in changed {
+        let id = git_in(root, &["hash-object", "-w", "--stdin"], files[name].as_bytes(), &[])?;
+        info.push_str(&format!("100644 blob {id}\t{name}\n"));
+    }
+    // a text git let go of before it was saved is left out, not an error
+    let ids: String = texts.iter().map(|t| format!("{t}\n")).collect();
+    let found = git_in(root, &["cat-file", "--batch-check"], ids.as_bytes(), &[])?;
+    for line in found.lines().filter(|l| l.ends_with(|c: char| c.is_ascii_digit()) && l.contains(" blob ")) {
+        let id = line.split(' ').next().unwrap_or_default();
+        info.push_str(&format!("100644 blob {id}\ttexts/{id}\n"));
+    }
+    let message = format!("ccc replay: {} - {steps} step(s)", refname.trim_start_matches(REF_PREFIX));
+    write_ref(root, refname, base, &info, &message)
+}
+
+// a ref's next commit - `info` entries over what it held, built in an index of its own so the working tree and the user's index are never touched
+fn write_ref(root: &Path, refname: &str, base: Option<&str>, info: &str, message: &str) -> Result<()> {
     let index = git(root, &["rev-parse", "--git-path", "ccc-replay.index"]).context("finding the git directory")?;
     let index = root.join(index);
     let _ = std::fs::remove_file(&index);
@@ -369,22 +576,9 @@ fn commit(
             Some(b) => git_in(root, &["read-tree", b], b"", &env)?,
             None => git_in(root, &["read-tree", "--empty"], b"", &env)?,
         };
-        let mut info = String::new();
-        for name in changed {
-            let id = git_in(root, &["hash-object", "-w", "--stdin"], files[name].as_bytes(), &[])?;
-            info.push_str(&format!("100644 blob {id}\t{name}\n"));
-        }
-        // a text git let go of before it was saved is left out, not an error
-        let ids: String = texts.iter().map(|t| format!("{t}\n")).collect();
-        let found = git_in(root, &["cat-file", "--batch-check"], ids.as_bytes(), &[])?;
-        for line in found.lines().filter(|l| l.ends_with(|c: char| c.is_ascii_digit()) && l.contains(" blob ")) {
-            let id = line.split(' ').next().unwrap_or_default();
-            info.push_str(&format!("100644 blob {id}\ttexts/{id}\n"));
-        }
         git_in(root, &["update-index", "--add", "--index-info"], info.as_bytes(), &env)?;
         let tree = git_in(root, &["write-tree"], b"", &env)?;
-        let message = format!("ccc replay: {} - {steps} step(s)", refname.trim_start_matches(REF_PREFIX));
-        let mut args = vec!["commit-tree", tree.as_str(), "-m", message.as_str()];
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
         if let Some(b) = base {
             args.extend(["-p", b]);
         }
@@ -392,7 +586,7 @@ fn commit(
     })();
     let _ = std::fs::remove_file(&index);
     let commit = built?;
-    let mut args = vec!["update-ref", "-m", "ccc replay save", refname, commit.as_str()];
+    let mut args = vec!["update-ref", "-m", message, refname, commit.as_str()];
     if let Some(b) = base {
         args.push(b);
     }
@@ -504,6 +698,7 @@ mod tests {
             edits: Vec::new(),
             changesets: Vec::new(),
             epoch,
+            beats: Vec::new(),
         };
         let turns = [turn("a", "s1", 100), turn("b", "s1", 102), turn("c", "s2", 150)];
         let named = by_changeset(&turns);
@@ -605,6 +800,48 @@ mod tests {
         assert!(main.skipped.as_deref().is_some_and(|s| s.contains("default branch")), "{main:?}");
         let asked = save(&r.work, &SaveOptions { default_branch: true, ..Default::default() }).unwrap();
         assert_eq!(asked.steps, 1);
+    }
+
+    // a replay's narration goes beside it under a ref of its own, out of the default fetch; a reviewer plays its steps and lines from it; turned off, it stays home
+    #[test]
+    fn a_replays_narration_goes_beside_it_and_a_reviewer_plays_it() {
+        crate::voice::tests::in_cache("replay", |_| {
+            let r = repo("voice");
+            let text = texts_of(&r.work, &[FileText { path: "a.rs".into(), before: Some("fn a() {}\n".into()), after: Some("fn a() { b(); }\n".into()) }], &mut HashMap::new());
+            feed(&r.work, &[step(1, "feature", "staged", text.clone()), step(2, "feature", "applied", text), step(3, "feature", "applied", json!([]))]);
+            // the visualiser read the written step aloud - its line kept, and noted against the step
+            let fp = "b".repeat(64);
+            let meta = json!({"duration": 1.0, "words": [], "step": {"at": 2000, "changeset": "c1-x", "call": null}}).to_string();
+            crate::voice::keep_line(&format!("{fp}.webm"), b"opus").unwrap();
+            crate::voice::keep_line(&format!("{fp}.json"), meta.as_bytes()).unwrap();
+            crate::voice::note_line(&r.work, &format!("{fp}.json"), meta.as_bytes()).unwrap();
+
+            let push = SaveOptions { push: true, ..Default::default() };
+            let saved = save(&r.work, &push).unwrap();
+            let v = saved.voice.as_ref().unwrap();
+            // the proposal is heard as its write, so two steps are heard and one of them is voiced
+            assert_eq!((v.added, v.lines, v.unvoiced), (1, 1, 1), "{v:?}");
+            assert!(matches!(&v.pushed, Some(Ok(remote)) if remote == "origin"), "{v:?}");
+            assert!(saved.describe().contains("refs/ccc/voice/feature"), "{}", saved.describe());
+            let theirs = sh(&r.dir, &["--git-dir", "remote.git", "for-each-ref", "--format=%(refname)"]);
+            assert!(theirs.lines().any(|l| l == "refs/ccc/voice/feature"), "{theirs}");
+            assert!(!sh(&r.work, &["config", "--get-all", "remote.origin.fetch"]).contains("voice"), "out of the default fetch");
+            assert_eq!(save(&r.work, &push).unwrap().voice.map(|v| v.added), Some(0), "kept once");
+
+            // a reviewer: the replay's steps numbered, and the line read from the narration the replay carries
+            crate::voice::remove().unwrap();
+            assert!(crate::voice::line(&format!("{fp}.webm")).is_none());
+            assert_eq!(voice_line(&r.work, &format!("{fp}.webm")).as_deref(), Some(&b"opus"[..]));
+            let played = steps(&r.work, "feature");
+            assert_eq!(played.iter().filter_map(|s| s["seq"].as_u64()).collect::<Vec<_>>(), [1, 2, 3]);
+            assert!(played.iter().all(|s| s.get("server").is_none()));
+            assert_eq!(list(&r.work)[0]["branch"], "feature");
+
+            // turned off for the branch, its narration stays home
+            sh(&r.work, &["config", "branch.feature.cccVoice", "false"]);
+            assert!(save(&r.work, &SaveOptions::default()).unwrap().voice.is_some_and(|v| v.off));
+        });
+        assert!(branch_ok("feature/x-1") && !branch_ok("../x") && !branch_ok("-x") && !branch_ok("a b") && !branch_ok("x:y"));
     }
 
     // the hook goes in once, follows ccc as it moves, never over a hook ccc

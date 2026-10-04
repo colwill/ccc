@@ -1,4 +1,4 @@
-# ccc - Collateral Code Check
+# ccc - Code Change Capture
 
 # the extension package `npm run package` writes
 vsix := "dist/ccc-codecache.vsix"

@@ -146,6 +146,7 @@ mod tests {
                 edits: vec![],
                 changesets: vec![],
                 epoch: 0,
+                beats: vec![],
             }],
             counts: PromptsCounts {
                 turns: 1,

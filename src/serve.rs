@@ -318,6 +318,26 @@ struct StepRef {
     changeset: Option<String>,
     // the agent session a look came from, where its transcript said
     session: Option<String>,
+    // the tool call a look was, where its transcript said
+    call: Option<String>,
+}
+
+fn beat_of(s: &StepRef, t: &crate::prompts::Turn) -> Option<usize> {
+    beat_at(s.at, s.changeset.as_deref(), s.call.as_deref(), t)
+}
+
+// the beat of its ask a step came in - its own call's, else the latest naming its changeset by then, else the one being spoken
+pub(crate) fn beat_at(at: u64, changeset: Option<&str>, call: Option<&str>, t: &crate::prompts::Turn) -> Option<usize> {
+    if let Some(i) = call.and_then(|c| t.beats.iter().position(|b| b.calls.iter().any(|x| x == c))) {
+        return Some(i);
+    }
+    if let Some(c) = changeset {
+        let naming: Vec<usize> = (0..t.beats.len()).filter(|&i| t.beats[i].changesets.iter().any(|x| x == c)).collect();
+        if let Some(&i) = naming.iter().rev().find(|&&i| t.beats[i].at <= at).or(naming.first()) {
+            return Some(i);
+        }
+    }
+    t.beats.iter().rposition(|b| b.at <= at).or((!t.beats.is_empty()).then_some(0))
 }
 
 // Steps into runs by the ask behind them. A step an agent took belongs to the
@@ -327,8 +347,10 @@ struct StepRef {
 // hand run together on their own. A look names no changeset, so it goes to
 // the ask made last before it.
 fn group_by_ask(steps: &[StepRef], turns: &[crate::prompts::Turn]) -> Value {
+    // a run - its kind, its ask, and each step's number with the beat it came in
+    type Run<'t> = (&'static str, Option<&'t crate::prompts::Turn>, Vec<u64>, Vec<Option<usize>>);
     let named = crate::replay::by_changeset(turns);
-    let mut groups: Vec<(&str, Option<&crate::prompts::Turn>, Vec<u64>)> = Vec::new();
+    let mut groups: Vec<Run> = Vec::new();
     for s in steps {
         let ask = crate::replay::ask_of(s.human, s.changeset.as_deref(), s.session.as_deref(), s.at, turns, &named);
         let kind = match (s.human, ask) {
@@ -336,18 +358,62 @@ fn group_by_ask(steps: &[StepRef], turns: &[crate::prompts::Turn]) -> Value {
             (_, Some(_)) => "ask",
             _ => "agent",
         };
+        let beat = ask.and_then(|t| beat_of(s, t));
         match groups.last_mut() {
-            Some((k, a, seqs)) if *k == kind && a.map(|t| &t.id) == ask.map(|t| &t.id) => seqs.push(s.seq),
-            _ => groups.push((kind, ask, vec![s.seq])),
+            Some((k, a, seqs, beats)) if *k == kind && a.map(|t| &t.id) == ask.map(|t| &t.id) => {
+                seqs.push(s.seq);
+                beats.push(beat);
+            }
+            _ => groups.push((kind, ask, vec![s.seq], vec![beat])),
         }
     }
-    let ask_json = |t: &crate::prompts::Turn| {
-        json!({"id": t.id, "agent": t.agent, "session": t.session, "at": t.epoch * 1000, "prompt": t.prompt, "model": t.model})
-    };
     json!({
         "groups": groups
             .iter()
-            .map(|(kind, ask, seqs)| json!({"kind": kind, "steps": seqs, "ask": ask.map(ask_json)}))
+            .map(|(kind, ask, seqs, beats)| json!({"kind": kind, "steps": seqs, "beats": beats, "ask": ask.map(ask_json)}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+// an ask as the visualiser tells its story - the request, the agent's plan, each beat of what it said, and its last word
+pub(crate) fn ask_json(t: &crate::prompts::Turn) -> Value {
+    json!({
+        "id": t.id,
+        "agent": t.agent,
+        "session": t.session,
+        "at": t.epoch * 1000,
+        "prompt": t.prompt,
+        "model": t.model,
+        "plan": t.plan(),
+        "outcome": t.outcome(),
+        "beats": t.beats.iter().map(|b| json!({"text": b.text, "at": b.at})).collect::<Vec<_>>(),
+    })
+}
+
+// a saved replay's steps grouped by the ask each carries - the story travels with the replay, so a reviewer needs no transcript
+fn replay_asks(steps: &[Value]) -> Value {
+    let mut groups: Vec<(&str, Value, Vec<Value>, Vec<Value>)> = Vec::new();
+    for v in steps {
+        let kind = if v["by"] == "human" {
+            "hand"
+        } else if v["ask"].is_object() {
+            "ask"
+        } else {
+            "agent"
+        };
+        let id = v["ask"]["id"].as_str().unwrap_or_default();
+        match groups.last_mut() {
+            Some((k, a, seqs, beats)) if *k == kind && a["id"].as_str().unwrap_or_default() == id => {
+                seqs.push(v["seq"].clone());
+                beats.push(v["beat"].clone());
+            }
+            _ => groups.push((kind, v["ask"].clone(), vec![v["seq"].clone()], vec![v["beat"].clone()])),
+        }
+    }
+    json!({
+        "groups": groups
+            .into_iter()
+            .map(|(kind, ask, seqs, beats)| json!({"kind": kind, "steps": seqs, "beats": beats, "ask": if ask.is_object() { ask } else { Value::Null }}))
             .collect::<Vec<_>>(),
     })
 }
@@ -643,6 +709,7 @@ impl MapState {
                 human: l.json["by"] == "human",
                 changeset: l.json["changeset"].as_str().map(str::to_string),
                 session: l.json["session"].as_str().map(str::to_string),
+                call: l.json["call"].as_str().map(str::to_string),
             })
             .collect();
         let Some(first) = steps.first() else {
@@ -863,6 +930,44 @@ impl MapState {
         Some(json!({"event": json, "before": side(&before), "after": side(&after)}))
     }
 
+    // a branch's saved replay as the timeline's events, numbered from one - its narration fetched meanwhile, so the voice is there when it plays
+    fn replay_events(&self, branch: &str) -> Value {
+        let (root, b) = (self.root.clone(), branch.to_string());
+        std::thread::spawn(move || crate::replay::fetch_voice(&root, &b));
+        let steps: Vec<Value> = crate::replay::steps(&self.root, branch)
+            .into_iter()
+            .map(|mut v| {
+                v["snapshot"] = json!(self.git && drawable_json(&v));
+                v
+            })
+            .collect();
+        json!({
+            "boot": 0,
+            "latest": steps.len(),
+            "first": steps.first().map(|v| v["seq"].clone()),
+            "generated": self.ts,
+            "replay": branch,
+            "events": steps,
+        })
+    }
+
+    // one step of a branch's saved replay drawn each side, from the texts the replay keeps of it
+    fn replay_step(&self, branch: &str, seq: u64) -> Option<Value> {
+        let json = crate::replay::steps(&self.root, branch).into_iter().find(|v| v["seq"].as_u64() == Some(seq))?;
+        let side = |s: Option<Arc<Value>>| s.as_deref().cloned().unwrap_or(Value::Null);
+        let (before, after) = match self.rebuilt(&json) {
+            Some(d) => {
+                let (step, focus) = &*d;
+                let model = self.vis_model();
+                let before = self.side_of(&model, step, focus, false);
+                let after = if matches!(step.status, "applied" | "reverted" | "edited" | "staged") { self.side_of(&model, step, focus, true) } else { None };
+                (before, after)
+            }
+            None => (None, None),
+        };
+        Some(json!({"event": json, "before": side(before), "after": side(after)}))
+    }
+
     // A step put back together from the texts the feed kept of it, as git
     // objects - one logged before this server started, or shared by another
     // server - so it is drawn like a step this server took. None without git,
@@ -906,10 +1011,11 @@ impl MapState {
 
     // An agent's look at the code through a read tool, logged as an inspect
     // of its own and shared - unless it is the look just logged.
-    fn timeline_look(&self, tool: &str, what: &str, sites: &[(String, usize, bool)]) {
-        let Some(ev) = vis::look(now_ms(), tool, what, sites, &self.caches) else {
+    fn timeline_look(&self, tool: &str, what: &str, sites: &[(String, usize, bool)], why: Option<String>) {
+        let Some(mut ev) = vis::look(now_ms(), tool, what, sites, &self.caches) else {
             return;
         };
+        ev.json["why"] = json!(why);
         let shared = {
             let mut tl = self.timeline();
             if tl.holds(&ev.json) {
@@ -941,6 +1047,7 @@ impl MapState {
                 };
                 ev.json["call"] = json!(r.call);
                 ev.json["session"] = json!(r.session);
+                ev.json["why"] = json!(r.why);
                 if !tl.holds(&ev.json) {
                     shared.push(tl.log(Logged::bare(ev.json)));
                 }
@@ -2748,6 +2855,13 @@ fn md_vulnerabilities(r: &audit::AuditReport, offline: bool, with_dev: bool) -> 
     out
 }
 
+// what a staging call's `intent` asks for - its own reason, read aloud as the step's subtitle on the visualiser's replay
+const INTENT_DOC: &str = "required - why THIS change, in one terse line specific to it (`retry the charge on timeout`), not the goal of the whole changeset; it is the subtitle a person watching the visualiser's replay reads and hears for this step";
+// what a read tool's `why` asks for
+const WHY_DOC: &str = "why you are looking, in one terse line (`find where the retry is set`) - shown on the visualiser's timeline so a person watching follows your reasoning (optional)";
+// the edit tools that stage a change, each of which must say why
+const STAGING: &[&str] = &["edit_rename", "edit_replace", "edit_delete", "edit_insert", "edit_text"];
+
 fn mcp_tools() -> Value {
     let tool = |name: &str, desc: &str, props: Value, required: &[&str]| {
         json!({
@@ -2777,19 +2891,26 @@ fn mcp_tools() -> Value {
             json!({
                 "query": {"type": "string", "description": "substring to search for; qualified form (a::b / a.b) searches call, use and import sites; trailing `::` lists a whole qualifier"},
                 "kind": {"type": "string", "enum": ["any", "func", "const", "type", "note", "call", "import"], "description": "filter by symbol kind (default any)"},
+                "why": {"type": "string", "description": WHY_DOC},
             }),
             &["query"],
         ),
         tool(
             "references",
             "CALL THIS BEFORE renaming a symbol, changing a signature, or deleting anything that looks unused - it answers what calls this, who imports it, and is this dead. Use instead of `grep -rn 'foo('`, which misses imports and type-only uses while inventing hits in comments. Definitions, call sites, constructions (a struct literal, a `new`), qualified value usages (enum variants, consts: `Encoding::O200kBase`) and import bindings of an exact name. Type definitions, constructions and imports are covered, so a struct that is only ever built, or used only through its type, or a crate pulled in for a derive, is still found. Qualified names (`serde_json::to_string`, `client.charge`, `Encoding::parse`) narrow by file, owning type and import module, and definitions that merely share the bare name are listed separately rather than passed off as the symbol. Re-exports are followed, so a crate-facade path (`mycrate::thing`, from a `pub use` in lib.rs) resolves to the definition in the module it actually lives in, and any symbol a module root republishes is reported under `published as` - renaming one is a breaking change even when every call site is local. Each hit carries its enclosing caller and test context, so production callers are distinguishable from test ones at a glance. An rpc declared in a `.proto` schema (looked up by any spelling - `CreateInvoice`, `create_invoice`, `Billing.CreateInvoice`, `acme.billing.v1.Billing/CreateInvoice`) also lists its handlers and its callers through generated stubs in every language, each with the evidence that tied it. A miss is an answer, not an error - it names the kinds searched, the nearest indexed names, and whether the qualifier is a declared dependency.",
-            json!({"symbol": {"type": "string", "description": "exact symbol name, optionally qualified (a::b or a.b)"}}),
+            json!({
+                "symbol": {"type": "string", "description": "exact symbol name, optionally qualified (a::b or a.b)"},
+                "why": {"type": "string", "description": WHY_DOC},
+            }),
             &["symbol"],
         ),
         tool(
             "dependencies",
             "ANSWERS what breaks if I change this file, what this module pulls in, and whether a declared package is actually used anywhere. Use instead of opening files to read their import blocks. File-level edges resolved from imports and calls (type-only imports included), plus the external packages declared in the manifests (Cargo.toml, package.json, go.mod, requirements.txt). Call edges require the site to name the target module or use an imported symbol; name-only matches are excluded and listed in excluded_symbols, so an edge here is evidence rather than a guess. Without arguments: the whole graph plus declared dependencies; with `file`: what it depends on and what depends on it.",
-            json!({"file": {"type": "string", "description": "relative path (optional)"}}),
+            json!({
+                "file": {"type": "string", "description": "relative path (optional)"},
+                "why": {"type": "string", "description": WHY_DOC},
+            }),
             &[],
         ),
         tool(
@@ -2825,6 +2946,7 @@ fn mcp_tools() -> Value {
             json!({
                 "path": {"type": "string", "description": "relative path, cache name, or unique path suffix"},
                 "structured": {"type": "boolean", "description": "return spans and the intra-file call graph instead of the rendered markdown (default false)"},
+                "why": {"type": "string", "description": WHY_DOC},
             }),
             &["path"],
         ),
@@ -2933,11 +3055,11 @@ fn mcp_tools() -> Value {
                 "result": {"type": "string", "description": "handle from `find` / `references` (or a follow-up handle an edit tool listed)"},
                 "to": {"type": "string", "description": "the new name; for a `find` handle, what replaces the matched substring"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
-                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
+                "intent": {"type": "string", "description": INTENT_DOC},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
-            &["result", "to"],
+            &["result", "to", "intent"],
         ),
         tool(
             "edit_replace",
@@ -2947,11 +3069,11 @@ fn mcp_tools() -> Value {
                 "text": {"type": "string", "description": "the replacement"},
                 "target": {"type": "string", "enum": ["token", "line", "definition"], "description": "what at each site is replaced (default token)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
-                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
+                "intent": {"type": "string", "description": INTENT_DOC},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
-            &["result", "text"],
+            &["result", "text", "intent"],
         ),
         tool(
             "edit_delete",
@@ -2960,11 +3082,11 @@ fn mcp_tools() -> Value {
                 "result": {"type": "string", "description": "handle from `find` / `references`"},
                 "force": {"type": "boolean", "description": "delete even though other sites still name it (default false)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
-                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
+                "intent": {"type": "string", "description": INTENT_DOC},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
-            &["result"],
+            &["result", "intent"],
         ),
         tool(
             "edit_insert",
@@ -2974,11 +3096,11 @@ fn mcp_tools() -> Value {
                 "text": {"type": "string", "description": "the code to add"},
                 "position": {"type": "string", "enum": ["after", "before"], "description": "which side of the site (default after)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
-                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
+                "intent": {"type": "string", "description": INTENT_DOC},
                 "skip": {"type": "array", "items": {"type": "string"}, "description": "`path:line` sites to leave alone"},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
-            &["result", "text"],
+            &["result", "text", "intent"],
         ),
         tool(
             "edit_text",
@@ -2990,10 +3112,10 @@ fn mcp_tools() -> Value {
                 "all": {"type": "boolean", "description": "replace every occurrence of `old` (default false)"},
                 "delete": {"type": "boolean", "description": "remove the file (default false)"},
                 "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
-                "intent": {"type": "string", "description": "why, in one terse line (`retry on timeout`) - shown beside the step on the visualiser's timeline, so a person watching can follow"},
+                "intent": {"type": "string", "description": INTENT_DOC},
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
-            &["path"],
+            &["path", "intent"],
         ),
         tool(
             "edit_apply",
@@ -3057,10 +3179,10 @@ fn mcp_initialize(params: &Value) -> Value {
         "capabilities": {"tools": {}, "resources": {}},
         "serverInfo": {
             "name": "ccc",
-            "title": "Collateral Code Check",
+            "title": "Code Change Capture",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "Code map of this project (ccc, Collateral Code Check), held in \
+        "instructions": "Code map of this project (ccc, Code Change Capture), held in \
             memory and refreshed automatically about three seconds after source changes.\n\n\
             1. SEARCHING - always start here. For any question about where something is \
             defined, called, imported or changed in this project, call a ccc tool before \
@@ -3093,9 +3215,14 @@ fn mcp_initialize(params: &Value) -> Value {
             function, config, docs, a new or removed file - `edit_text`. Each stages a \
             changeset and shows its diff: read it, then `edit_apply` it (or pass apply=true \
             when the diff would tell you nothing new); `edit_discard` drops one, \
-            `edit_revert` undoes an applied one. Pass `intent`, one terse line on why \
-            (`retry on timeout`), with each staging call: a person watching the visualiser \
-            reviews the step by it. The map records where code is and how it \
+            `edit_revert` undoes an applied one. Every staging call needs `intent`, one \
+            terse line on why THIS change (`retry the charge on timeout`) rather than the \
+            changeset's goal: a person watching the visualiser's replay reads and hears it as \
+            the step's subtitle, so a call without one is refused. Pass `why` with `find`, \
+            `references`, `file` and `dependencies` too - one line on what you are looking \
+            for - so the replay shows your reasoning as well as your changes. Say what you \
+            are about to do before a run of calls, and sum up when you are done: the \
+            replay tells the story from those words. The map records where code is and how it \
             connects, not every character of it: read the real source before writing code \
             that depends on its exact text. Never write under `.ccc` except map.json and \
             surface.json.\n\n\
@@ -4815,7 +4942,7 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Res
     };
     // an agent's reads are its looks - a page reading for itself is not
     if let Some((what, sites)) = looked.filter(|_| !browser) {
-        map.timeline_look(name, &what, &sites);
+        map.timeline_look(name, &what, &sites, arg("why").filter(|w| !w.trim().is_empty()));
     }
     Ok(match out {
         Ok(text) => mcp_md(&text, false),
@@ -4873,6 +5000,13 @@ fn edit_tool_call(state: &RwLock<MapState>, name: &str, args: &Value) -> Value {
             .unwrap_or_default(),
         intent: s("intent"),
     };
+    // a change no one can follow is refused - its intent is its subtitle on the replay
+    if STAGING.contains(&name) && stage.intent.as_deref().is_none_or(|i| i.trim().is_empty()) {
+        return mcp_md(
+            "error: missing `intent` - one terse line on why THIS change (`retry the charge on timeout`). A person watching the visualiser's replay reads and hears it as this step's subtitle, so say what this particular edit is for",
+            true,
+        );
+    }
     let out = {
         let map = state.read().expect("map lock poisoned");
         let ctx = edit::Ctx { root: &map.root, caches: &map.caches };
@@ -5064,6 +5198,10 @@ enum ReplyBody {
     Json(Value),
     Html(String),
     Empty,
+    // a small file's bytes, with their media type
+    Bytes(Vec<u8>, &'static str),
+    // a file streamed from disk - the voice's model runs to hundreds of megabytes
+    File(PathBuf, &'static str),
 }
 
 struct Reply {
@@ -5431,11 +5569,21 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
         ("GET", "/vis/events") => {
             let since = get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
             let map = state.read().expect("map lock poisoned");
+            // `replay` - a branch's saved replay rather than the live timeline
+            if let Some(b) = get("replay") {
+                if !crate::replay::branch_ok(b) {
+                    return bad(400, format!("no replay for '{b}'"));
+                }
+                return ok(map.replay_events(b));
+            }
             ok(map.timeline_since(since))
         }
         // the timeline's steps grouped by the ask behind each, or by hand
         ("GET", "/vis/asks") => {
             let map = state.read().expect("map lock poisoned");
+            if let Some(b) = get("replay").filter(|b| crate::replay::branch_ok(b)) {
+                return ok(replay_asks(&crate::replay::steps(&map.root, b)));
+            }
             ok(map.timeline_asks())
         }
         ("GET", "/vis/event") => {
@@ -5443,6 +5591,12 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
                 return bad(400, "missing ?seq=<n>");
             };
             let map = state.read().expect("map lock poisoned");
+            if let Some(b) = get("replay").filter(|b| crate::replay::branch_ok(b)) {
+                return match map.replay_step(b, seq) {
+                    Some(v) => ok(v),
+                    None => bad(404, format!("no step {seq} in {b}'s replay")),
+                };
+            }
             match map.timeline_step(seq) {
                 Some(v) => ok(v),
                 None => bad(404, format!("no step {seq} on the timeline - it keeps the last {TIMELINE_STEPS}")),
@@ -5451,6 +5605,50 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
         ("GET", "/vis.json") => {
             let map = state.read().expect("map lock poisoned");
             ok(map.vis_model().overview().clone())
+        }
+        // the narration voice - where it stands, fetching it once, its files, and the lines it read
+        ("GET", "/vis/voice") => ok(crate::voice::status()),
+        ("POST", "/vis/voice/download") => match crate::voice::start_download() {
+            Ok(()) => ok(crate::voice::status()),
+            Err(e) => bad(500, format!("{e:#}")),
+        },
+        ("GET", p) if p.starts_with("/vis/voice/file/") => match crate::voice::file(&p["/vis/voice/file/".len()..]) {
+            Some((path, ty)) => Reply { status: 200, body: ReplyBody::File(path, ty) },
+            None => bad(404, "no such voice file here - the voice is not downloaded yet"),
+        },
+        // a line kept on this machine, else one a teammate's replay carries
+        ("GET", p) if p.starts_with("/vis/voice/line/") => {
+            let name = &p["/vis/voice/line/".len()..];
+            let carried = || {
+                let ty = crate::voice::line_type(name)?;
+                let map = state.read().expect("map lock poisoned");
+                crate::replay::voice_line(&map.root, name).map(|b| (b, ty))
+            };
+            match crate::voice::line(name).or_else(carried) {
+                Some((bytes, ty)) => Reply { status: 200, body: ReplyBody::Bytes(bytes, ty) },
+                None => bad(404, format!("no line {name} kept")),
+            }
+        }
+        ("POST", p) if p.starts_with("/vis/voice/line/") => {
+            let name = &p["/vis/voice/line/".len()..];
+            match crate::voice::keep_line(name, body) {
+                Ok(()) => {
+                    // the step it reads noted, so the branch's replay carries it
+                    let map = state.read().expect("map lock poisoned");
+                    let _ = crate::voice::note_line(&map.root, name, body);
+                    ok(json!({"kept": true}))
+                }
+                Err(e) => bad(400, format!("{e:#}")),
+            }
+        }
+        // a teammate's replay, for a reviewer to play - the replays held, and fetching theirs
+        ("GET", "/vis/replays") => {
+            let map = state.read().expect("map lock poisoned");
+            let fetched = get("fetch").map(|_| crate::replay::fetch_replays(&map.root));
+            if let Some(Err(e)) = &fetched {
+                return bad(502, format!("{e:#}"));
+            }
+            ok(json!({"replays": crate::replay::list(&map.root), "branch": crate::replay::branch_of(&map.root)}))
         }
         ("GET", "/vis/code") => {
             let Some(file) = get("file") else {
@@ -5683,6 +5881,20 @@ fn handle_request(state: &RwLock<MapState>, mut request: tiny_http::Request) {
             .with_status_code(reply.status)
             .with_header(header("Content-Type", "text/html; charset=utf-8"))
             .boxed(),
+        ReplyBody::Bytes(data, ty) => tiny_http::Response::from_data(data)
+            .with_status_code(reply.status)
+            .with_header(header("Content-Type", ty))
+            .boxed(),
+        ReplyBody::File(path, ty) => match std::fs::File::open(&path) {
+            Ok(file) => tiny_http::Response::from_file(file)
+                .with_status_code(reply.status)
+                .with_header(header("Content-Type", ty))
+                .boxed(),
+            Err(e) => tiny_http::Response::from_data(json!({"error": format!("reading {}: {e}", path.display())}).to_string().into_bytes())
+                .with_status_code(404)
+                .with_header(header("Content-Type", "application/json"))
+                .boxed(),
+        },
     };
     // CORS: echo an allowed origin (incl. "null" for file:// report pages) so
     // the browser-side HTMX panel can read responses; foreign origins got 403
@@ -7406,7 +7618,11 @@ mod tests {
         (Scratch(dir), state)
     }
 
-    fn tool(state: &RwLock<MapState>, name: &str, args: Value) -> (bool, String) {
+    fn tool(state: &RwLock<MapState>, name: &str, mut args: Value) -> (bool, String) {
+        // a staging call must say why - a test that is not about that says it for its call
+        if STAGING.contains(&name) && args.get("intent").is_none() {
+            args["intent"] = json!(format!("test {name}"));
+        }
         let v = mcp_handle(
             state,
             &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -7892,6 +8108,7 @@ mod tests {
             tool: tool.into(),
             path: path.into(),
             lines,
+            why: Some(format!("why {call}")),
         };
         let map = state.read().unwrap();
         map.timeline_reads(vec![read("t1", "Read", "src/pay.rs", Some((6, 6))), read("t2", "Bash", "src/pay.rs", None), read("t3", "Read", "notes.txt", None)]);
@@ -7907,6 +8124,7 @@ mod tests {
         assert_eq!(got, [("inspect", "Read src/pay.rs:6", "flow", "t1"), ("inspect", "Bash src/pay.rs", "code", "t2")]);
         assert_eq!(all["events"][0]["focus"]["name"], "refund");
         assert_eq!(all["events"][0]["session"], "s1");
+        assert_eq!(all["events"][1]["why"], "why t2");
         let fed = fs::read_to_string(feed_path(&state.read().unwrap().root)).unwrap();
         assert_eq!(fed.lines().count(), 2, "{fed}");
     }
@@ -7938,6 +8156,7 @@ mod tests {
             edits: Vec::new(),
             changesets: changesets.iter().map(|c| c.to_string()).collect(),
             epoch,
+            beats: Vec::new(),
         };
         let step = |seq: u64, secs: u64, human: bool, changeset: Option<&str>| StepRef {
             seq,
@@ -7945,6 +8164,7 @@ mod tests {
             human,
             changeset: changeset.map(str::to_string),
             session: None,
+            call: None,
         };
         let turns = [turn("a", 100, &["c1"]), turn("b", 200, &["c1", "c2"])];
         let steps = [
@@ -7982,6 +8202,73 @@ mod tests {
         );
         assert_eq!(v["groups"][0]["ask"]["prompt"], "ask a");
         assert_eq!(v["groups"][0]["ask"]["at"], 100_000);
+    }
+
+    // a step goes to the beat of its ask it came in - its own call's, the latest naming its changeset by then, or the one being spoken
+    #[test]
+    fn a_step_lands_in_the_beat_it_came_in() {
+        let beat = |at: u64, calls: &[&str], changesets: &[&str]| crate::prompts::Beat {
+            text: format!("at {at}"),
+            at,
+            calls: calls.iter().map(|c| c.to_string()).collect(),
+            changesets: changesets.iter().map(|c| c.to_string()).collect(),
+        };
+        let turn = crate::prompts::Turn {
+            id: "a".into(),
+            agent: "claude".into(),
+            session: "s1".into(),
+            model: None,
+            ts: String::new(),
+            branch: None,
+            prompt: "ask".into(),
+            edits: Vec::new(),
+            changesets: vec!["c1".into()],
+            epoch: 100,
+            beats: vec![beat(100_000, &["t1"], &[]), beat(110_000, &["t2"], &["c1"]), beat(120_000, &["t3"], &["c1"]), beat(130_000, &[], &[])],
+        };
+        let step = |at: u64, changeset: Option<&str>, call: Option<&str>| StepRef {
+            seq: 1,
+            at,
+            human: false,
+            changeset: changeset.map(str::to_string),
+            session: None,
+            call: call.map(str::to_string),
+        };
+        assert_eq!(beat_of(&step(105_000, None, Some("t1")), &turn), Some(0));
+        // staged under the second beat, applied under the third
+        assert_eq!(beat_of(&step(111_000, Some("c1"), None), &turn), Some(1));
+        assert_eq!(beat_of(&step(121_000, Some("c1"), None), &turn), Some(2));
+        // a look through ccc's own read tools names no call - it goes to the beat being spoken
+        assert_eq!(beat_of(&step(115_000, None, None), &turn), Some(1));
+        let ask = ask_json(&turn);
+        assert_eq!((ask["plan"].as_str(), ask["outcome"].as_str()), (Some("at 100000"), Some("at 130000")));
+        assert_eq!(ask["beats"].as_array().map(Vec::len), Some(4));
+    }
+
+    // a change must say why or it is refused - its intent is its subtitle - and a read's why goes on its look
+    #[test]
+    fn a_change_says_why_and_a_read_may() {
+        let (_dir, state) = scratch("why", &[("src/pay.rs", "pub fn charge(n: i32) -> i32 {\n    n\n}\n")]);
+        let raw = |args: Value| {
+            let v = mcp_handle(&state, &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "edit_text", "arguments": args}})).unwrap();
+            (v["result"]["isError"].as_bool().unwrap_or(false), v["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string())
+        };
+        for args in [json!({"path": "src/pay.rs", "old": "    n\n", "new": "    n + 1\n"}), json!({"path": "src/pay.rs", "old": "    n\n", "new": "    n + 1\n", "intent": "  "})] {
+            let (err, out) = raw(args);
+            assert!(err && out.contains("missing `intent`"), "{out}");
+        }
+        let (err, out) = raw(json!({"path": "src/pay.rs", "old": "    n\n", "new": "    n + 1\n", "intent": "charge one more"}));
+        assert!(!err, "{out}");
+        let required = mcp_tools()["tools"].as_array().unwrap().iter().filter(|t| t["inputSchema"]["required"].as_array().unwrap().iter().any(|r| r == "intent")).count();
+        assert_eq!(required, STAGING.len());
+
+        let events = || json_of(&route(&state, "GET", "/vis/events?since=0", b"")).clone();
+        events();
+        let (err, out) = tool(&state, "find", json!({"query": "charge", "why": "where is the charge made"}));
+        assert!(!err, "{out}");
+        let all = events();
+        let look = all["events"].as_array().unwrap().iter().find(|e| e["status"] == "inspect").cloned().unwrap();
+        assert_eq!(look["why"], "where is the charge made");
     }
 
     // A type that is built and never called - a struct literal, a `new` - is still

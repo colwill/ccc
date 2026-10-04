@@ -5,6 +5,8 @@ import type { WorkspaceSession } from './session';
 
 // what the page may ask the analyser for: its own levels, the edit timeline and search
 const ALLOWED = ['/vis', '/find?'];
+// where the narration voice's bytes come and go
+const VOICE = '/vis/voice/';
 
 // The architecture visualiser in VS Code - the analyser's own `/vis` page,
 // as a view in the ccc side bar and as a tab beside the editor. The page asks
@@ -79,7 +81,34 @@ export class VisualiserView implements vscode.WebviewViewProvider, vscode.Dispos
     openIn: vscode.ViewColumn | undefined,
     raw: unknown,
   ): Promise<void> {
-    const m = raw as { type?: string; id?: number; url?: string; file?: string; line?: number };
+    const m = raw as {
+      type?: string;
+      id?: number;
+      url?: string;
+      file?: string;
+      line?: number;
+      method?: string;
+      body?: ArrayBuffer | string;
+      contentType?: string;
+    };
+    // the narration voice's bytes either way - its files coming, the lines it read going back to be kept
+    if (m.type === 'bytes' && typeof m.id === 'number' && typeof m.url === 'string') {
+      const url = m.url;
+      const post = m.method === 'POST';
+      if (!url.startsWith(VOICE) || (post && !url.startsWith(`${VOICE}line/`) && url !== `${VOICE}download`)) {
+        void webview.postMessage({ type: 'res', id: m.id, error: `the visualiser may not ask for ${url} that way` });
+        return;
+      }
+      try {
+        const body = m.body === undefined ? undefined : typeof m.body === 'string' ? Buffer.from(m.body) : Buffer.from(new Uint8Array(m.body));
+        const res = await session.fetchBytes(post ? 'POST' : 'GET', url, body, m.contentType);
+        const bytes = res.body.buffer.slice(res.body.byteOffset, res.body.byteOffset + res.body.byteLength);
+        void webview.postMessage({ type: 'res', id: m.id, status: res.status, bytes });
+      } catch (err) {
+        void webview.postMessage({ type: 'res', id: m.id, error: describe(err) });
+      }
+      return;
+    }
     if (m.type === 'get' && typeof m.id === 'number' && typeof m.url === 'string') {
       const url = m.url;
       if (!ALLOWED.some((p) => url.startsWith(p))) {
@@ -126,11 +155,18 @@ export class VisualiserView implements vscode.WebviewViewProvider, vscode.Dispos
   }
 }
 
-// The page as served, locked down for a webview: nothing loads from anywhere,
-// and only its own inline script runs.
+// the page locked down for a webview - nothing loads from anywhere, only its own script runs, and the voice's worker, wasm and audio come from memory
 function withPolicy(html: string): string {
   const nonce = randomBytes(16).toString('base64');
-  const policy = `default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'nonce-${nonce}';`;
+  const policy = [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    'img-src data:',
+    `script-src 'nonce-${nonce}' blob: 'wasm-unsafe-eval'`,
+    'worker-src blob:',
+    'connect-src blob: data:',
+    'media-src blob:',
+  ].join('; ');
   return html
     .replace('<head>', `<head>\n<meta http-equiv="Content-Security-Policy" content="${policy}">`)
     .replace(/<script>/g, `<script nonce="${nonce}">`);

@@ -1,5 +1,5 @@
 //! rendering of `FileCache` entries and the `CCC.md` index to markdown per the
-//! Collateral Code Check spec in PLAN.md
+//! Code Change Capture spec in PLAN.md
 
 use crate::model::{Counts, FileCache};
 use std::fmt::Write as _;
@@ -117,7 +117,7 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
 
     // agent guide kept at the very top in metadata
     let _ = writeln!(out, "---");
-    let _ = writeln!(out, "Collateral Code Check - agent guide");
+    let _ = writeln!(out, "Code Change Capture - agent guide");
     let _ = writeln!(out);
     let _ = writeln!(out, "what:  a GENERATED map of this project's source. Each source file has a");
     let _ = writeln!(out, "        `<module>-<file>.<ext>.md` entry listing the submodules it declares,");
@@ -145,7 +145,7 @@ pub fn render_index(root: &Path, caches: &[FileCache], ts: &str) -> String {
     let _ = writeln!(out, "---");
     let _ = writeln!(out);
 
-    let _ = writeln!(out, "# Collateral Code Check ({}) UTC", ts);
+    let _ = writeln!(out, "# Code Change Capture ({}) UTC", ts);
     let _ = writeln!(out, "### project: {}", root_label);
     let _ = writeln!(
         out,

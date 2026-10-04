@@ -37,6 +37,9 @@ const PROMPT_CAP: usize = 500;
 // proposed/agreed text kept per edit
 const EDIT_TEXT_CAP: usize = 2000;
 
+// what an agent said kept per beat - a message, not an essay
+const BEAT_CAP: usize = 1200;
+
 // current state - read alongside a pinned edit
 const MAX_AGREED_LINES: usize = 60;
 
@@ -110,6 +113,34 @@ pub struct Turn {
     // epoch seconds, not serialised: ordering and windowing only
     #[serde(skip)]
     pub epoch: i64,
+    // what the agent said as it worked, each with the calls it made next - the visualiser's story of the ask
+    #[serde(skip)]
+    pub beats: Vec<Beat>,
+}
+
+// one thing an agent said as it worked, and the tool calls it made before it spoke again
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Beat {
+    // what it said, as plain prose
+    pub text: String,
+    // when it said it, epoch milliseconds
+    pub at: u64,
+    // the tool calls it made next
+    pub calls: Vec<String>,
+    // the changesets those calls named
+    pub changesets: Vec<String>,
+}
+
+impl Turn {
+    // what the agent said it would do, before its first call
+    pub fn plan(&self) -> Option<&str> {
+        self.beats.first().filter(|b| !b.calls.is_empty()).map(|b| b.text.as_str()).filter(|t| !t.is_empty())
+    }
+
+    // its last word, said once its calls were done
+    pub fn outcome(&self) -> Option<&str> {
+        self.beats.last().filter(|b| b.calls.is_empty()).map(|b| b.text.as_str()).filter(|t| !t.is_empty())
+    }
 }
 
 // a change, and the request that produced it
@@ -411,6 +442,28 @@ fn truncate(s: &str, cap: usize) -> String {
     format!("{}…", head.trim_end())
 }
 
+// what an agent said, as prose a subtitle can carry - markdown marks and code blocks out, lines run together
+pub(crate) fn said(text: &str) -> String {
+    let mut flat = String::new();
+    let mut fenced = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        let t = t.trim_start_matches('#').trim_start_matches(['-', '*', '>']).trim();
+        if fenced || t.is_empty() {
+            continue;
+        }
+        if !flat.is_empty() {
+            flat.push(' ');
+        }
+        flat.push_str(t);
+    }
+    truncate(&flat.replace("**", "").replace("__", ""), BEAT_CAP)
+}
+
 // the text of a record, when it is one the user actually typed. Tool results,
 // harness metadata and slash-command expansions are not requests
 // ccc:skip
@@ -665,6 +718,7 @@ fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(St
             prompt,
             edits: Vec::new(),
             changesets: Vec::new(),
+            beats: Vec::new(),
         });
     }
 
@@ -695,6 +749,55 @@ fn parse_claude_with(path: &Path, root: &Path, ledger: &BTreeMap<String, Vec<(St
         }
     }
     let ccc = CccWrites { answers, ledger };
+
+    // what the agent said as it worked, each message with the calls it made next
+    for rec in &records {
+        if rec.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = rec.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let Some(&slot) = walk_to_prompt(rec, &records, &by_uuid).and_then(|idx| at.get(&idx)) else {
+            continue;
+        };
+        let when = rec
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map_or(0, |d| d.timestamp_millis().max(0) as u64);
+        let beats = &mut out[slot].beats;
+        for b in blocks {
+            match b.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    let text = said(b.get("text").and_then(|t| t.as_str()).unwrap_or_default());
+                    if text.is_empty() {
+                        continue;
+                    }
+                    match beats.last_mut().filter(|l| l.calls.is_empty()) {
+                        // a message that runs on before any call is the same beat
+                        Some(last) => last.text = truncate(format!("{} {text}", last.text).trim(), BEAT_CAP),
+                        None => beats.push(Beat { text, at: when, ..Default::default() }),
+                    }
+                }
+                Some("tool_use") => {
+                    let Some(id) = b.get("id").and_then(|i| i.as_str()) else {
+                        continue;
+                    };
+                    let name = b.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                    let named = if is_ccc_edit(name) { changesets_of(b, &ccc.answers) } else { reported_changesets(b, &ccc.answers) };
+                    if beats.is_empty() {
+                        beats.push(Beat { at: when, ..Default::default() });
+                    }
+                    if let Some(last) = beats.last_mut() {
+                        last.calls.push(id.to_string());
+                        last.changesets.extend(named);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
     // then credit each edit - and the model that produced it - to the
     // request that led to it
@@ -882,6 +985,7 @@ fn parse_copilot(path: &Path) -> Vec<Turn> {
                 // the edit payload, so its changes can only be placed in time
                 edits: Vec::new(),
                 changesets: Vec::new(),
+                beats: Vec::new(),
             })
         })
         .collect()
@@ -1349,6 +1453,33 @@ mod tests {
         assert!(turns[0].edits[0].anchor.is_some());
     }
 
+    // what the agent says as it works is its ask's story - each message with the calls it made next, its plan first and its last word last
+    #[test]
+    fn a_turn_keeps_what_its_agent_said_as_beats() {
+        let dir = tempdir::Dir::new("prompt-beats");
+        let call = |id: &str, name: &str| serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": {}});
+        let text = |t: &str| serde_json::json!({"type": "text", "text": t});
+        let file = write(
+            dir.path(),
+            "s1.jsonl",
+            &[
+                user("u1", None, "2026-08-20T10:00:00Z", serde_json::json!("keep additions green")),
+                assistant("a1", "u1", "2026-08-20T10:00:01Z", serde_json::json!([text("Two changes:\n1. **Keep** them green\n```\ncode\n```\n2. Fade the rest")])),
+                assistant("a2", "a1", "2026-08-20T10:00:02Z", serde_json::json!([text("Reading the fade code:"), call("t1", "Read"), call("t2", "Bash")])),
+                user("r1", Some("a2"), "2026-08-20T10:00:03Z", serde_json::json!([{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}])),
+                assistant("a3", "r1", "2026-08-20T10:00:04Z", serde_json::json!([text("Now the edit."), call("t3", "mcp__ccc__edit_text")])),
+                assistant("a4", "a3", "2026-08-20T10:00:05Z", serde_json::json!([text("Done - additions stay green.")])),
+            ],
+        );
+        let turns = parse_claude(&file, Path::new("/proj"));
+        let beats: Vec<(&str, Vec<&str>)> = turns[0].beats.iter().map(|b| (b.text.as_str(), b.calls.iter().map(String::as_str).collect())).collect();
+        let plan = "Two changes: 1. Keep them green 2. Fade the rest Reading the fade code:";
+        assert_eq!(beats, [(plan, vec!["t1", "t2"]), ("Now the edit.", vec!["t3"]), ("Done - additions stay green.", vec![])]);
+        assert_eq!(turns[0].plan(), Some(plan));
+        assert_eq!(turns[0].outcome(), Some("Done - additions stay green."));
+        assert_eq!(turns[0].beats[1].at, 1_787_220_004_000);
+    }
+
     // A message sent while the agent worked reaches it queued, mid-turn - a
     // request of its own, the edits after it its own - while a task's note
     // to the agent is no one's request.
@@ -1547,6 +1678,7 @@ mod tests {
             prompt: format!("request {id}"),
             edits,
             changesets: Vec::new(),
+            beats: Vec::new(),
         }
     }
 

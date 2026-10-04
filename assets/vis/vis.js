@@ -127,7 +127,8 @@
     });
   }
 
-  function viaHost(url) {
+  // `more` - a `bytes` message for the narration voice's files and lines, its method and body
+  function viaHost(url, more) {
     return new Promise((resolve, reject) => {
       const id = ++asked;
       const timer = setTimeout(() => {
@@ -138,8 +139,30 @@
         clearTimeout(timer);
         resolve(m);
       });
-      vscode.postMessage({ type: 'get', id, url });
+      vscode.postMessage({ type: 'get', id, url, ...more });
     });
+  }
+
+  // a file's bytes from the server - through the extension in a webview, where the page reaches nothing itself
+  async function getBytes(url) {
+    if (vscode) {
+      const m = await viaHost(url, { type: 'bytes' });
+      if (m.error) throw new Error(m.error);
+      return { status: m.status, bytes: m.bytes };
+    }
+    const r = await fetch(url, { cache: 'no-store' });
+    return { status: r.status, bytes: await r.arrayBuffer() };
+  }
+
+  // bytes sent to the server - a line the voice read, going back to be kept
+  async function postBytes(url, body, contentType) {
+    if (vscode) {
+      const m = await viaHost(url, { type: 'bytes', method: 'POST', body, contentType });
+      if (m.error) throw new Error(m.error);
+      return m.status;
+    }
+    const r = await fetch(url, { method: 'POST', body, headers: { 'Content-Type': contentType || 'application/octet-stream' } });
+    return r.status;
   }
 
   async function getJSON(url) {
@@ -194,6 +217,14 @@
     stepPanel: false,
     // the step on show is seen alone - see `fade`
     focusing: false,
+    // the rail beside the canvas: open or closed by hand, else open where the window is wide enough - see `railOpen`
+    rail: store.get('rail', null),
+    // what it holds - the story of the ask on show, or every ask - and whether the ask's words are shown whole
+    railView: 'story',
+    railPrompt: false,
+    // the moment whose card is over the canvas, and whether it was put aside - see `drawOverlay`
+    ovFor: '',
+    ovAside: false,
   };
 
   const LEVELS = {
@@ -653,6 +684,9 @@
 
   // ------------------------------------------------------------- level 4: code
 
+  // what the marks on a node mean - the story's colours, where a node names its kind itself
+  const MARK_LEGEND = [['Read', 'var(--mk-read)'], ['Added', 'var(--mk-added)'], ['Changed', 'var(--mk-changed)'], ['Removed', 'var(--mk-removed)']];
+
   function fnAccent(f) {
     if (f.module) return 'var(--purple)';
     if (f.test) return 'var(--grey)';
@@ -742,7 +776,7 @@
       file: d,
       note: `${d.file} · ${langName(d.language)} · ${plural(d.functions.length, 'function')}` + (types.length ? ` · types: ${types.slice(0, 8).join(', ')}${types.length > 8 ? ', …' : ''}` : '') + (d.proxies_truncated ? ' · outside callers trimmed' : ''),
       empty: fns.length ? null : ['No functions here', d.functions.length ? 'Every function here is a test - switch tests on to see them.' : types.length ? `This file defines types only: ${types.join(', ')}.` : 'The map holds no functions for this file.'],
-      legend: [['entry point', 'var(--red)'], ['function', 'var(--blue)'], ['test', 'var(--grey)'], ['top level', 'var(--purple)'], ['outside this file', 'var(--grey)', 'dash'], ['exec wire', 'var(--faint)', 'line']],
+      legend: MARK_LEGEND,
     };
   }
 
@@ -877,16 +911,7 @@
         `${f.file}:${f.start}-${f.end} · ${d.step_count} step${d.step_count === 1 ? '' : 's'}` +
         (d.truncated ? ' · cut short: very long or deeply nested' : '') +
         ' · read off the syntax tree, not a trace',
-      legend: [
-        ['call', 'var(--blue)'],
-        ['library call', 'var(--grey)'],
-        ['branch', 'var(--slate)'],
-        ['loop', 'var(--teal)'],
-        ['return', 'var(--purple)'],
-        ['throw', 'var(--red)'],
-        ['closure', 'var(--pink)'],
-        ['defines', 'var(--green)'],
-      ],
+      legend: MARK_LEGEND,
     };
   }
 
@@ -1583,8 +1608,7 @@
     // another view: the one on show lifted off as a picture, to move away as this one comes in
     const ghost = was && !same ? lift(was) : null;
     clearCanvas();
-    // the list of asks belongs to no one level, so it stays while they are walked
-    if (!S.asksPanel) hidePanel();
+    hidePanel();
     hideMessage();
     S.scene = scene;
     S.selected = null;
@@ -1596,6 +1620,8 @@
       n.el.dataset.id = n.id;
       l.nodes.append(n.el);
     }
+    // the lines the step on show touched go inside its nodes before they are measured, so the layout makes room for them
+    showCode(scene);
     for (const n of scene.nodes) {
       n.w = n.el.offsetWidth;
       n.h = n.el.offsetHeight;
@@ -1647,7 +1673,7 @@
     if (same) morph(was);
     else if (ghost) travel(was, ghost, via);
     showKept();
-    showOffMap();
+    drawOverlay();
     S.shownRoute = S.route && { ...S.route };
   }
 
@@ -1698,6 +1724,104 @@
     }
     const keyOf = id => (S.byId.has(id) ? morphKey(S.byId.get(id)) : String(id));
     for (const e of S.scene.edges) if (e.path && kept.has('wire:' + wireKey(e, keyOf))) e.path.classList.add('kept-new');
+  }
+
+  // ------------------------------------------------------------- the lines a step touched
+
+  // at most this many of a step's lines go inside one node
+  const CODE_ROWS = 6;
+
+  // A file's diff as runs of changed lines - what was taken out and what was
+  // put in together - each line numbered in the text it belongs to.
+  function diffRuns(diff) {
+    const runs = [];
+    let run = null;
+    let was = 0;
+    let now = 0;
+    let open = false;
+    for (const line of diff || []) {
+      const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (hunk) {
+        was = +hunk[1];
+        now = +hunk[2];
+        open = true;
+        run = null;
+      } else if (!open || line[0] === '\\') continue;
+      else if (line[0] === '+' || line[0] === '-') {
+        if (!run) runs.push((run = []));
+        run.push(line[0] === '+' ? { op: '+', n: now++, text: line.slice(1) } : { op: '-', n: was++, text: line.slice(1) });
+      } else {
+        was++;
+        now++;
+        run = null;
+      }
+    }
+    return runs;
+  }
+
+  // the lines of a step's diff that fall in a node - those in a function's span at the code level, a statement's own in its logic
+  function codeOf(n, ev) {
+    const d = n.data || {};
+    const level = S.route && S.route.level;
+    let file;
+    let pick;
+    if (level === 'code') {
+      const t = ev.functions.find(x => sameFn(x, d));
+      if (!t) return [];
+      file = t.file;
+      const spans = (pos, line) => !!pos && line >= pos.start && line <= pos.end;
+      // each run that reaches into the function, whole - a comment written above it comes with it
+      pick = run => (run.some(r => spans(r.op === '+' ? t.after : t.before, r.n)) ? run : []);
+    } else if (level === 'flow' && n.kind !== 'entry' && n.kind !== 'end') {
+      file = S.route.file;
+      // a statement's lines run from its own to the next statement's - a call spread over several is all of it
+      const linesOf = x => (x.kind === 'calls' ? x.data.calls.map(c => c.line) : x.kind === 'entry' || x.kind === 'end' || !x.data ? [] : [x.data.line]);
+      const mine = linesOf(n);
+      const from = Math.min(...mine);
+      const last = Math.max(...mine);
+      const next = Math.min(...S.scene.nodes.flatMap(linesOf).filter(l => l > last));
+      const to = Number.isFinite(next) ? next - 1 : S.scene.entry?.data?.function?.end ?? last;
+      const inside = r => r.n >= from && r.n <= to;
+      // the scene is one side of the step, its lines numbered as that side's text
+      const op = S.marks.side === 'before' ? '-' : '+';
+      // the statement's own lines, and what a small replacement took the place of
+      pick = run => {
+        if (!run.some(r => r.op === op && inside(r))) return [];
+        const small = run.filter(r => r.op !== op).length <= 2;
+        return run.filter(r => (r.op === op ? inside(r) : small));
+      };
+    } else return [];
+    const f = ev.files.find(x => x.path === file);
+    return diffRuns(f && f.diff).flatMap(pick);
+  }
+
+  // the lines the step on show wrote, inside the nodes they fall in - a read wrote none
+  function showCode(scene) {
+    for (const n of scene.nodes) n.el.querySelector(':scope > .code')?.remove();
+    const m = S.marks;
+    if (!m || scene.kind !== 'bp' || m.ev.status === 'inspect' || layoutOnly(m.ev)) return;
+    const hit = scene.nodes.filter(n => changeOf(n, m.ev, m.side));
+    // a change with no statement of its own shows in the one it lands after, as its mark does
+    const near = !hit.length && S.route.level === 'flow' && landing(m.ev, m.side);
+    if (near) hit.push(near);
+    for (const n of hit) {
+      // a blank line says nothing in so few
+      const rows = codeOf(n, m.ev).filter(r => r.text.trim());
+      if (!rows.length) continue;
+      // indented as they sit against each other, not as deep as the file has them
+      const pad = Math.min(...rows.map(r => r.text.match(/^\s*/)[0].length));
+      const box = h('div', 'code');
+      for (const r of rows.slice(0, CODE_ROWS)) {
+        const row = h('div', 'ln ' + (r.op === '+' ? 'add' : 'del'));
+        row.title = r.text.trim();
+        row.append(h('span', 'g', r.op === '+' ? '+' : '−'), h('code', null, r.text.slice(pad)));
+        box.append(row);
+      }
+      if (rows.length > CODE_ROWS) box.append(h('div', 'ln more', plural(rows.length - CODE_ROWS, 'more line')));
+      const head = n.el.querySelector(':scope > .head');
+      if (head) head.after(box);
+      else n.el.prepend(box);
+    }
   }
 
   // ------------------------------------------------------------- motion
@@ -2413,12 +2537,10 @@
   function hidePanel() {
     $('panel').hidden = true;
     S.stepPanel = false;
-    S.asksPanel = false;
   }
 
   function panel(what, title, fill) {
     S.stepPanel = false;
-    S.asksPanel = false;
     $('panel-what').textContent = what;
     $('panel-title').textContent = title;
     const body = $('panel-body');
@@ -2897,9 +3019,12 @@
         input.focus();
         input.select();
       } else if (e.key === 'Escape') {
-        if (!$('panel').hidden) select(null);
+        if (!$('tl-menu').hidden) showMenu(false);
+        else if (!$('ov').hidden) closeOverlay();
+        else if (!$('panel').hidden) select(null);
         else up();
       } else if (e.key === 'Backspace') up();
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') stepBy(e.key === 'ArrowLeft' ? -1 : 1);
       else if (e.key === 'f' || e.key === 'F') fit(true);
       else if (e.key === '+' || e.key === '=') zoomBy(1.2);
       else if (e.key === '-' || e.key === '_') zoomBy(1 / 1.2);
@@ -2909,9 +3034,26 @@
       else if (e.key === 'l' || e.key === 'L') toggleFollow();
       else if (e.key === '[') groupBy(-1);
       else if (e.key === ']') groupBy(1);
+      else if (e.key === 'm' || e.key === 'M') toggleSay();
+      else if (e.key === 'c' || e.key === 'C') toggleCc();
+      else if (e.key === ' ' && !e.target.closest('button')) {
+        e.preventDefault();
+        play();
+      }
     });
 
-    window.addEventListener('hashchange', () => render(false));
+    // reaching for the canvas or the bar puts the card over the canvas aside
+    $('viewport').addEventListener('pointerdown', () => closeOverlay());
+    document.querySelector('.bar').addEventListener('pointerdown', () => closeOverlay());
+
+    window.addEventListener('hashchange', () => {
+      // walking the map leaves the plan or the result for the canvas
+      if (T.moment) {
+        T.moment = null;
+        drawTimeline();
+      }
+      render(false);
+    });
   }
 
   // ------------------------------------------------------------- timeline
@@ -2921,9 +3063,9 @@
   // Following, each new one is shown where it landed and as the map holds it
   // now; scrubbing replays any of them from the snapshots the server drew on
   // each side of it while this page was open.
-  // replay speeds, as a share of real time
-  const SPEEDS = [1, 0.5, 0.25, 0.125, 0.1];
-  const SPEED_LABEL = { 1: 'Live', 0.5: '½×', 0.25: '¼×', 0.125: '⅛×', 0.1: '⅒×' };
+  // playback speeds, in the order the button steps through them - 1× keeps the time between steps as it was
+  const SPEEDS = [1, 1.5, 2, 0.5, 0.25];
+  const SPEED_LABEL = { 1: '1×', 1.5: '1.5×', 2: '2×', 0.5: '½×', 0.25: '¼×' };
   // at live speed a step stays on show at least this long - parts that
   // landed together still take their turn each - and never waits longer
   // than this for the next, however long the agent paused
@@ -2954,20 +3096,24 @@
     pumping: false,
     // the step shown last while following, and when
     shown: null,
-    // the step controls opened by hand while following
-    unfolded: false,
+    // the ask's plan or its result on show in place of a step - the step at `at` keeps the place in the story
+    moment: null,
     // each step on show is seen alone: what it touched in full, the rest faded
     focus: store.get('focus', true),
+    // a teammate's replay on show in place of the live timeline - its branch
+    source: null,
   };
   const MAX_TIMELINE = 200;
   const STATUS = {
-    staged: 'staged - not written yet',
-    applied: 'applied - written',
-    reverted: 'reverted - put back',
-    discarded: 'discarded - dropped unwritten',
-    edited: 'edited by hand - saved outside ccc’s edit tools',
-    inspect: 'inspect - an agent read it, through ccc’s read tools or its own',
+    staged: 'proposed - not written yet',
+    applied: 'written',
+    reverted: 'put back - undone',
+    discarded: 'dropped - never written',
+    edited: 'changed by hand - outside ccc’s edit tools',
+    inspect: 'read - an agent looked at it, through ccc’s read tools or its own',
   };
+  // a step's state in a word, as the timeline and the subtitles say it
+  const WORD = { staged: 'proposed', applied: 'written', reverted: 'put back', discarded: 'dropped', edited: 'changed by hand', inspect: 'read' };
 
   const sameFn = (t, f) => t.file === f.file && t.name === f.name && (t.owner || null) === (f.owner || null);
   const within = (line, ranges) => line != null && ranges.some(([a, b]) => line >= a && line <= b);
@@ -2982,8 +3128,249 @@
   // The timeline's steps grouped by the ask behind them - the request an
   // agent was answering, read from its transcript - or by a run of changes
   // made by hand, as /vis/asks answers.
-  const A = { groups: [], of: new Map(), timer: 0 };
+  // `titles` - each chapter's, worked out once for the asks and steps `titled` stamps
+  const A = { groups: [], of: new Map(), beat: new Map(), version: 0, timer: 0, titles: new Map(), titled: '' };
   const groupOf = ev => (ev ? A.groups[A.of.get(ev.seq)] : null);
+
+  // ------------------------------------------------------------- the story
+  // each step told in a line - what it did, to what, and why as the agent said it - for the subtitles to show and the voice to read
+
+  const VERB = { added: 'Adding', modified: 'Changing', removed: 'Removing', inspect: 'Reading' };
+
+  // what a step did, as one kind of change - a name takes the colour of the mark it matches on the canvas
+  function kindOf(ev) {
+    if (ev.status === 'inspect') return 'inspect';
+    const c = ev.part && ev.part.change;
+    if (c === 'added' || c === 'removed') return c;
+    if (c) return 'modified';
+    const fns = (ev.functions || []).filter(f => !f.whitespace);
+    if (fns.length && fns.every(f => f.change === 'added')) return 'added';
+    if (fns.length && fns.every(f => f.change === 'removed')) return 'removed';
+    return 'modified';
+  }
+
+  // what a step's line names - its part, else the functions it touched, else its files
+  function namesOf(ev) {
+    if (ev.part && ev.part.name) return [ev.part.name];
+    const fns = [...new Set((ev.functions || []).filter(f => !f.whitespace).map(f => f.name))];
+    return fns.length ? fns.slice(0, 3) : (ev.files || []).slice(0, 2).map(f => base(f.path));
+  }
+
+  // the first sentence of what an agent said, kept to a subtitle's length
+  function sentence(text, cap = 200) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    const m = t.match(/^.+?[.!?](?=\s|$)/);
+    const s = m && m[0].length >= 12 ? m[0] : t;
+    return s.length > cap ? s.slice(0, cap - 1).replace(/\s+\S*$/, '') + '…' : s;
+  }
+
+  // the beat of its ask a step came in - what the agent was saying as it took it
+  function beatOf(ev) {
+    const g = groupOf(ev);
+    const b = ev ? A.beat.get(ev.seq) : undefined;
+    return g && g.ask && g.ask.beats && b != null ? g.ask.beats[b] || null : null;
+  }
+
+  // the first few sentences of what an agent said, kept to `cap` letters
+  function sentences(text, n, cap) {
+    let rest = String(text || '').replace(/\s+/g, ' ').trim();
+    let out = '';
+    for (let k = 0; k < n && rest; k++) {
+      const m = rest.match(/^.+?[.!?](?=\s|$)/);
+      const s = m ? m[0] : rest;
+      out += (out ? ' ' : '') + s;
+      rest = rest.slice(s.length).trim();
+    }
+    return out.length > cap ? out.slice(0, cap - 1).replace(/\s+\S*$/, '') + '…' : out;
+  }
+
+  // the chapter a step plays in - one per beat of its ask, named for what the agent did in it
+  function chapterOf(ev) {
+    const g = groupOf(ev);
+    const b = ev ? A.beat.get(ev.seq) : undefined;
+    if (!g || !g.ask || !g.ask.beats || b == null) return null;
+    return { key: `${g.ask.id}:${b}`, index: b, title: chapterTitle(g, b) };
+  }
+
+  // A chapter's title: the reason the agent gave most often for its steps -
+  // an edit's intent counting over a read's why - else what it said it would
+  // do as the beat began. Worked out once for each set of asks and steps.
+  function chapterTitle(g, b) {
+    const stamp = `${A.version}:${T.steps.length}`;
+    if (A.titled !== stamp) {
+      A.titled = stamp;
+      A.titles = new Map();
+    }
+    const key = `${g.ask.id}:${b}`;
+    if (!A.titles.has(key)) {
+      const count = new Map();
+      for (const ev of T.steps) {
+        if (A.beat.get(ev.seq) !== b || groupOf(ev)?.ask?.id !== g.ask.id) continue;
+        const look = ev.status === 'inspect';
+        const r = look ? ev.why : why(ev);
+        if (r) count.set(r, (count.get(r) || 0) + (look ? 1 : 2));
+      }
+      const top = [...count].sort((x, y) => y[1] - x[1])[0];
+      A.titles.set(key, titleFrom(top ? top[0] : (g.ask.beats[b] || {}).text));
+    }
+    return A.titles.get(key);
+  }
+
+  // words as a chapter's title - what the agent said it would do, its opening words and backticks gone: "Next I'll check the voice chip." is "Check the voice chip"
+  function titleFrom(text) {
+    const said = String(text || '').replace(/\s+/g, ' ').trim().match(/.+?(?:[.!?](?=\s|$)|$)/g) || [];
+    let t = said[0] || '';
+    for (const s of said) {
+      const m = s.match(/\b(?:I'll|I will|let me|I'm going to|I need to)\s+(.+)/i);
+      if (m) {
+        t = m[1];
+        break;
+      }
+    }
+    t = t
+      .replace(/^\s*(?:next|now|then|first|finally|so|ok|okay|good|right|also)\b[,:]?\s*/i, '')
+      .replace(/[`*]/g, '')
+      .replace(/[\s.:;,!?-]+$/, '')
+      .trim();
+    // a plain first word takes a capital, a name in code keeps its own case
+    if (/^[a-z][a-z'-]*(\s|$)/.test(t)) t = t[0].toUpperCase() + t.slice(1);
+    return t.length > 72 ? t.slice(0, 71).replace(/\s+\S*$/, '') + '…' : t || 'Working';
+  }
+
+  // why a step was taken, as the agent put it - its own reason, else the beat it came in
+  function reasonOf(ev) {
+    const own = ev.status === 'inspect' ? ev.why : why(ev);
+    if (own) return sentence(own);
+    const b = beatOf(ev);
+    return b ? sentence(b.text) : '';
+  }
+
+  // a step's line as runs of words - the verb, the names it touched, then why; `kind` colours a run, `code` marks a name, `say` is how a voice reads it
+  function lineOf(ev) {
+    if (!ev) return [];
+    const kind = byHand(ev) ? 'modified' : kindOf(ev);
+    const runs = [{ text: byHand(ev) ? 'Changed by hand' : VERB[kind], kind, verb: true }];
+    const names = namesOf(ev);
+    names.forEach((n, k) => runs.push({ text: k === 0 ? ' ' : k === names.length - 1 ? ' and ' : ', ' }, { text: n, kind, code: true }));
+    const reason = reasonOf(ev);
+    if (reason) runs.push({ text: ' - ', say: ', ' }, ...prose(reason, new Map((ev.functions || []).map(f => [f.name, f.change]))));
+    return runs;
+  }
+
+  // what an agent wrote as runs of words - a name in backticks reads as code, coloured by what `touched` says a step did to it
+  const prose = (text, touched) =>
+    String(text)
+      .split(/`([^`]+)`/)
+      .flatMap((part, k) => (!part ? [] : k % 2 ? [{ text: part, code: true, kind: touched && touched.get(part) }] : [{ text: part }]));
+
+  // the story's first and last lines in the agent's own words - its plan, then how it ended
+  function storyLine(kind, ask) {
+    const plan = kind === 'plan';
+    return [{ text: plan ? 'Plan:' : 'Done.', verb: true }, { text: ' ' }, ...prose(sentences(plan ? ask.plan : ask.outcome, 2, 260))];
+  }
+
+  // a name as a voice says it - `morphWires` is "morph wires", `keep_line` "keep line", `vis.css` "vis dot css"
+  function sayName(n) {
+    return String(n)
+      .replace(/\.(\w+)$/, ' dot $1')
+      .replace(/::|[_/]+/g, ' ')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .toLowerCase();
+  }
+
+  const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+  const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+  // a number in words, so the voice and the highlighting agree on how many words it is
+  function numberWords(n) {
+    if (n < 20) return ONES[n];
+    if (n < 100) return TENS[Math.floor(n / 10)] + (n % 10 ? ' ' + ONES[n % 10] : '');
+    if (n < 1000) return ONES[Math.floor(n / 100)] + ' hundred' + (n % 100 ? ' and ' + numberWords(n % 100) : '');
+    if (n < 1e6) return numberWords(Math.floor(n / 1000)) + ' thousand' + (n % 1000 ? ' ' + numberWords(n % 1000) : '');
+    return String(n);
+  }
+  const speakable = s => s.replace(/\d+/g, d => (d.length <= 6 ? numberWords(+d) : d));
+
+  // a line as words on screen and as the text a voice reads, each word knowing where it sits in that text
+  function compose(runs) {
+    const frag = document.createDocumentFragment();
+    const marks = [];
+    let text = '';
+    const word = (el, say) => {
+      marks.push({ el, start: text.length, end: text.length + say.length });
+      text += say;
+      frag.append(el);
+    };
+    for (const r of runs) {
+      if (r.say != null) {
+        frag.append(r.text);
+        text += r.say;
+      } else if (r.code || r.verb) {
+        const el = h('span', (r.verb ? 'v' : 's') + (r.kind ? ' k-' + r.kind : ''), r.text);
+        if (r.code) el.dataset.name = r.text;
+        word(el, r.code ? sayName(r.text) : speakable(r.text));
+      } else {
+        for (const part of r.text.split(/(\s+)/)) {
+          if (!part) continue;
+          if (/^\s+$/.test(part)) {
+            frag.append(part);
+            text += ' ';
+          } else word(h('span', null, part), speakable(part));
+        }
+      }
+    }
+    return { frag, spoken: text, marks };
+  }
+
+  // the ask behind a step, if an agent's ask is
+  const askOf = ev => groupOf(ev)?.ask || null;
+
+  // the moment on show - the ask's plan or result, else the step at `at`
+  function momentNow() {
+    const ev = T.at != null ? T.steps[T.at] : null;
+    const ask = ev && askOf(ev);
+    if (T.moment && ask && (T.moment === 'plan' ? ask.plan : ask.outcome)) return { kind: T.moment, ask };
+    return ev ? { kind: 'step', i: T.at, ev } : null;
+  }
+
+  // a moment's line as runs of words
+  const runsOf = m => (!m ? [] : m.kind === 'step' ? lineOf(m.ev) : storyLine(m.kind, m.ask));
+
+  const sameMoment = (a, b) => !!a && !!b && a.kind === b.kind && (a.kind === 'step' ? a.i === b.i : a.ask.id === b.ask.id);
+
+  // the moment on show, told in a line over the foot of the canvas
+  function showSubtitle() {
+    const box = $('subs');
+    const m = momentNow();
+    // on show while it plays or is followed, drawn from its snapshot, or marked on the map as it is now - the plan and result whenever they are
+    const show = V.cc && !!m && !!(T.moment || T.replay || T.playing || T.follow || (S.marks && S.marks.ev === m.ev)) && !V.wait;
+    box.hidden = !show;
+    if (!show) return;
+    // asks learned since change what a step's line says
+    const key = `${m.kind}:${m.ev ? m.ev.seq : m.ask.id}:${A.version}`;
+    if (box.dataset.key === key) return;
+    box.dataset.key = key;
+    const c = compose(runsOf(m));
+    V.marks = c.marks;
+    const line = h('span', 'subs-line');
+    line.append(c.frag);
+    const inner = h('div', 'subs-in');
+    inner.append(line);
+    box.replaceChildren(inner);
+  }
+
+  // the word the voice is on, lit - `at` a place in the line as it is read, -1 for none
+  function lightWord(at) {
+    for (const m of V.marks || []) m.el.classList.toggle('now', at >= m.start && at <= m.end);
+  }
+
+  // a name pointed at in a subtitle finds its node on the canvas
+  function pingName(name, on) {
+    for (const n of S.scene ? S.scene.nodes : []) {
+      const d = n.data || {};
+      if (d.name === name || (d.function && d.function.name === name)) n.el.classList.toggle('ping', on);
+    }
+  }
 
   // what a group of steps is put down to, in a line
   function groupText(g) {
@@ -3010,17 +3397,23 @@
   async function loadAsks() {
     let r;
     try {
-      r = await getJSON('/vis/asks');
+      r = await getJSON('/vis/asks' + (T.source ? '?replay=' + encodeURIComponent(T.source) : ''));
     } catch {
       return;
     }
     A.groups = r.groups || [];
     A.of = new Map();
-    A.groups.forEach((g, i) => g.steps.forEach(seq => A.of.set(seq, i)));
+    A.beat = new Map();
+    A.version++;
+    A.groups.forEach((g, i) =>
+      g.steps.forEach((seq, k) => {
+        A.of.set(seq, i);
+        if (g.beats && g.beats[k] != null) A.beat.set(seq, g.beats[k]);
+      })
+    );
     drawTimeline();
     // which steps make up the collection on show may have just been learned
     showKept();
-    if (S.asksPanel) panelAsks();
   }
 
   // a person, beside a change made by hand rather than by an agent
@@ -3028,27 +3421,6 @@
     const s = sv('svg', { class: 'person', viewBox: '0 0 16 16', 'aria-hidden': 'true' });
     s.append(sv('circle', { cx: 8, cy: 4.5, r: 3 }), sv('path', { d: 'M2 15c0-3.6 2.7-6 6-6s6 2.4 6 6z' }));
     return s;
-  }
-
-  function summary(ev) {
-    const fn = ev.focus && ev.focus.level === 'flow' ? ev.focus.name : null;
-    const files = ev.files.length === 1 ? base(ev.files[0].path) : plural(ev.files_total, 'file');
-    if (ev.status === 'inspect') return `inspected ${fn || files}`;
-    const added = ev.files.reduce((n, f) => n + f.added, 0);
-    const removed = ev.files.reduce((n, f) => n + f.removed, 0);
-    // one part of a step: the definition it is about, and which part of how many
-    const p = ev.part;
-    const what = (p && p.name ? `${p.owner ? p.owner + '::' : ''}${p.name}` : fn) || files;
-    const part = p ? ` · ${p.kind === 'file' ? 'file' : p.kind} ${p.change} · ${p.index + 1}/${p.of}` : '';
-    return `${what} +${added} −${removed}${part}`;
-  }
-
-  // one part of a step in a line: what it is about, and which of how many
-  function partOf(ev) {
-    const p = ev.part;
-    if (!p) return null;
-    const name = p.name ? ` ${p.owner ? p.owner + '::' : ''}${p.name}` : '';
-    return `${p.kind}${name} ${p.change} ${p.index + 1}/${p.of}`;
   }
 
   // where on the canvas a step is seen, on one side of it
@@ -3123,6 +3495,15 @@
     const hit = [];
     if (!S.scene) return hit;
     const m = S.marks;
+    // the lines a step wrote go with its marks, and the wires find their pins again
+    if (!m && document.querySelector('#nodes .code')) {
+      for (const el of document.querySelectorAll('#nodes .code')) el.remove();
+      for (const n of S.scene.nodes) {
+        n.h = n.el.offsetHeight;
+        measurePins(n);
+      }
+      drawEdges();
+    }
     const mark = (n, how) => {
       // read layout between the two so the pulse starts again
       void n.el.offsetWidth;
@@ -3172,13 +3553,13 @@
   // `now` - straight there, as the motion of a new scene carries the camera
   function flyTo(nodes, now) {
     const vp = $('viewport');
-    const bar = $('timeline');
     const x0 = Math.min(...nodes.map(n => n.x));
     const y0 = Math.min(...nodes.map(n => n.y));
     const x1 = Math.max(...nodes.map(n => n.x + n.w));
     const y1 = Math.max(...nodes.map(n => n.y + n.h));
     const vw = vp.clientWidth - ($('panel').hidden ? 0 : 352);
-    const vh = vp.clientHeight - (bar.hidden ? 0 : bar.offsetHeight + 12);
+    // the subtitles cover the canvas's foot
+    const vh = vp.clientHeight - ($('subs').hidden ? 0 : 72);
     // near enough a grouped scene that its nodes are back
     const floor = S.route && S.route.level === 'flow' ? 0.6 : S.scene && S.scene.groups ? GROUP_SHOW + 0.05 : 0.3;
     S.zoom = clamp(Math.min((vw - 120) / Math.max(1, x1 - x0), (vh - 120) / Math.max(1, y1 - y0)), floor, 1.1);
@@ -3203,6 +3584,7 @@
   async function arrive(ev) {
     const i = T.steps.indexOf(ev);
     T.at = i < 0 ? T.steps.length - 1 : i;
+    T.moment = null;
     T.side = ev.on_disk;
     drawTimeline();
     if (ev.status === 'discarded') {
@@ -3245,19 +3627,10 @@
     // A step in a file the map does not hold - a stylesheet, a README - is seen
     // where the latest step before it that the map holds happened, never
     // wherever the view was left: following goes on from the latest point.
-    if (!focusRoute(ev, ev.on_disk)) S.offMapStep = ev;
+    // What it changed shows on a card over that view - see `drawOverlay`.
     const route = focusRoute(ev, ev.on_disk) || placeBefore(T.at);
     if (route) go(route);
     else render(true);
-  }
-
-  // A step in files the map does not draw - a stylesheet, a README - shown
-  // by what it changed, in the panel, once the view it is seen from is up;
-  // never over the list of asks.
-  function showOffMap() {
-    const ev = S.offMapStep;
-    S.offMapStep = null;
-    if (ev && !S.asksPanel) panelEvent(ev);
   }
 
   // where on the map the latest step before `i` happened, if any did
@@ -3284,8 +3657,7 @@
   function followLive() {
     stopPlay();
     T.follow = true;
-    // the step controls fold away again
-    T.unfolded = false;
+    T.moment = null;
     // live is now, whatever was still waiting its turn, in the latest ask
     T.queue = [];
     T.shown = null;
@@ -3359,11 +3731,12 @@
     const mine = ++replaySeq;
     if (!live) T.follow = false;
     T.at = i;
+    T.moment = null;
     drawTimeline();
     let full = T.full.get(ev.seq);
     if (!full && ev.snapshot) {
       try {
-        full = await getJSON('/vis/event?seq=' + ev.seq);
+        full = await getJSON('/vis/event?seq=' + ev.seq + (T.source ? '&replay=' + encodeURIComponent(T.source) : ''));
         T.full.set(ev.seq, full);
       } catch {
         full = null;
@@ -3377,6 +3750,7 @@
     const keepPanel = S.stepPanel;
     S.marks = { ev, side };
     S.fly = true;
+    showSubtitle();
     if (!has(side)) {
       // nothing was drawn of it - no visualiser was open, or it is older than
       // the snapshots kept - so show where it happened in the map as it is
@@ -3385,14 +3759,10 @@
       } catch {
         return;
       }
-      // a step the map has no place for shows what it changed in the panel
-      if (!focusRoute(ev, ev.on_disk)) S.offMapStep = ev;
+      // a step the map has no place for shows what it changed on the card over the canvas
       const route = focusRoute(ev, ev.on_disk) || placeBefore(i);
       if (route) go(route);
-      else {
-        drawTimeline();
-        showOffMap();
-      }
+      else drawTimeline();
       return;
     }
     const snap = full[side];
@@ -3441,39 +3811,72 @@
     drawTimeline();
   }
 
-  // the step before or after the one on show, within the ask on show
+  // the moment before or after the one on show, within the story on show
   function stepBy(d) {
-    const shown = shownSteps();
-    if (!shown.length) return;
+    const st = storyOf();
+    if (!st.all.length) return;
     stopPlay();
-    const k = shown.indexOf(T.at);
-    const from = k < 0 ? (d > 0 ? -1 : shown.length) : k;
-    const i = shown[clamp(from + d, 0, shown.length - 1)];
-    if (i !== T.at || !T.replay) replay(i, T.side);
+    const from = st.at < 0 ? (d > 0 ? -1 : st.all.length) : st.at;
+    const k = clamp(from + d, 0, st.all.length - 1);
+    if (k !== st.at || (st.all[k].kind === 'step' && !T.replay)) showMoment(st.all[k], T.side);
   }
 
-  // replay step after step - those given, or every one from the playhead on -
-  // then follow again at the end
+  // a moment brought on show: a step drawn as it was, or the ask's plan or result told over the canvas
+  function showMoment(m, side) {
+    if (m.kind === 'step') return replay(m.i, side || 'after');
+    const shown = shownSteps();
+    T.follow = false;
+    T.moment = m.kind;
+    // the step it stands beside keeps the story's place - the first for the plan, the last for the result
+    const at = m.kind === 'plan' ? shown[0] : shown[shown.length - 1];
+    if (at != null) T.at = at;
+    if (m.kind === 'result') {
+      // the story told, nothing is marked but what it added, resting green
+      S.marks = null;
+      applyMarks();
+      showKept();
+    }
+    drawTimeline();
+  }
+
+  // how long a line takes to read, at the chosen speed
+  const readMs = m => clamp(1400 + compose(runsOf(m)).spoken.split(/\s+/).length * 230, 3000, 9000) / T.speed;
+
+  // Play the story on from the moment on show - or the steps given - each
+  // moment read aloud, else on show long enough to read. A story that has
+  // ended stays on its result; one still being told follows on, live.
   async function play(list) {
     if (T.playing) return stopPlay();
+    if (V.wait) return endWait(false);
     if (!T.steps.length) return;
+    const st = storyOf();
+    // from the moment on show, or from the start once the story has ended
+    const queue = list ? list.map(i => ({ kind: 'step', i, ev: T.steps[i] })) : st.all.slice(st.at < 0 || st.at >= st.all.length - 1 ? 0 : st.at);
+    if (!queue.length) return;
+    // the first time a story is played, say what narration needs; the natural voice, once chosen, is waited for
+    if (!(await voiceReady(queue, () => play(list)))) return;
     T.playing = true;
-    const shown = shownSteps();
-    const k = shown.indexOf(T.at);
-    const queue = list || shown.slice(k < 0 || k >= shown.length - 1 ? 0 : k + 1);
     drawTimeline();
-    for (const [k, i] of queue.entries()) {
+    // every line of the story made ahead while it plays, in the order it is read
+    if (V.on && V.state === 'ready') for (const m of queue) lineFor(m).catch(() => {});
+    for (const [k, m] of queue.entries()) {
       if (!T.playing) break;
-      await replay(i, 'after');
-      await sleep(pace(T.steps[i], T.steps[queue[k + 1]]));
+      await showMoment(m, 'after');
+      if (!T.playing) break;
+      // a moment read aloud stays on show until its line ends, with a breath after it
+      if (await narrate(m)) await sleep(350 / T.speed);
+      else await sleep(Math.max(m.kind === 'step' ? pace(m.ev, queue[k + 1] && queue[k + 1].ev) : 0, V.cc ? readMs(m) : 0));
     }
     if (T.playing) {
       T.playing = false;
-      followLive();
+      if (queue[queue.length - 1].kind === 'result' || T.source) drawTimeline();
+      else followLive();
     }
   }
 
   function stopPlay() {
+    stopLine();
+    if (V.wait) endWait(false);
     if (!T.playing) return;
     T.playing = false;
     drawTimeline();
@@ -3507,13 +3910,16 @@
   // timeline afresh. A step no ask is known for yet is the newest, so it goes
   // with the latest.
   function shownSteps() {
-    if (!A.groups.length) return T.steps.map((_, i) => i);
+    // a change proposed and then written is one step - once its changeset is written, the proposals give way to the writes
+    const written = new Set(T.steps.filter(ev => ev.status === 'applied' && ev.changeset).map(ev => ev.changeset));
+    const merged = ev => !(ev.status === 'staged' && written.has(ev.changeset));
+    if (!A.groups.length) return T.steps.flatMap((ev, i) => (merged(ev) ? [i] : []));
     const latest = collectionOf(A.groups.length - 1);
     const want = collectionAt() || latest;
     const out = [];
     T.steps.forEach((ev, i) => {
       const gi = A.of.get(ev.seq);
-      if (gi === undefined ? want === latest : collectionOf(gi) === want) out.push(i);
+      if (merged(ev) && (gi === undefined ? want === latest : collectionOf(gi) === want)) out.push(i);
     });
     return out;
   }
@@ -3521,90 +3927,47 @@
   function drawTimeline() {
     const bar = $('timeline');
     const n = T.steps.length;
-    // with no edits yet there is no timeline, only the switches for what comes
     bar.hidden = false;
+    // nothing to play yet: the player waits for a story, its switches for what comes still on hand
     bar.classList.toggle('empty', !n);
-    document.body.classList.toggle('with-timeline', n > 0);
-    document.body.classList.toggle('with-tl-switches', !n);
-    const ticks = $('tl-ticks');
-    ticks.textContent = '';
-    // one collection at a time - scrubbing stays inside it, and a long history drawn whole is what lags
-    const shown = shownSteps();
-    shown.forEach(i => {
-      const ev = T.steps[i];
-      const g = A.groups[A.of.get(ev.seq)];
-      const t = h('i', `tick ${ev.status}${byHand(ev) ? ' human' : ''}${layoutOnly(ev) ? ' ws' : ''}${i === T.at ? ' at' : ''}`);
-      t.title = `${g ? groupText(g) + '\n' : ''}#${ev.seq} ${ev.status} · ${ev.tool} · ${summary(ev)}${why(ev) ? ' · ' + why(ev) : ''}`;
-      t.dataset.i = i;
-      ticks.append(t);
-    });
+    const st = storyOf();
+    drawScrub(st);
+    const m = st.all[st.at] || null;
     const ev = T.at != null ? T.steps[T.at] : null;
+    // where the story is, and the chapter it is in
+    $('tl-time').textContent = st.all.length ? `${st.at < 0 ? '–' : st.at + 1} / ${st.all.length}` : '';
+    const ch = m && st.chapters[m.chapter];
     const label = $('tl-step');
-    const who = ev && byHand(ev) ? [person()] : [];
-    // a part says what it is about before why its step was taken
-    const text = ev && `#${ev.seq} ${ev.status} · ${[partOf(ev), why(ev)].filter(Boolean).join(' · ') || summary(ev)}${ev.whitespace ? ' · layout only' : ''}`;
-    label.replaceChildren(...who, text || 'No edits yet - every change lands here, by ccc’s edit tools or by hand');
-    label.title = ev ? `${STATUS[ev.status]} · ${ev.tool} · ${summary(ev)}${ev.changeset ? ' · changeset ' + ev.changeset : ''} - click for its diff` : '';
-    label.disabled = !ev;
-    const g = groupOf(ev);
-    const chip = $('tl-ask');
-    chip.hidden = !A.groups.length;
-    const k = shown.indexOf(T.at);
-    chip.replaceChildren(
-      ...(g ? [groupIcon(g)] : []),
-      h('span', 'ask-label', g ? groupText(g) : 'Asks'),
-      ...(g && k >= 0 ? [h('span', 'ask-n', `${k + 1} / ${shown.length}`)] : [])
-    );
-    chip.title = `${g ? groupText(g) + '\n\n' : ''}Every ask and what it changed - [ and ] step between them`;
-    const cur = collectionAt();
-    for (const row of document.querySelectorAll('#panel .ask-row')) row.classList.toggle('at', row.dataset.c === cur);
-    $('tl-prev').disabled = !shown.length || k === 0;
-    $('tl-next').disabled = !shown.length || T.at == null || k >= shown.length - 1;
+    label.replaceChildren(...(m && m.kind === 'step' && byHand(m.ev) ? [person()] : []), n ? `· ${ch ? ch.title : 'Steps'} ›` : 'No steps yet - every change lands here, by ccc’s edit tools or by hand');
+    label.disabled = !n;
+    $('tl-prev').disabled = st.at <= 0;
+    $('tl-next').disabled = st.at < 0 || st.at >= st.all.length - 1;
     $('tl-play').disabled = !n;
-    $('tl-play').textContent = T.playing ? '❚❚' : '▶';
-    $('tl-play').title = T.playing ? 'Pause' : 'Replay the steps from here';
+    const busy = T.playing || !!V.wait;
+    $('tl-play-icon').setAttribute('d', busy ? 'M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z' : 'M7 4.5v15l12.5-7.5z');
+    $('tl-play').setAttribute('aria-label', V.wait ? 'stop waiting for the voice' : T.playing ? 'pause' : 'play');
+    $('tl-play').title = V.wait ? 'Stop waiting (space)' : T.playing ? 'Pause (space)' : 'Play (space)';
+    // which side of a replayed step is drawn
     const full = ev && T.full.get(ev.seq);
-    $('tl-side').hidden = !T.replay;
+    $('tl-side').hidden = !T.replay || !!T.moment;
     for (const b of $('tl-side').children) {
       b.setAttribute('aria-pressed', String(T.side === b.dataset.side));
       b.disabled = !(full && full[b.dataset.side]);
     }
     const live = T.follow && (!T.replay || T.replay.live);
-    $('tl-follow').setAttribute('aria-checked', String(live));
+    const follow = $('tl-follow');
+    follow.setAttribute('aria-checked', String(live));
+    follow.title = live ? 'Following live changes - each edit shown as it lands (L)' : 'Go live - the newest change, then each one as it lands (L)';
+    $('tl-live').textContent = live ? 'Live' : 'Go live';
     // slowed, following runs behind by the steps still waiting their turn
-    $('tl-behind').replaceChildren(...(live && T.queue.length ? [` · ${T.queue.length}`, h('span', 'tl-behind', ' behind')] : []));
-    // Following, the step controls fold away to the left behind an arrow
-    // that opens them - and stopping opens them too.
-    const folded = live && !T.unfolded;
-    const controls = $('tl-controls');
-    controls.classList.toggle('folded', folded);
-    controls.inert = folded;
-    const unfold = $('tl-unfold');
-    unfold.hidden = !live;
-    unfold.textContent = folded ? '»' : '«';
-    unfold.title = folded ? 'Show the step controls' : 'Fold the step controls away';
-    unfold.setAttribute('aria-label', unfold.title.toLowerCase());
-    unfold.setAttribute('aria-expanded', String(!folded));
-    $('tl-ws').setAttribute('aria-pressed', String(T.ws));
+    $('tl-behind').textContent = live && T.queue.length ? ` · ${T.queue.length} behind` : '';
+    $('tl-ws').setAttribute('aria-checked', String(T.ws));
+    $('tl-focus').setAttribute('aria-checked', String(T.focus));
     $('tl-speed').textContent = SPEED_LABEL[T.speed];
-    $('tl-focus').setAttribute('aria-pressed', String(T.focus));
-    const badge = $('replay-badge');
-    // a step only in files the map does not draw - a stylesheet, a README -
-    // moves nothing on it, so it says so whether replayed or just landed
-    const offMap = !!ev && !!S.overview && ev.status !== 'inspect' && ev.files.length > 0 && !focusRoute(ev, ev.on_disk);
-    badge.hidden = !ev || !(T.replay || offMap);
-    if (!badge.hidden) {
-      badge.replaceChildren(
-        ...(byHand(ev) ? [person()] : []),
-        !T.replay
-          ? `Step #${ev.seq} ${ev.status}${why(ev) ? ' · ' + why(ev) : ''}`
-          : T.replay.live
-            ? `Proposed · step #${ev.seq}${why(ev) ? ' · ' + why(ev) : ' - staged, not written yet'}`
-            : `Replay · step #${ev.seq} ${ev.status} · ${T.side} it${why(ev) ? ' · ' + why(ev) : ''}`,
-        ...(offMap ? [h('span', 'off-map', ` · ${ev.files.map(f => base(f.path)).join(', ')} not on the map`)] : []),
-      );
-      badge.title = (ev.intent || []).join('\n');
-    }
+    drawOverlay(st, m);
+    drawRail(st);
+    showSubtitle();
+    voiceChip();
   }
 
   function diffView(ev) {
@@ -3629,7 +3992,7 @@
     const look = ev.status === 'inspect';
     // a read an agent took with its own tool names the call, found in its transcript
     const own = look && !!ev.call;
-    panel((look ? 'Inspect #' : 'Edit step #') + ev.seq, `${ev.status} · ${ev.tool}`, body => {
+    panel((look ? 'Read #' : 'Step #') + ev.seq, `${WORD[ev.status] || ev.status} · ${ev.tool}`, body => {
       const by = byHand(ev)
         ? 'a person, by hand'
         : own
@@ -3638,7 +4001,11 @@
             ? 'an agent, through ccc’s read tools'
             : 'an agent, through ccc’s edit tools';
       const rows = [['status', STATUS[ev.status]], ['by', by]];
-      if (ev.intent && ev.intent.length) rows.push([own ? 'read' : look ? 'asked' : 'why', ev.intent.join(' · ')]);
+      const reason = reasonOf(ev);
+      if (reason) rows.push(['why', reason]);
+      if (look && ev.intent && ev.intent.length) rows.push([own ? 'read' : 'asked', ev.intent.join(' · ')]);
+      const chapter = chapterOf(ev);
+      if (chapter) rows.push(['chapter', chapter.title]);
       if (ev.part) rows.push(['part', `${ev.part.index + 1} of ${ev.part.of} - ${ev.part.kind} ${ev.part.change}`]);
       const g = groupOf(ev);
       if (g && g.ask) rows.push(['ask', g.ask.prompt]);
@@ -3653,7 +4020,7 @@
           row.append(h('span', 'chg-tag ' + (t.whitespace ? 'ws' : t.change), t.whitespace ? 'layout' : t.change), goBtn(`${t.owner ? t.owner + '::' : ''}${t.name}  ${base(t.file)}`, route));
           return row;
         });
-        section(body, look ? 'Inspected' : 'Functions', list(rows));
+        section(body, look ? 'Read' : 'Functions', list(rows));
       }
       if (ev.ops.length) section(body, 'Operations', list(ev.ops.map(o => h('code', null, o))));
       if (look) section(body, 'Files', list(ev.files.map(f => goBtn(f.path, { level: 'code', file: f.path }))));
@@ -3662,57 +4029,476 @@
     S.stepPanel = true;
   }
 
-  // Every collection the timeline holds - each ask, each run of changes by
-  // hand - in order, under the session it was made in: pick one and the
-  // timeline holds its steps alone, or play a whole session through.
-  function panelAsks() {
-    const keep = S.asksPanel ? $('panel-body').scrollTop : 0;
-    select(null);
-    const all = collections();
-    const asks = all.filter(c => c.group.ask).length;
-    panel('Asks', `${plural(asks, 'ask')} · ${plural(T.steps.length, 'step')}`, body => {
-      if (!all.length) body.append(h('p', 'hint', 'No steps yet - each ask an agent works on lands here, and every change made by hand'));
-      const cur = collectionAt();
-      let session;
-      for (const c of all) {
-        const g = c.group;
-        if (g.ask && g.ask.session !== session) {
-          session = g.ask.session;
-          const s = session;
-          const head = h('div', 'ask-session');
-          head.append(h('span', null, `${g.ask.agent} session · ${new Date(g.ask.at).toLocaleString()}`));
-          const all = h('button', null, '▶ Play session');
-          all.title = 'Replay every step from this session’s first ask to its last';
-          all.addEventListener('click', () => playSession(s));
-          head.append(all);
-          body.append(head);
-        }
-        const row = h('div', 'ask-row' + (c.key === cur ? ' at' : ''));
-        row.dataset.c = c.key;
-        const go = h('button', 'ask-go');
-        go.append(groupIcon(g), h('span', 'ask-text', groupText(g)), h('span', 'ask-n', plural(c.steps.length, 'step')));
-        go.title = groupText(g);
-        go.addEventListener('click', () => goCollection(c));
-        const one = h('button', 'ask-play', '▶');
-        one.title = 'Replay this ask’s steps';
-        one.addEventListener('click', () => play(indicesOf(c.steps)));
-        row.append(go, one);
-        body.append(row);
+  // ------------------------------------------------------------- the story as a video
+
+  // The story of the collection on show, moment by moment - the agent's plan,
+  // each step, how it ended - in its chapters, and where in it the player is.
+  function storyOf() {
+    const shown = shownSteps();
+    const ask = askOf(T.steps[T.at != null ? T.at : shown[shown.length - 1]]);
+    const all = [];
+    if (ask && ask.plan) all.push({ kind: 'plan', ask });
+    for (const i of shown) all.push({ kind: 'step', i, ev: T.steps[i] });
+    if (ask && ask.outcome) all.push({ kind: 'result', ask });
+    const chapters = [];
+    for (const [k, m] of all.entries()) {
+      const c = chapterOfMoment(m);
+      const last = chapters[chapters.length - 1];
+      if (last && last.key === c.key) last.end = k + 1;
+      else chapters.push({ ...c, start: k, end: k + 1 });
+      m.chapter = chapters.length - 1;
+    }
+    let at = T.moment ? all.findIndex(m => m.kind === T.moment) : -1;
+    if (at < 0) at = all.findIndex(m => m.kind === 'step' && m.i === T.at);
+    return { ask, all, chapters, at };
+  }
+
+  // the chapter a moment plays in - the plan and the result each one of their own
+  function chapterOfMoment(m) {
+    if (m.kind !== 'step') return m.kind === 'plan' ? { key: 'plan', title: 'The plan' } : { key: 'result', title: 'Result' };
+    const c = chapterOf(m.ev);
+    if (c) return c;
+    const g = groupOf(m.ev);
+    return { key: 'none', title: g && g.kind === 'hand' ? 'Changed by hand' : 'Steps' };
+  }
+
+  // what a moment did, for the colour of its dot
+  function dotKind(m) {
+    if (m.kind !== 'step') return m.kind === 'plan' ? 'plan' : 'done';
+    if (m.ev.status === 'staged') return 'proposed';
+    return byHand(m.ev) ? 'modified' : kindOf(m.ev);
+  }
+
+  // a step whose files the map does not draw - a stylesheet, a README - so the map has nothing of it to mark
+  const offMap = ev => !!S.overview && ev.status !== 'inspect' && ev.files.length > 0 && !focusRoute(ev, ev.on_disk);
+
+  // what a run of moments did, counted - its reads, what it added, changed and removed, and the files it touched off the map
+  function tally(ms) {
+    let reads = 0;
+    const off = new Set();
+    const did = { added: new Set(), modified: new Set(), removed: new Set() };
+    for (const m of ms) {
+      if (m.kind !== 'step') continue;
+      if (m.ev.status === 'inspect') {
+        reads++;
+        continue;
       }
+      if (offMap(m.ev)) for (const f of m.ev.files) off.add(f.path);
+      else for (const n of namesOf(m.ev)) did[byHand(m.ev) ? 'modified' : kindOf(m.ev)].add(n);
+    }
+    const out = [];
+    if (reads) out.push(plural(reads, 'read'));
+    if (did.added.size) out.push(`${fmt(did.added.size)} added`);
+    if (did.modified.size) out.push(`${fmt(did.modified.size)} changed`);
+    if (did.removed.size) out.push(`${fmt(did.removed.size)} removed`);
+    if (off.size) out.push(`${plural(off.size, 'file')} off the map`);
+    return out.join(' · ');
+  }
+
+  const PAST = { added: 'Added', modified: 'Changed', removed: 'Removed', inspect: 'Read' };
+
+  // a moment in a few words, as a chapter lists its steps
+  function shortOf(m) {
+    if (m.kind !== 'step') return sentences(m.kind === 'plan' ? m.ask.plan : m.ask.outcome, 1, 64);
+    const ev = m.ev;
+    const did = byHand(ev) ? 'Changed by hand' : ev.status === 'staged' ? 'Proposed: ' + PAST[kindOf(ev)].toLowerCase() : PAST[kindOf(ev)];
+    return `${did} ${namesOf(ev).join(', ')}`;
+  }
+
+  // where a moment comes from, quietly under it
+  function srcOf(m) {
+    if (m.kind === 'plan') return 'its plan, before its first call';
+    if (m.kind === 'result') return 'its last word';
+    const ev = m.ev;
+    return `#${ev.seq} ${WORD[ev.status] || ev.status} · ${ev.files.length === 1 ? base(ev.files[0].path) : plural(ev.files_total, 'file')}`;
+  }
+
+  // a time as the rail says it - "4 Oct, 00:36"
+  const when = ms => new Date(ms).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+  // The bar: a segment for each chapter, as long as its moments are many,
+  // with a dot under it for each in the colour of what it did, played up to
+  // the knob at the moment on show.
+  function drawScrub(st) {
+    const segs = $('tl-ticks');
+    const key = st.chapters.map(c => `${c.key}:${c.end - c.start}`).join('|') + '|' + st.all.map(dotKind).join(',');
+    if (segs.dataset.key !== key) {
+      segs.dataset.key = key;
+      segs.replaceChildren(
+        ...st.chapters.map(c => {
+          const seg = h('div', 'seg');
+          seg.style.flexGrow = c.end - c.start;
+          seg.append(h('i', 'fill'));
+          for (let k = c.start; k < c.end; k++) {
+            const mk = h('i', 'mk d-' + dotKind(st.all[k]));
+            mk.style.left = ((k - c.start + 0.5) / (c.end - c.start)) * 100 + '%';
+            seg.append(mk);
+          }
+          return seg;
+        })
+      );
+      // a long story's dots shrink rather than run into each other
+      segs.classList.toggle('dense', st.all.length > 90);
+    }
+    const now = st.at >= 0 ? st.all[st.at].chapter : -1;
+    st.chapters.forEach((c, k) => {
+      const f = k < now ? 1 : k > now ? 0 : (st.at - c.start + 0.5) / (c.end - c.start);
+      segs.children[k].firstChild.style.width = f * 100 + '%';
     });
-    S.asksPanel = true;
-    $('panel-body').scrollTop = keep;
+    const knob = $('tl-knob');
+    knob.hidden = now < 0;
+    if (now >= 0) {
+      const seg = segs.children[now];
+      const c = st.chapters[now];
+      knob.style.left = seg.offsetLeft + ((st.at - c.start + 0.5) / (c.end - c.start)) * seg.offsetWidth + 'px';
+    }
+    const track = $('tl-track');
+    track.setAttribute('aria-valuemax', String(st.all.length));
+    track.setAttribute('aria-valuenow', String(st.at + 1));
+    track.setAttribute('aria-valuetext', now < 0 ? 'nothing on show' : `${st.at + 1} of ${st.all.length}: ${st.chapters[now].title}`);
+  }
+
+  // the moment under the pointer on the bar - each chapter's segment holds its moments side by side
+  function momentAt(x, st) {
+    const segs = [...$('tl-ticks').children];
+    for (let k = 0; k < segs.length; k++) {
+      const next = segs[k + 1] ? segs[k + 1].getBoundingClientRect().left : Infinity;
+      if (x >= next && k < segs.length - 1) continue;
+      const c = st.chapters[k];
+      if (!c) return -1;
+      const r = segs[k].getBoundingClientRect();
+      return c.start + Math.floor(clamp((x - r.left) / r.width, 0, 0.9999) * (c.end - c.start));
+    }
+    return -1;
+  }
+
+  // a line of a diff as a row - its sign in the gutter, its text from `pad` on, cut to fit
+  function lineRow(r, pad) {
+    const row = h('div', 'ln ' + (r.op === '+' ? 'add' : 'del'));
+    row.title = r.text.trim();
+    row.append(h('span', 'g', r.op === '+' ? '+' : '−'), h('code', null, r.text.slice(pad)));
+    return row;
+  }
+
+  // The card over the canvas, veiling it: the ask a story opens on, with what
+  // it came to and a button to play it, or what a step changed in files the
+  // map does not draw.
+  function drawOverlay(st, m) {
+    if (!st) {
+      st = storyOf();
+      m = st.all[st.at] || null;
+    }
+    const ov = $('ov');
+    const ask = m && m.kind === 'plan' ? m.ask : null;
+    const off = !ask && m && m.kind === 'step' && offMap(m.ev) ? m.ev : null;
+    const id = ask ? 'plan:' + ask.id : off ? 'off:' + off.seq : '';
+    // a card put aside stays aside while its moment is on show, however often the view is drawn again
+    if (id !== S.ovFor) {
+      S.ovFor = id;
+      S.ovAside = false;
+    }
+    const key = !id || S.ovAside ? '' : ask ? `${id}:${st.all.length}:${V.on}:${T.playing}` : id;
+    $('viewport').classList.toggle('veil', !!key);
+    ov.hidden = !key;
+    if (ov.dataset.key === key) return;
+    ov.dataset.key = key;
+    if (!key) return ov.replaceChildren();
+    const close = h('button', 'ov-close', '×');
+    close.title = 'Close (Esc)';
+    close.setAttribute('aria-label', 'close');
+    close.addEventListener('click', () => closeOverlay());
+    if (ask) {
+      const eb = h('div', 'eyebrow', 'You asked');
+      eb.append(h('span', null, '· ' + when(ask.at)));
+      const steps = st.all.filter(x => x.kind === 'step');
+      const card = [close, eb, h('blockquote', null, ask.prompt), h('p', 'meta', [plural(steps.length, 'step'), tally(steps)].filter(Boolean).join(' · '))];
+      // while it plays, the card only says what was asked
+      if (!T.playing) {
+        const go = h('button', 'play-big');
+        const icon = sv('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' });
+        icon.append(sv('path', { d: 'M7 4.5v15l12.5-7.5z' }));
+        go.append(icon, 'Play the story');
+        go.addEventListener('click', () => play());
+        const hint = h('p', 'say-hint');
+        hint.append(...(V.on ? ['Read aloud as it plays. Press ', h('kbd', null, 'M'), ' to mute.'] : ['The subtitles tell it. Press ', h('kbd', null, 'M'), ' for the voice.']));
+        const cta = h('div', 'cta');
+        cta.append(go, hint);
+        card.push(cta);
+      }
+      ov.replaceChildren(...card);
+    } else {
+      const rows = off.files.flatMap(f => diffRuns(f.diff).flat()).filter(r => r.text.trim());
+      const pad = Math.min(...rows.map(r => r.text.match(/^\s*/)[0].length));
+      const diff = h('div', 'diff');
+      diff.append(...rows.slice(0, 12).map(r => lineRow(r, pad)));
+      if (rows.length > 12) diff.append(h('div', 'ln more', plural(rows.length - 12, 'more line')));
+      // the whole diff opens in the panel, the card put aside for it
+      const more = h('button', 'ov-more', 'The whole diff');
+      more.addEventListener('click', () => {
+        closeOverlay();
+        panelEvent(off);
+      });
+      ov.replaceChildren(close, h('div', 'eyebrow', 'Outside the map'), h('div', 'file', off.files.map(f => f.path).join(', ')), h('p', 'why', 'The map draws code, not stylesheets or docs, so the change shows here.'), ...(rows.length ? [diff] : []), more);
+    }
+  }
+
+  // the card put aside and the canvas whole again, until another moment brings one
+  function closeOverlay() {
+    if ($('ov').hidden) return;
+    S.ovAside = true;
+    drawOverlay();
+  }
+
+  // ------------------------------------------------------------- the rail
+
+  // open unless closed by hand - and until it is, only where the window is wide enough to give it a side
+  const railOpen = () => S.rail ?? window.innerWidth >= 1000;
+
+  function toggleRail(open) {
+    S.rail = open ?? !railOpen();
+    store.set('rail', S.rail);
+    // the player and the canvas give way to it, or take its room back
+    drawTimeline();
+  }
+
+  // The rail beside the canvas: the ask on show - what was asked, its
+  // chapters with the one on show open on its steps, how it ended - or every
+  // ask, to pick one. Drawn again only when what it shows has moved.
+  function drawRail(st) {
+    const open = railOpen();
+    const rail = $('rail');
+    document.body.classList.toggle('with-rail', open);
+    rail.hidden = !open;
+    $('tl-rail').setAttribute('aria-pressed', String(open));
+    if (!open) return;
+    st = st || storyOf();
+    const view = S.railView === 'asks' || !st.all.length ? 'asks' : 'story';
+    const key = [view, T.source, A.version, T.steps.length, st.at, st.all.length, S.railPrompt, collectionAt()].join('|');
+    if (rail.dataset.key === key) return;
+    const same = rail.dataset.view === view;
+    rail.dataset.key = key;
+    rail.dataset.view = view;
+    const keep = rail.scrollTop;
+    const body = $('rail-body');
+    body.replaceChildren();
+    if (view === 'asks') railAsks(body);
+    else railStory(body, st);
+    rail.scrollTop = same ? keep : 0;
+    // the moment on show kept in sight
+    rail.querySelector('.st.at')?.scrollIntoView({ block: 'nearest' });
+  }
+
+  // the story of the ask on show, as the mock's side tells it
+  function railStory(body, st) {
+    const ask = st.ask;
+    const g = T.at != null ? groupOf(T.steps[T.at]) : null;
+    const top = h('section');
+    const eb = h('div', 'eyebrow', ask ? 'You asked' : g && g.kind === 'hand' ? 'By hand' : 'Steps');
+    if (ask) eb.append(h('span', null, '· ' + when(ask.at)));
+    const every = h('button', 'go', 'All asks');
+    every.addEventListener('click', () => {
+      S.railView = 'asks';
+      drawRail();
+    });
+    eb.append(every);
+    const said = ask ? ask.prompt : g ? groupText(g) : 'Steps no transcript explains yet';
+    top.append(eb, h('p', 'prompt' + (S.railPrompt ? ' open' : ''), said));
+    if (said.length > 200) {
+      const more = h('button', 'more', S.railPrompt ? 'Show less' : 'Show all');
+      more.addEventListener('click', () => {
+        S.railPrompt = !S.railPrompt;
+        drawRail();
+      });
+      top.append(more);
+    }
+    const told = st.chapters.filter(c => c.key !== 'result');
+    const sec = h('section');
+    const eb2 = h('div', 'eyebrow', 'Chapters');
+    eb2.append(h('span', null, '· ' + told.length));
+    const ol = h('ol', 'chapters');
+    const now = st.at >= 0 ? st.all[st.at].chapter : -1;
+    st.chapters.forEach((c, k) => {
+      if (c.key === 'result') return;
+      const li = h('li', 'ch ' + (k < now ? 'done' : k === now ? 'now' : 'next'));
+      const head = h('button', 'ch-head');
+      const words = h('span');
+      words.append(h('span', 'ch-title', c.title));
+      const meta = tally(st.all.slice(c.start, c.end));
+      if (meta) words.append(h('span', 'ch-meta', meta));
+      const strip = h('span', 'ch-strip');
+      for (let j = c.start; j < c.end; j++) strip.append(h('i', 'd-' + dotKind(st.all[j])));
+      words.append(strip);
+      head.append(h('span', 'ch-state'), words);
+      head.title = 'Go to this chapter';
+      head.addEventListener('click', () => {
+        stopPlay();
+        showMoment(st.all[c.start]);
+      });
+      li.append(head);
+      // the chapter on show opens on its steps - the one on show picked again opens what it changed
+      if (k === now) {
+        const steps = h('ol', 'ch-steps');
+        for (let j = c.start; j < c.end; j++) {
+          const m = st.all[j];
+          const row = h('button', 'st' + (j === st.at ? ' at' : ''));
+          row.append(h('i', 'st-dot d-' + dotKind(m)), h('span', 'st-what', shortOf(m)), h('span', 'st-src', srcOf(m)));
+          row.title = j === st.at && m.kind === 'step' ? 'Show what it changed' : runsOf(m).map(r => r.text).join('');
+          row.addEventListener('click', () => {
+            stopPlay();
+            if (j === st.at && m.kind === 'step') panelEvent(m.ev);
+            else showMoment(m);
+          });
+          const item = h('li');
+          item.append(row);
+          steps.append(item);
+        }
+        li.append(steps);
+      }
+      ol.append(li);
+    });
+    sec.append(eb2, ol);
+    body.append(top, sec);
+    if (ask && ask.outcome) {
+      const result = h('section', 'result' + (T.moment === 'result' ? ' now' : ''));
+      result.append(h('div', 'eyebrow', 'Result'), h('p', null, sentences(ask.outcome, 4, 600)));
+      result.title = 'Go to how it ended';
+      result.addEventListener('click', () => {
+        stopPlay();
+        showMoment(st.all[st.all.length - 1]);
+      });
+      body.append(result);
+    }
+  }
+
+  // the replays a reviewer can open - each branch's, a teammate's once fetched - filled in where the rail keeps a place for them
+  function replaysSection(body) {
+    const box = h('section', 'replays');
+    body.append(box);
+    const fill = async fetch => {
+      let r;
+      try {
+        r = await getJSON('/vis/replays' + (fetch ? '?fetch=1' : ''));
+      } catch (e) {
+        box.replaceChildren(h('div', 'eyebrow', 'Replays'), h('p', 'hint', `Could not ${fetch ? 'fetch' : 'list'} replays: ${e.message}`));
+        return;
+      }
+      const rows = (r.replays || []).map(rp => {
+        const b = h('button', 'replay-row');
+        b.append(h('span', null, rp.branch + (rp.branch === r.branch ? ' (this branch)' : '')), h('small', null, new Date(rp.at).toLocaleString()));
+        b.title = rp.subject || 'Open this replay';
+        b.addEventListener('click', () => openReplay(rp.branch));
+        return b;
+      });
+      const more = h('button', 'replay-fetch', 'Fetch teammates’ replays');
+      more.addEventListener('click', () => {
+        more.disabled = true;
+        more.textContent = 'Fetching…';
+        fill(true);
+      });
+      box.replaceChildren(h('div', 'eyebrow', 'Replays'), rows.length ? list(rows) : h('p', 'hint', 'No replays yet - each branch pushed saves one'), more);
+    };
+    fill(false);
+  }
+
+  // a teammate's replay opened in place of the live timeline - its steps, its story and its narration
+  async function openReplay(branch) {
+    let r;
+    try {
+      r = await getJSON('/vis/events?replay=' + encodeURIComponent(branch));
+    } catch (e) {
+      showMessage('Could not open the replay', e.message);
+      return;
+    }
+    stopPlay();
+    T.source = branch;
+    T.follow = false;
+    T.queue = [];
+    T.steps = r.events || [];
+    T.full.clear();
+    T.at = T.steps.length ? 0 : null;
+    A.groups = [];
+    A.of = new Map();
+    A.beat = new Map();
+    $('replay-of-branch').textContent = branch;
+    $('replay-of').hidden = false;
+    hidePanel();
+    S.railView = 'story';
+    await loadAsks();
+    // a teammate's story opens on its first moment - its plan, where the agent gave one
+    const [first] = storyOf().all;
+    if (first) showMoment(first);
+    else drawTimeline();
+  }
+
+  // the live timeline again - the page starts over, as when the server does
+  function backToLive() {
+    if (vscode) vscode.postMessage({ type: 'reload' });
+    else location.reload();
+  }
+
+  // Every collection the timeline holds - each ask, each run of changes by
+  // hand - in order, under the session it was made in: pick one and the story
+  // is its alone, or play a whole session through. Then the replays a
+  // reviewer can open.
+  function railAsks(body) {
+    const all = collections();
+    const cur = collectionAt();
+    const sec = h('section');
+    const eb = h('div', 'eyebrow', T.source ? `Every ask in ${T.source}'s replay` : 'Every ask');
+    if (all.length) {
+      const back = h('button', 'go', 'This ask');
+      back.addEventListener('click', () => {
+        S.railView = 'story';
+        drawRail();
+      });
+      eb.append(back);
+    }
+    sec.append(eb);
+    if (!all.length) sec.append(h('p', 'hint', 'No steps yet - each ask an agent works on lands here, and every change made by hand'));
+    let session;
+    for (const c of all) {
+      const g = c.group;
+      if (g.ask && g.ask.session !== session) {
+        session = g.ask.session;
+        const s = session;
+        const head = h('div', 'ask-session');
+        head.append(h('span', null, `${g.ask.agent} session · ${new Date(g.ask.at).toLocaleString()}`));
+        const whole = h('button', null, '▶ Play session');
+        whole.title = 'Replay every step from this session’s first ask to its last';
+        whole.addEventListener('click', () => playSession(s));
+        head.append(whole);
+        sec.append(head);
+      }
+      const row = h('div', 'ask-row' + (c.key === cur ? ' at' : ''));
+      const go = h('button', 'ask-go');
+      go.append(groupIcon(g), h('span', 'ask-text', groupText(g)), h('span', 'ask-n', plural(c.steps.length, 'step')));
+      go.title = groupText(g);
+      go.addEventListener('click', () => goCollection(c));
+      const one = h('button', 'ask-play', '▶');
+      one.title = 'Play this ask’s story';
+      one.addEventListener('click', () => {
+        goCollection(c);
+        play();
+      });
+      row.append(go, one);
+      sec.append(row);
+    }
+    body.append(sec);
+    replaysSection(body);
   }
 
   // where steps sit on the timeline, by their numbers
   const indicesOf = seqs => seqs.map(seq => T.steps.findIndex(e => e.seq === seq)).filter(i => i >= 0);
 
-  // a collection, from its first step - the timeline then holds it alone
+  // a collection, from the start of its story - its plan, where the agent gave one - and the timeline then holds it alone
   function goCollection(c) {
     const [i] = c ? indicesOf(c.steps) : [];
     if (i == null) return;
     stopPlay();
-    replay(i, 'after');
+    S.railView = 'story';
+    T.at = i;
+    const [first] = storyOf().all;
+    if (first) showMoment(first);
   }
 
   // the collection before or after the one on show
@@ -3732,15 +4518,685 @@
     play(indicesOf(A.groups.slice(at[0], at[at.length - 1] + 1).flatMap(g => g.steps)));
   }
 
-  // how far the timeline's top sits from the window's foot, for what keeps clear of it
+  // how far the player's top sits from the window's foot, for the canvas and what sits over its foot to keep clear of
   function clearOfTimeline() {
     const bar = $('timeline');
-    const set = () => {
-      const top = bar.hidden ? 0 : Math.ceil(window.innerHeight - bar.getBoundingClientRect().top);
-      document.body.style.setProperty('--tl-top', top + 'px');
-    };
+    const set = () => document.body.style.setProperty('--tl-top', (bar.hidden ? 0 : Math.ceil(window.innerHeight - bar.getBoundingClientRect().top)) + 'px');
     new ResizeObserver(set).observe(bar);
     window.addEventListener('resize', set);
+  }
+
+  // ------------------------------------------------------------- the voice
+  // the story read aloud - Kokoro runs in this page on the graphics card from the copy ccc keeps for every window, and the browser's own voice reads where it cannot
+
+  const MODEL = 'onnx-community/Kokoro-82M-v1.0-ONNX-timestamped';
+  const SPEAKER = 'af_heart';
+  const RATE = 24000;
+  const synth = 'speechSynthesis' in window ? window.speechSynthesis : null;
+
+  const V = {
+    // read aloud at all, and each step told in a subtitle
+    on: store.get('say', true),
+    cc: store.get('cc', true),
+    // the reader chosen - kokoro, browser or off - none until the card is answered
+    pref: store.get('voice', null),
+    // the server's copy of the voice, and the model's state in this page - idle, loading, ready or failed
+    server: null,
+    state: 'idle',
+    stage: '',
+    error: '',
+    gpu: null,
+    worker: null,
+    calls: new Map(),
+    seq: 0,
+    // each line read and timed, by its fingerprint
+    lines: new Map(),
+    player: null,
+    // the line being read, and the words of the subtitle on show
+    current: null,
+    marks: [],
+    // a story waiting for the natural voice, and one that chose not to wait
+    wait: null,
+    impatient: false,
+    // what to do once the card is answered
+    then: null,
+    browserVoice: null,
+  };
+
+  // only a graphics card runs the voice fast enough to keep up with the story
+  function hasGpu() {
+    if (!V.gpu) {
+      V.gpu = (async () => {
+        try {
+          return !!(navigator.gpu && (await navigator.gpu.requestAdapter()));
+        } catch {
+          return false;
+        }
+      })();
+    }
+    return V.gpu;
+  }
+
+  // the model runs off the page's thread, a line at a time; every file it would fetch comes from ccc's copy through the page, the only side that reaches the server
+  const VOICE_WORKER = `
+  const real = self.fetch.bind(self);
+  const waiting = new Map();
+  let asked = 0;
+  const need = name => new Promise((resolve, reject) => {
+    const id = ++asked;
+    waiting.set(id, { resolve, reject });
+    self.postMessage({ type: 'need', id, name });
+  });
+  const blobUrl = (bytes, type) => URL.createObjectURL(new Blob([bytes], { type }));
+  self.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (/^(blob|data):/.test(url)) return real(input, init);
+    const bytes = await need(new URL(url).pathname.split('/').pop());
+    return new Response(bytes, { status: 200, headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(bytes.byteLength) } });
+  };
+  const none = { match: async () => undefined, put: async () => {}, delete: async () => false, keys: async () => [] };
+  Object.defineProperty(self, 'caches', { value: { open: async () => none, match: async () => undefined, has: async () => false, keys: async () => [], delete: async () => false }, configurable: true });
+  let tts = null, held = null, lib = null, queue = Promise.resolve();
+  async function load() {
+    const gpu = self.navigator.gpu && (await self.navigator.gpu.requestAdapter());
+    if (!gpu) throw new Error('no WebGPU here');
+    lib = await import(blobUrl(await need('kokoro.web.js'), 'text/javascript'));
+    lib.env.wasmPaths = {
+      mjs: blobUrl(await need('ort-wasm-simd-threaded.jsep.mjs'), 'text/javascript'),
+      wasm: blobUrl(await need('ort-wasm-simd-threaded.jsep.wasm'), 'application/wasm'),
+    };
+    tts = await lib.KokoroTTS.from_pretrained('${MODEL}', { dtype: 'fp32', device: 'webgpu' });
+    const run = tts.model;
+    tts.model = async inputs => {
+      const out = await run(inputs);
+      held = Object.entries(out).find(([k]) => k !== 'waveform')?.[1] || null;
+      return out;
+    };
+    await tts.generate('Ready.', { voice: '${SPEAKER}' });
+    return {};
+  }
+  function wav(samples) {
+    const n = samples.length, v = new DataView(new ArrayBuffer(44 + n * 2));
+    const tag = (o, t) => { for (let i = 0; i < 4; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+    tag(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); tag(8, 'WAVE'); tag(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, ${RATE}, true); v.setUint32(28, ${RATE} * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    tag(36, 'data'); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, samples[i])) * 0x7fff, true);
+    return v.buffer;
+  }
+  const cat = parts => { const out = new Uint8Array(parts.reduce((a, p) => a + p.length, 0)); let at = 0; for (const p of parts) { out.set(p, at); at += p.length; } return out; };
+  const be = (v, len) => { const b = new Uint8Array(len); for (let i = len - 1; i >= 0; i--) { b[i] = v % 256; v = Math.floor(v / 256); } return b; };
+  const ebml = (id, ...parts) => { const body = cat(parts); const size = be(body.length, 8); size[0] |= 1; return cat([new Uint8Array(id), size, body]); };
+  const uint = (id, v) => ebml(id, be(v, 8));
+  const flt = (id, v) => { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, v); return ebml(id, b); };
+  const str = (id, s) => ebml(id, new TextEncoder().encode(s));
+  function opusHead(rate) {
+    const b = new Uint8Array(19), d = new DataView(b.buffer);
+    b.set(new TextEncoder().encode('OpusHead')); b[8] = 1; b[9] = 1; d.setUint16(10, 312, true); d.setUint32(12, rate, true);
+    return b;
+  }
+  function webm(packets, head, ms) {
+    const header = ebml([0x1a, 0x45, 0xdf, 0xa3], uint([0x42, 0x86], 1), uint([0x42, 0xf7], 1), uint([0x42, 0xf2], 4), uint([0x42, 0xf3], 8), str([0x42, 0x82], 'webm'), uint([0x42, 0x87], 4), uint([0x42, 0x85], 2));
+    const info = ebml([0x15, 0x49, 0xa9, 0x66], uint([0x2a, 0xd7, 0xb1], 1000000), flt([0x44, 0x89], ms), str([0x4d, 0x80], 'ccc'), str([0x57, 0x41], 'ccc'));
+    const track = ebml([0xae], uint([0xd7], 1), uint([0x73, 0xc5], 1), uint([0x83], 2), str([0x86], 'A_OPUS'), ebml([0x63, 0xa2], head), ebml([0xe1], flt([0xb5], 48000), uint([0x9f], 1)));
+    const clusters = [];
+    for (let i = 0; i < packets.length; ) {
+      const start = Math.floor(packets[i].t / 1000);
+      const blocks = [];
+      while (i < packets.length && packets[i].t / 1000 - start < 30000) {
+        const rel = Math.round(packets[i].t / 1000 - start);
+        blocks.push(ebml([0xa3], new Uint8Array([0x81, (rel >> 8) & 255, rel & 255, 0x80]), packets[i].b));
+        i++;
+      }
+      clusters.push(ebml([0x1f, 0x43, 0xb6, 0x75], uint([0xe7], start), ...blocks));
+    }
+    return cat([header, ebml([0x18, 0x53, 0x80, 0x67], info, ebml([0x16, 0x54, 0xae, 0x6b], track), ...clusters)]).buffer;
+  }
+  async function opus(samples, rate) {
+    if (typeof AudioEncoder === 'undefined') return null;
+    let pcm = samples, at = rate;
+    let config = { codec: 'opus', sampleRate: at, numberOfChannels: 1, bitrate: 32000 };
+    if (!(await AudioEncoder.isConfigSupported(config)).supported) {
+      at = 48000;
+      pcm = new Float32Array(samples.length * 2);
+      for (let i = 0; i < samples.length; i++) { const a = samples[i], b = i + 1 < samples.length ? samples[i + 1] : a; pcm[2 * i] = a; pcm[2 * i + 1] = (a + b) / 2; }
+      config = { ...config, sampleRate: at };
+      if (!(await AudioEncoder.isConfigSupported(config)).supported) return null;
+    }
+    const packets = [];
+    let head = null, failed = null;
+    const enc = new AudioEncoder({
+      output: (chunk, meta) => {
+        const b = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(b);
+        packets.push({ t: chunk.timestamp, b });
+        const d = meta && meta.decoderConfig && meta.decoderConfig.description;
+        if (d && !head) head = d instanceof ArrayBuffer ? new Uint8Array(d.slice(0)) : new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+      },
+      error: e => { failed = e; },
+    });
+    enc.configure(config);
+    const step = at / 10;
+    for (let i = 0; i < pcm.length; i += step) {
+      const part = pcm.slice(i, Math.min(pcm.length, i + step));
+      enc.encode(new AudioData({ format: 'f32', sampleRate: at, numberOfFrames: part.length, numberOfChannels: 1, timestamp: Math.round((i / at) * 1e6), data: part }));
+    }
+    await enc.flush();
+    enc.close();
+    if (failed || !packets.length) return null;
+    return webm(packets, head || opusHead(rate), (pcm.length / at) * 1000);
+  }
+  async function say(text) {
+    const parts = [], chunks = [];
+    const gap = Math.round(0.22 * ${RATE});
+    let offset = 0;
+    const sentences = new lib.TextSplitterStream();
+    sentences.push(text);
+    sentences.close();
+    for await (const { phonemes, audio } of tts.stream(sentences, { voice: '${SPEAKER}' })) {
+      if (parts.length) { parts.push(new Float32Array(gap)); offset += gap; }
+      chunks.push({ phonemes, offset, length: audio.audio.length, durations: held ? Array.from(held.data, Number) : null });
+      parts.push(audio.audio);
+      offset += audio.audio.length;
+    }
+    const samples = new Float32Array(offset);
+    let at = 0;
+    for (const p of parts) { samples.set(p, at); at += p.length; }
+    const webmBytes = await opus(samples, ${RATE}).catch(() => null);
+    return { wav: wav(samples), webm: webmBytes, duration: offset / ${RATE}, chunks };
+  }
+  self.onmessage = ({ data }) => {
+    if (data.type === 'got') {
+      const w = waiting.get(data.id);
+      if (!w) return;
+      waiting.delete(data.id);
+      if (data.error) w.reject(new Error(data.error));
+      else w.resolve(data.bytes);
+      return;
+    }
+    queue = queue.then(async () => {
+      try {
+        const r = data.type === 'load' ? await load() : await say(data.text);
+        self.postMessage({ id: data.id, ok: true, ...r }, [r.wav, r.webm].filter(Boolean));
+      } catch (e) {
+        self.postMessage({ id: data.id, ok: false, error: String((e && e.message) || e) });
+      }
+    });
+  };`;
+
+  function voiceWorker() {
+    const w = new Worker(URL.createObjectURL(new Blob([VOICE_WORKER], { type: 'text/javascript' })), { type: 'module' });
+    w.onmessage = async ({ data }) => {
+      if (data.type === 'need') {
+        try {
+          const r = await getBytes('/vis/voice/file/' + encodeURIComponent(data.name));
+          if (r.status !== 200) throw new Error(`the voice's ${data.name} is not on this machine (${r.status})`);
+          w.postMessage({ type: 'got', id: data.id, bytes: r.bytes }, [r.bytes]);
+        } catch (e) {
+          w.postMessage({ type: 'got', id: data.id, error: String((e && e.message) || e) });
+        }
+        return;
+      }
+      const c = V.calls.get(data.id);
+      if (!c) return;
+      V.calls.delete(data.id);
+      if (data.ok) c.resolve(data);
+      else c.reject(new Error(data.error));
+    };
+    w.onerror = e => {
+      e.preventDefault();
+      voiceFailed(e.message || 'the voice could not start');
+    };
+    return w;
+  }
+
+  const voiceCall = (type, more) =>
+    new Promise((resolve, reject) => {
+      const id = ++V.seq;
+      V.calls.set(id, { resolve, reject });
+      V.worker.postMessage({ id, type, ...more });
+    });
+
+  // the natural voice made ready - ccc downloads it once if it has to, then it runs here
+  async function startVoice() {
+    if (V.state === 'loading' || V.state === 'ready') return;
+    if (!(await hasGpu())) return voiceFailed('no WebGPU here');
+    V.state = 'loading';
+    V.stage = '';
+    V.error = '';
+    voiceUi();
+    try {
+      let s = await getJSON('/vis/voice');
+      if (s.state === 'absent' || s.state === 'failed') {
+        const status = await postBytes('/vis/voice/download', '', 'application/json');
+        if (status >= 400) throw new Error(`the server would not download the voice (${status})`);
+        s = await getJSON('/vis/voice');
+      }
+      while (s.state === 'downloading') {
+        V.server = s;
+        voiceUi();
+        await sleep(700);
+        s = await getJSON('/vis/voice');
+      }
+      V.server = s;
+      if (s.state !== 'ready') throw new Error(s.error || 'the voice could not be downloaded');
+      V.stage = 'starting';
+      voiceUi();
+      V.worker = voiceWorker();
+      await voiceCall('load');
+      V.state = 'ready';
+      V.stage = '';
+      voiceUi();
+      if (V.wait) waitOn(V.wait.m);
+    } catch (e) {
+      voiceFailed(e);
+    }
+  }
+
+  // the natural voice cannot run here - the browser's reads instead, with subtitles, and a story waiting for it goes on
+  function voiceFailed(e) {
+    V.state = 'failed';
+    V.stage = '';
+    V.error = String((e && e.message) || e || 'unknown error');
+    for (const c of V.calls.values()) c.reject(new Error('the voice stopped'));
+    V.calls.clear();
+    if (V.worker) V.worker.terminate();
+    V.worker = null;
+    voiceUi();
+    if (V.wait) endWait(true);
+  }
+
+  async function fingerprint(text) {
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // when each word on screen is said, from how long the model held each phoneme - a word that reads as several takes them all
+  function align(chunks, c) {
+    const starts = [];
+    for (const ch of chunks) {
+      const d = ch.durations;
+      const exact = !!d && d.length === ch.phonemes.length + 2;
+      const cum = [0];
+      if (exact) for (const x of d) cum.push(cum[cum.length - 1] + x);
+      const total = exact ? cum[cum.length - 1] : ch.phonemes.length;
+      for (const m of ch.phonemes.matchAll(/\S+/g)) {
+        if (!/\p{L}/u.test(m[0])) continue;
+        const at = exact ? cum[m.index + 1] : m.index;
+        starts.push((ch.offset + (at / total) * ch.length) / RATE);
+      }
+    }
+    const words = [];
+    let k = 0;
+    for (const mk of c.marks) {
+      const n = (c.spoken.slice(mk.start, mk.end).match(/\S*[\p{L}\p{N}]\S*/gu) || []).length;
+      if (!n) continue;
+      if (k < starts.length) words.push([mk.start, starts[k]]);
+      k += n;
+    }
+    return words;
+  }
+
+  // a line ccc kept from an earlier reading - this machine's, or one a teammate pushed with a branch's replay
+  async function keptLine(fp) {
+    try {
+      const meta = await getBytes(`/vis/voice/line/${fp}.json`);
+      if (meta.status !== 200) return null;
+      const audio = await getBytes(`/vis/voice/line/${fp}.webm`);
+      if (audio.status !== 200) return null;
+      const m = JSON.parse(new TextDecoder().decode(meta.bytes));
+      return { url: URL.createObjectURL(new Blob([audio.bytes], { type: 'audio/webm' })), duration: m.duration, words: m.words || [] };
+    } catch {
+      return null;
+    }
+  }
+
+  // a moment's line read and timed - kept from before, else made by the model here and kept for every later replay of it
+  function lineFor(m) {
+    const c = compose(runsOf(m));
+    const model = (V.server && V.server.model) || MODEL;
+    const speaker = (V.server && V.server.speaker) || SPEAKER;
+    return fingerprint(`${model}|${speaker}|${c.spoken}`).then(fp => {
+      if (!V.lines.has(fp)) {
+        // what a line reads - a step, or its ask's plan or outcome - noted with its timings so the branch's replay carries the line
+        const ev = m.ev;
+        const about =
+          m.kind === 'step'
+            ? { step: { seq: ev.seq, at: ev.at, changeset: ev.changeset || null, call: ev.call || null, part: ev.part || null } }
+            : { step: null, ask: { id: m.ask.id, moment: m.kind === 'plan' ? 'plan' : 'outcome' } };
+        const meta = (duration, words) => JSON.stringify({ duration, words, text: c.spoken, ...about });
+        const made = (async () => {
+          const kept = await keptLine(fp);
+          if (kept) {
+            if (!T.source) postBytes(`/vis/voice/line/${fp}.json`, meta(kept.duration, kept.words), 'application/json').catch(() => {});
+            return kept;
+          }
+          if (V.state !== 'ready') throw new Error('the voice is not running');
+          const r = await voiceCall('say', { text: c.spoken });
+          const words = align(r.chunks, c);
+          if (r.webm) {
+            postBytes(`/vis/voice/line/${fp}.webm`, r.webm.slice(0), 'audio/webm')
+              .then(() => postBytes(`/vis/voice/line/${fp}.json`, meta(r.duration, words), 'application/json'))
+              .catch(() => {});
+          }
+          const audio = r.webm || r.wav;
+          return { url: URL.createObjectURL(new Blob([audio], { type: r.webm ? 'audio/webm' : 'audio/wav' })), duration: r.duration, words };
+        })();
+        made.catch(() => V.lines.delete(fp));
+        V.lines.set(fp, made);
+      }
+      return V.lines.get(fp);
+    });
+  }
+
+  // the line being read stopped, and the wait for it kept
+  function stopLine() {
+    const c = V.current;
+    V.current = null;
+    if (V.player) {
+      V.player.onended = null;
+      V.player.pause();
+    }
+    // a browser line is taken back from the engine whatever it says of it - a slow one that has not started yet would read it late, over a later step
+    if (synth && (synth.speaking || synth.pending || (c && c.utterance))) synth.cancel();
+    lightWord(-1);
+    if (c) c.resolve();
+  }
+
+  // read a line in Kokoro's voice, lighting each word as it is said
+  function playLine(line) {
+    return new Promise(resolve => {
+      stopLine();
+      const p = V.player || (V.player = new Audio());
+      V.current = { line, resolve };
+      p.onended = () => stopLine();
+      p.src = line.url;
+      p.currentTime = 0;
+      // read at the story's speed - each word still lit as it is said
+      p.playbackRate = clamp(T.speed, 0.5, 2);
+      const follow = () => {
+        if (!V.current || V.current.line !== line) return;
+        let w = -1;
+        for (const [at, when] of line.words) {
+          if (when > p.currentTime) break;
+          w = at;
+        }
+        lightWord(w);
+        requestAnimationFrame(follow);
+      };
+      p.play().then(() => requestAnimationFrame(follow), () => stopLine());
+    });
+  }
+
+  // read a line in the browser's own voice - the story goes on if there is none to read with
+  function speakBrowser(text) {
+    return new Promise(resolve => {
+      stopLine();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = clamp(T.speed, 0.5, 2);
+      if (V.browserVoice) {
+        u.voice = V.browserVoice;
+        u.lang = V.browserVoice.lang;
+      } else u.lang = 'en-GB';
+      V.current = { line: null, utterance: u, resolve };
+      const mine = () => V.current && V.current.utterance === u;
+      let heard = false;
+      u.onstart = () => {
+        heard = true;
+        // a line the story has moved past, started late, is stopped before it is heard over the one on show
+        if (!mine()) synth.cancel();
+      };
+      u.onboundary = e => {
+        if (mine() && (!e.name || e.name === 'word')) lightWord(e.charIndex);
+      };
+      u.onend = u.onerror = () => mine() && stopLine();
+      // an engine that has not started by now is given up on, its line taken back with it
+      setTimeout(() => !heard && mine() && stopLine(), 4000);
+      setTimeout(() => mine() && synth.speak(u), 40);
+    });
+  }
+
+  function pickBrowserVoice() {
+    const english = synth.getVoices().filter(v => /^en([-_]|$)/i.test(v.lang));
+    const rank = v =>
+      (/natural|neural|premium|enhanced/i.test(v.name) ? 8 : 0) +
+      (/google|microsoft|samantha|daniel|serena|karen|moira|arthur/i.test(v.name) ? 4 : 0) +
+      (v.localService ? 2 : 0);
+    V.browserVoice = english.sort((a, b) => rank(b) - rank(a))[0] || null;
+  }
+
+  // one moment read aloud - its kept or made line in Kokoro's voice, else the browser's; false when nothing read it, so the story paces it instead
+  async function narrate(m) {
+    if (!V.on || !m || V.pref === 'off') return false;
+    if (V.pref !== 'browser') {
+      const line = await lineFor(m).catch(() => null);
+      if (!T.playing || !sameMoment(momentNow(), m)) return true;
+      if (line) {
+        await playLine(line);
+        return true;
+      }
+    }
+    if (synth && (V.pref === 'browser' || V.impatient || V.state === 'failed')) {
+      await speakBrowser(compose(runsOf(m)).spoken);
+      return true;
+    }
+    return false;
+  }
+
+  // before a story plays - say once what narration needs, and hold for the natural voice when it was chosen, as a video buffers
+  async function voiceReady(queue, again) {
+    if (!V.on || !queue.length) return true;
+    if (!V.pref) {
+      // a replay that carries its lines just plays - nothing to download, nothing to ask; one saved before plans were read still carries its steps'
+      if (await lineFor(queue.find(m => m.kind === 'step') || queue[0]).then(() => true, () => false)) return true;
+      V.then = again;
+      askVoice();
+      return false;
+    }
+    if (V.pref !== 'kokoro' || V.impatient || V.state === 'failed' || V.state === 'ready') return true;
+    return waitForVoice(queue[0]);
+  }
+
+  function waitForVoice(m) {
+    return new Promise(resolve => {
+      V.wait = { m, resolve };
+      voiceUi();
+      showSubtitle();
+      // a line kept from before needs no model - the story starts now
+      lineFor(m).then(() => V.wait && V.wait.resolve === resolve && endWait(true), () => {});
+      startVoice();
+    });
+  }
+
+  // the voice is up - the story starts once it has made the line it opens on
+  function waitOn(m) {
+    voiceUi();
+    lineFor(m).then(() => V.wait && endWait(true), e => voiceFailed(e));
+  }
+
+  // the wait over - `go` false when it was called off
+  function endWait(go) {
+    const w = V.wait;
+    V.wait = null;
+    voiceUi();
+    showSubtitle();
+    if (w) w.resolve(go);
+  }
+
+  // the card that says, once, what narration needs - `then` what to do when it is answered
+  async function askVoice() {
+    $('voice-card').hidden = false;
+    try {
+      V.server = await getJSON('/vis/voice');
+    } catch {
+      // the card says what it can without it
+    }
+    const gpu = await hasGpu();
+    const s = V.server || {};
+    $('voice-size').textContent = s.total ? `${Math.round(s.total / 1e6)} MB` : '350 MB';
+    if (s.dir) $('voice-dir').textContent = s.dir;
+    const ready = s.state === 'ready';
+    const note = !gpu
+      ? `This device cannot run the natural voice on a graphics card (no WebGPU), and on the processor it cannot keep up with the story, so ${synth ? "the browser's voice reads instead, with subtitles" : 'the subtitles tell it'}.`
+      : ready
+        ? 'The voice is already on this machine - nothing to download.'
+        : s.state === 'downloading'
+          ? 'Another ccc window is downloading it now.'
+          : '';
+    $('voice-note').textContent = note;
+    $('voice-note').hidden = !note;
+    $('voice-yes').hidden = !gpu;
+    $('voice-yes').textContent = ready ? 'Narrate with Kokoro' : 'Download and narrate';
+    $('voice-browser').className = gpu ? 'voice-quiet' : 'voice-primary';
+    (gpu ? $('voice-yes') : $('voice-browser')).focus();
+  }
+
+  function closeVoice() {
+    $('voice-card').hidden = true;
+  }
+
+  // the card answered - the reader kept for every visit, and whatever waited on it carried on
+  function chooseVoice(pref) {
+    V.pref = pref;
+    store.set('voice', pref);
+    V.impatient = false;
+    V.on = pref !== 'off';
+    store.set('say', V.on);
+    if (pref === 'off') stopLine();
+    if (pref === 'kokoro') startVoice();
+    closeVoice();
+    voiceUi();
+    const then = V.then;
+    V.then = null;
+    if (then) then();
+  }
+
+  // where the voice stands, said on the chip, the wait and the switches
+  function voiceUi() {
+    voiceChip();
+    const box = $('voice-wait');
+    box.hidden = !V.wait;
+    $('tl-say').setAttribute('aria-pressed', String(V.on));
+    $('tl-cc').setAttribute('aria-pressed', String(V.cc));
+    if (!V.wait) return;
+    const s = V.server || {};
+    const pct = s.total ? Math.round(((s.done || 0) / s.total) * 100) : 0;
+    let what = 'Getting the voice ready';
+    let how = '';
+    let bar = 0;
+    if (V.state === 'ready') {
+      what = 'Reading the first line';
+      how = 'The voice is running on this device';
+      bar = 100;
+    } else if (s.state === 'downloading') {
+      what = 'Downloading the voice';
+      how = `${pct}% of ${Math.round(s.total / 1e6)} MB, once - every ccc window shares it`;
+      bar = pct;
+    } else if (V.stage === 'starting') {
+      what = 'Starting the voice';
+      how = 'On your graphics card';
+      bar = 100;
+    }
+    $('voice-wait-what').textContent = what;
+    $('voice-wait-how').textContent = how;
+    $('voice-wait-bar').style.width = bar + '%';
+    $('voice-wait-browser').hidden = !synth;
+  }
+
+  function voiceChip() {
+    const chip = $('tl-voice');
+    if (!chip) return;
+    const s = V.server || {};
+    const pct = s.total ? Math.round(((s.done || 0) / s.total) * 100) : 0;
+    chip.textContent = !V.on || V.pref === 'off'
+      ? 'Subtitles only'
+      : V.pref === 'browser' || (V.state === 'failed' && synth)
+        ? 'Browser voice'
+        : V.state === 'ready'
+          ? 'Kokoro voice'
+          : V.state === 'loading'
+            ? s.state === 'downloading'
+              ? `Voice ${pct}%`
+              : 'Voice starting'
+            : V.state === 'failed'
+              ? 'Voice unavailable'
+              : 'Voice';
+    chip.title = V.state === 'failed' ? `The natural voice cannot run here: ${V.error}` : 'Choose how the story is read';
+  }
+
+  // what the visualiser knows of the voice when it opens - one already on this machine was agreed to once, so every window uses it without asking
+  async function voiceInit() {
+    if (synth) {
+      pickBrowserVoice();
+      synth.onvoiceschanged = pickBrowserVoice;
+    }
+    try {
+      V.server = await getJSON('/vis/voice');
+    } catch {
+      V.server = null;
+    }
+    if (!V.pref && V.server && V.server.state === 'ready') V.pref = 'kokoro';
+    if (V.pref === 'kokoro' && V.on) startVoice();
+    voiceUi();
+  }
+
+  function bindVoice() {
+    $('voice-yes').addEventListener('click', () => chooseVoice('kokoro'));
+    $('voice-browser').addEventListener('click', () => chooseVoice('browser'));
+    $('voice-off').addEventListener('click', () => chooseVoice('off'));
+    $('voice-close').addEventListener('click', () => {
+      V.then = null;
+      closeVoice();
+    });
+    $('voice-wait-browser').addEventListener('click', () => {
+      // this once - the natural voice still loads, and reads from the step after it is ready
+      V.impatient = true;
+      endWait(true);
+    });
+    $('voice-wait-cancel').addEventListener('click', () => endWait(false));
+    $('tl-voice').addEventListener('click', () => {
+      V.then = null;
+      askVoice();
+    });
+    $('tl-say').addEventListener('click', () => toggleSay());
+    $('replay-back').addEventListener('click', () => backToLive());
+    $('tl-cc').addEventListener('click', () => toggleCc());
+    const subs = $('subs');
+    subs.addEventListener('mouseover', e => e.target.dataset && e.target.dataset.name && pingName(e.target.dataset.name, true));
+    subs.addEventListener('mouseout', e => e.target.dataset && e.target.dataset.name && pingName(e.target.dataset.name, false));
+  }
+
+  function toggleSay() {
+    V.on = !V.on;
+    store.set('say', V.on);
+    if (!V.on) stopLine();
+    else if (!V.pref) askVoice();
+    else if (V.pref === 'kokoro') startVoice();
+    voiceUi();
+  }
+
+  function toggleCc() {
+    V.cc = !V.cc;
+    store.set('cc', V.cc);
+    delete $('subs').dataset.key;
+    showSubtitle();
+    voiceUi();
+  }
+
+  // the moment under the pointer, told above the bar - its place and chapter, its line, where it comes from
+  function preview(x) {
+    const box = $('tl-preview');
+    const st = storyOf();
+    const k = momentAt(x, st);
+    const m = st.all[k];
+    if (!m) return (box.hidden = true);
+    const line = h('div');
+    line.append(compose(runsOf(m)).frag);
+    box.replaceChildren(h('div', 'pv-ch', `${k + 1} · ${st.chapters[m.chapter].title}`), line, h('div', 'pv-at', srcOf(m)));
+    box.hidden = false;
+    const bar = $('timeline').getBoundingClientRect();
+    box.style.left = clamp(x - bar.left - 160, 8, Math.max(8, bar.width - box.offsetWidth - 8)) + 'px';
   }
 
   function bindTimeline() {
@@ -3749,22 +5205,20 @@
     let scrubbing = false;
     let timer = 0;
     const pick = x => {
-      if (!T.steps.length) return;
-      // the tick under the pointer - ticks are packed left, so a share of the
-      // track's width is not a step
-      const ticks = [...$('tl-ticks').querySelectorAll('.tick')];
-      let k = ticks.findIndex(t => x < t.getBoundingClientRect().right);
-      if (k < 0) k = ticks.length - 1;
-      if (k < 0) return;
-      const i = +ticks[k].dataset.i;
-      if (i === T.at && T.replay) return;
+      const st = storyOf();
+      const k = momentAt(x, st);
+      const m = st.all[k];
+      if (!m || (k === st.at && (T.replay || T.moment))) return;
       stopPlay();
       T.follow = false;
-      T.at = i;
+      // the bar moves at once; a fast scrub draws only where it comes to rest
+      if (m.kind === 'step') {
+        T.moment = null;
+        T.at = m.i;
+      } else T.moment = m.kind;
       drawTimeline();
-      // a fast scrub draws only where it comes to rest
       clearTimeout(timer);
-      timer = setTimeout(() => replay(i, T.side), 110);
+      timer = setTimeout(() => showMoment(m, T.side), 110);
     };
     track.addEventListener('pointerdown', e => {
       scrubbing = true;
@@ -3773,7 +5227,9 @@
     });
     track.addEventListener('pointermove', e => {
       if (scrubbing) pick(e.clientX);
+      preview(e.clientX);
     });
+    track.addEventListener('pointerleave', () => ($('tl-preview').hidden = true));
     track.addEventListener('pointerup', () => (scrubbing = false));
     track.addEventListener('pointercancel', () => (scrubbing = false));
     track.addEventListener('keydown', e => {
@@ -3787,27 +5243,30 @@
     $('tl-next').addEventListener('click', () => stepBy(1));
     $('tl-play').addEventListener('click', () => play());
     $('tl-follow').addEventListener('click', () => toggleFollow());
-    $('tl-unfold').addEventListener('click', () => {
-      T.unfolded = !T.unfolded;
-      drawTimeline();
-    });
     $('tl-speed').addEventListener('click', e => {
-      // shift steps back up through the speeds
+      // shift steps back through the speeds
       const i = SPEEDS.indexOf(T.speed);
       setReplay(SPEEDS[(i + (e.shiftKey ? SPEEDS.length - 1 : 1)) % SPEEDS.length]);
     });
+    $('tl-more').addEventListener('click', () => showMenu($('tl-menu').hidden));
     $('tl-focus').addEventListener('click', () => setReplay(undefined, !T.focus));
-    $('tl-ask').addEventListener('click', () => (S.asksPanel ? hidePanel() : panelAsks()));
     $('tl-ws').addEventListener('click', () => {
       T.ws = !T.ws;
       store.set('ws', T.ws);
       applyMarks();
       drawTimeline();
     });
-    $('tl-step').addEventListener('click', () => {
-      const ev = T.steps[T.at];
-      if (ev) panelEvent(ev);
+    // a press anywhere else closes the settings
+    document.addEventListener('pointerdown', e => {
+      if (!$('tl-menu').hidden && !e.target.closest('.tl-menu-at')) showMenu(false);
     });
+    $('tl-rail').addEventListener('click', () => toggleRail());
+    $('tl-step').addEventListener('click', () => {
+      S.railView = 'story';
+      toggleRail(true);
+    });
+    // the bar's knob and the rail follow the window's width
+    window.addEventListener('resize', () => drawTimeline());
     for (const b of $('tl-side').children) {
       b.addEventListener('click', () => {
         if (T.at != null) replay(T.at, b.dataset.side);
@@ -3815,10 +5274,18 @@
     }
   }
 
+  // the settings above the gear, opened or closed
+  function showMenu(open) {
+    $('tl-menu').hidden = !open;
+    $('tl-more').setAttribute('aria-expanded', String(open));
+  }
+
   // One request a second carries both: new edit steps, and the map's
   // generation - which a save or a branch switch moves without any step.
   async function poll() {
     let wait = 1000;
+    // a teammate's replay on show holds the timeline - the live steps wait until it is closed
+    if (T.source) return setTimeout(poll, 2000);
     try {
       let r = await getJSON('/vis/events?since=' + T.seq);
       if (r.boot !== T.boot) {
@@ -3874,6 +5341,8 @@
   bindCanvas();
   bindChrome();
   bindTimeline();
+  bindVoice();
+  voiceInit();
   applyView();
   if (vscode && !location.hash) {
     const saved = store.get('hash', '');

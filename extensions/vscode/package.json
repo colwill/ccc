@@ -1,8 +1,8 @@
 {
-  "name": "ccc-codecache",
-  "displayName": "Collateral Code Check (ccc)",
-  "description": "Test-coverage, untested-changes and cross-service hints from the ccc static analyser, inline in your editor.",
-  "version": "1.6.0",
+  "name": "run-ccc",
+  "displayName": "Code Change Capture (ccc)",
+  "description": "ccc static analyser",
+  "version": "1.7.0",
   "publisher": "colwill",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -538,7 +538,7 @@
       "activitybar": [
         {
           "id": "ccc",
-          "title": "Collateral Code Check",
+          "title": "Code Change Capture",
           "icon": "media/run.svg"
         }
       ]
