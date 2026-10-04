@@ -1,6 +1,6 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { CccClient, isAborted, type RawReply } from './client';
+import { type BytesReply, CccClient, isAborted, type RawReply } from './client';
 import { type Cfg, needsRebuild, needsServerRestart } from './config';
 import { FileStructureCache, refineFileHints } from './enclosing';
 import { describe, type Log } from './log';
@@ -281,6 +281,13 @@ export class WorkspaceSession implements vscode.Disposable {
     if (!this.client) await this.ensureStarted();
     if (!this.client) throw new Error('the ccc analyser is not running');
     return this.client.raw(path);
+  }
+
+  // the visualiser's binary traffic - the narration voice's files, and the lines it read going back to be kept
+  async fetchBytes(method: 'GET' | 'POST', path: string, body?: Buffer, contentType?: string): Promise<BytesReply> {
+    if (!this.client) await this.ensureStarted();
+    if (!this.client) throw new Error('the ccc analyser is not running');
+    return this.client.bytes(method, path, body, contentType);
   }
 
   async restartServer(): Promise<void> {

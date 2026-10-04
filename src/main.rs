@@ -284,6 +284,11 @@ enum Command {
         #[command(subcommand)]
         action: ReplayCommand,
     },
+    // the narration voice the visualiser reads replays with - downloaded once, shared by every ccc on this machine
+    Voice {
+        #[command(subcommand)]
+        action: VoiceCommand,
+    },
     // install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
     Install {
         // Directory to install into, positionally: `ccc install ~/bin`. Every
@@ -327,6 +332,16 @@ enum ReplayCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum VoiceCommand {
+    // where the voice stands - downloaded or not, and where it is kept
+    Status,
+    // download it now, rather than when the visualiser first asks
+    Download,
+    // remove it, and every line it read, from this machine
+    Remove,
 }
 
 fn main() -> ExitCode {
@@ -733,8 +748,7 @@ fn run() -> Result<ExitCode> {
             ReplayCommand::Save { path, branch, remote, no_push, default_branch, quiet } => {
                 let opts = codecache::replay::SaveOptions { branch, remote, push: !no_push, default_branch };
                 let saved = codecache::replay::save(&canonical(&path), &opts)?;
-                let failed = matches!(saved.pushed, Some(Err(_)));
-                if !quiet || saved.skipped.is_none() || failed {
+                if !quiet || saved.news() {
                     println!("{}", saved.describe());
                 }
                 Ok(ExitCode::SUCCESS)
@@ -744,6 +758,35 @@ fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Command::Voice { action } => {
+            let mb = |b: u64| b as f64 / 1e6;
+            match action {
+                VoiceCommand::Status => {
+                    let s = codecache::voice::status();
+                    println!("voice: {} - {:.0} of {:.0} MB", s["state"].as_str().unwrap_or("?"), mb(s["done"].as_u64().unwrap_or(0)), mb(codecache::voice::total()));
+                    if let Some(dir) = s["dir"].as_str() {
+                        println!("kept in {dir}, shared by every ccc on this machine");
+                    }
+                    if let Some(e) = s["error"].as_str() {
+                        println!("the last download stopped: {e}");
+                    }
+                }
+                VoiceCommand::Download => {
+                    let mut last = 0u64;
+                    codecache::voice::download_now(|done, total| {
+                        let pct = done * 100 / total.max(1);
+                        if pct != last {
+                            last = pct;
+                            eprint!("\rdownloading the voice: {pct}% of {:.0} MB", mb(total));
+                        }
+                    })?;
+                    eprintln!();
+                    println!("voice: ready");
+                }
+                VoiceCommand::Remove => println!("voice: removed, {:.0} MB freed", mb(codecache::voice::remove()?)),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Install { path, dir, force } => run_install(path.or(dir), force),
     }
 }

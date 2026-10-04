@@ -10,7 +10,10 @@
 <header class="bar">
   <div class="brand"><i class="logo" role="img" aria-label="ccc"></i></div>
   <nav class="crumbs" id="crumbs" aria-label="level"></nav>
+  <!-- what the view is, quietly after where it is -->
+  <span class="bar-note" id="note" hidden></span>
   <div class="spacer"></div>
+  <span class="replay-of" id="replay-of" hidden>Replay of <b id="replay-of-branch"></b><button type="button" id="replay-back">Back to live</button></span>
   <div class="search">
     <svg viewBox="0 0 16 16" fill="none" stroke-width="2"><circle cx="7" cy="7" r="5"/><path d="M11 11l4 4"/></svg>
     <input id="search" type="search" placeholder="Find a function or file  ( / )" autocomplete="off" spellcheck="false">
@@ -45,6 +48,11 @@
   </div>
 </main>
 
+<!-- beside the canvas: the ask the story tells, its chapters and how it ended - or every ask, to pick one -->
+<aside class="rail" id="rail" aria-label="the ask and its chapters" hidden>
+  <div class="rail-in" id="rail-body"></div>
+</aside>
+
 <aside class="panel" id="panel" hidden>
   <header>
     <div><div class="what" id="panel-what"></div><h2 id="panel-title"></h2></div>
@@ -61,31 +69,75 @@
   <button id="layout-reset" title="Forget dragged positions in this view">Re-layout</button>
 </div>
 <div class="legend" id="legend"></div>
-<!-- what the view is, and under it what a proposed or replayed step on show is, centred at the top -->
-<div class="top-notes">
-  <div class="note-bar" id="note" hidden></div>
-  <div class="replay-badge" id="replay-badge" hidden></div>
-</div>
+<!-- a card over the canvas: the ask a story opens on, or a change in a file the map does not draw -->
+<div class="ov" id="ov" hidden></div>
 <div class="message" id="message" hidden></div>
+<!-- the step on show told in a line, read aloud while the story plays -->
+<div class="subs" id="subs" aria-live="polite" hidden></div>
+<!-- the story holding for the voice, the way a video buffers -->
+<div class="voice-wait" id="voice-wait" role="status" aria-live="polite" hidden>
+  <span class="spin" aria-hidden="true"></span>
+  <b id="voice-wait-what">Getting the voice ready</b>
+  <small id="voice-wait-how"></small>
+  <div class="voice-bar"><i id="voice-wait-bar"></i></div>
+  <div class="voice-acts">
+    <button type="button" id="voice-wait-browser">Play now with the browser's voice</button>
+    <button type="button" id="voice-wait-cancel">Cancel</button>
+  </div>
+</div>
+<!-- what narration needs, said once before anything downloads -->
+<div class="voice-card" id="voice-card" role="dialog" aria-labelledby="voice-card-title" hidden>
+  <button class="voice-close" id="voice-close" type="button" aria-label="close">×</button>
+  <div class="voice-eyebrow">Narration</div>
+  <h3 id="voice-card-title">Read the story aloud in a natural voice</h3>
+  <p>ccc can narrate each step with Kokoro, an open voice model that runs on this computer, so nothing is sent to a speech service. Where this device cannot run it, the browser's voice reads instead.</p>
+  <ul class="voice-facts">
+    <li><b>Downloads once</b><span><span id="voice-size">350 MB</span>, the first time you turn narration on.</span></li>
+    <li><b>One copy</b><span>Kept in <code id="voice-dir">ccc's cache</code> and used by every ccc window and VS Code instance. It runs on your graphics card.</span></li>
+    <li><b>Kept</b><span>Lines it has read are saved beside it, so a replay you have heard starts narrated at once.</span></li>
+    <li><b>Goes with your PR</b><span>Lines you voice are pushed with the branch's replay, so reviewers just press play. Turn it off for a branch, or everywhere with <code>git config ccc.replay.voice false</code>.</span></li>
+    <li><b>Removable</b><span><code>ccc voice remove</code> deletes it. Apache 2.0 licence.</span></li>
+  </ul>
+  <p class="voice-note" id="voice-note" hidden></p>
+  <div class="voice-cta">
+    <button type="button" class="voice-yes" id="voice-yes">Download and narrate</button>
+    <button type="button" class="voice-quiet" id="voice-browser">Use the browser's voice</button>
+    <button type="button" class="voice-quiet" id="voice-off">Subtitles only</button>
+  </div>
+</div>
 
-<section class="timeline" id="timeline" aria-label="edit timeline" hidden>
-  <button class="tl-unfold" id="tl-unfold" title="Show the step controls" aria-label="show the step controls" aria-expanded="false" hidden>»</button>
-  <div class="tl-controls" id="tl-controls">
-    <button id="tl-prev" title="Previous step (,)" aria-label="previous step">‹</button>
-    <button id="tl-play" title="Replay the steps from here" aria-label="replay">▶</button>
-    <button id="tl-next" title="Next step (.)" aria-label="next step">›</button>
+<!-- the story as a video: its chapters along a bar, the controls under it -->
+<section class="player" id="timeline" aria-label="the story's player" hidden>
+  <div class="scrub" id="tl-track" tabindex="0" role="slider" aria-label="position in the story" aria-valuemin="1">
+    <div class="segs" id="tl-ticks"></div>
+    <i class="knob" id="tl-knob" hidden></i>
   </div>
-  <div class="tl-track" id="tl-track" tabindex="0" role="slider" aria-label="scrub through edit steps"><div class="tl-ticks" id="tl-ticks"></div></div>
-  <button class="tl-ask" id="tl-ask" hidden>Asks</button>
-  <button class="tl-step" id="tl-step"></button>
-  <div class="tl-side" id="tl-side" role="group" aria-label="which side of the step" hidden>
-    <button data-side="before" title="The code as it was before this step">before</button>
-    <button data-side="after" title="The code as this step left it">after</button>
+  <div class="tl-preview" id="tl-preview" hidden></div>
+  <div class="ctrls">
+    <button class="ctl" id="tl-prev" title="Previous step (←)" aria-label="previous step"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2.2v14H6zM19 5v14L9.5 12z"/></svg></button>
+    <button class="ctl" id="tl-play" title="Play (space)" aria-label="play"><svg viewBox="0 0 24 24" aria-hidden="true"><path id="tl-play-icon" d="M7 4.5v15l12.5-7.5z"/></svg></button>
+    <button class="ctl" id="tl-next" title="Next step (→)" aria-label="next step"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.8 5H18v14h-2.2zM5 5v14l9.5-7z"/></svg></button>
+    <button class="ctl say" id="tl-say" title="Read the story aloud (m)" aria-label="read the story aloud" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 9h4l5-4.5v15l-5-4.5h-4z"/><path class="wave" d="M15.5 9a4.2 4.2 0 0 1 0 6M18 6.5a7.8 7.8 0 0 1 0 11"/><path class="mute" d="M16 9.5l5 5M21 9.5l-5 5"/></svg></button>
+    <span class="time" id="tl-time"></span>
+    <button class="ch-now" id="tl-step" title="Show the chapters"></button>
+    <span class="spacer"></span>
+    <button class="live" id="tl-follow" role="switch" aria-checked="true" title="Follow live changes - each edit shown as it lands (L)"><i aria-hidden="true"></i><span id="tl-live">Live</span><span class="behind" id="tl-behind"></span></button>
+    <div class="tl-side" id="tl-side" role="group" aria-label="which side of the step" hidden>
+      <button data-side="before" title="The code as it was before this step">before</button>
+      <button data-side="after" title="The code as this step left it">after</button>
+    </div>
+    <button class="voice-chip" id="tl-voice" title="Choose how the story is read">Voice</button>
+    <button class="ctl cc" id="tl-cc" title="Subtitles (c)" aria-label="subtitles" aria-pressed="true">CC</button>
+    <button class="ctl speed" id="tl-speed" title="Playback speed (shift-click goes back)" aria-label="playback speed">1×</button>
+    <div class="tl-menu-at">
+      <button class="ctl" id="tl-more" title="Settings" aria-label="settings" aria-haspopup="menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.61.06-.94s-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84a.47.47 0 0 0-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87a.47.47 0 0 0 .12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.47.47 0 0 0-.12-.61zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></svg></button>
+      <div class="tl-menu" id="tl-menu" role="menu" hidden>
+        <button role="menuitemcheckbox" id="tl-focus" aria-checked="true"><span>Granular changes</span><small>Each step seen on its own - what it did not touch fades back</small></button>
+        <button role="menuitemcheckbox" id="tl-ws" aria-checked="false"><span>Whitespace changes</span><small>Steps that only move whitespace or wrap lines</small></button>
+      </div>
+    </div>
+    <button class="ctl" id="tl-rail" title="Chapters" aria-label="chapters" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h2v2H4zm4 0h12v2H8zM4 11h2v2H4zm4 0h12v2H8zM4 16h2v2H4zm4 0h12v2H8z"/></svg></button>
   </div>
-  <button class="tl-speed" id="tl-speed" title="Replay speed - Live keeps the time between steps as it was, slower stretches it (shift-click goes back up)" aria-label="replay speed">Live</button>
-  <button class="tl-focus" id="tl-focus" title="Granular Changes - each step seen on its own: what it did not touch fades back, and a big scene keeps only what is wired to it" aria-label="granular changes" aria-pressed="true">◎</button>
-  <button class="tl-ws" id="tl-ws" title="Show whitespace changes - steps that only move whitespace or wrap lines" aria-label="show whitespace changes" aria-pressed="false">¶</button>
-  <button class="tl-follow" id="tl-follow" role="switch" aria-checked="true" title="Follow live changes - each edit shown as it lands (L)"><span class="switch" aria-hidden="true"></span><span>Follow<span class="tl-follow-more"> live changes</span></span><span id="tl-behind"></span></button>
 </section>
 
 <script>/*__CCC_VIS_JS__*/</script>

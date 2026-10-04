@@ -13,3 +13,6 @@ bench/
 
 # timeline steps the ccc servers on this project share
 /.ccc/timeline.jsonl
+
+# the narrated lines each step was read with
+/.ccc/voice-lines.jsonl

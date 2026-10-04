@@ -1,9 +1,9 @@
 [package]
 name = "codecache"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 rust-version = "1.77"
-description = "Collateral Code Check (ccc) generates an agent friendly local source map"
+description = "Code Change Capture (ccc) generates an agent friendly local source map"
 license = "MIT"
 
 # packages the VS Code extension into dist/ alongside the binary
@@ -43,6 +43,8 @@ tree-sitter-zig = "1.1"
 tree-sitter-odin = "1.3"
 tree-sitter-proto = "0.6"
 crossbeam-epoch = "0.9.20"
+# checks each file of the narration voice against the hash pinned for it
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 2

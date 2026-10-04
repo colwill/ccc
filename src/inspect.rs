@@ -43,6 +43,8 @@ pub struct Read {
     // 1-based and inclusive, ending at `usize::MAX` for the rest of the file -
     // none for the whole of it
     pub lines: Option<(usize, usize)>,
+    // why it was read - the description the agent gave the call, else what it last said
+    pub why: Option<String>,
 }
 
 impl Read {
@@ -85,6 +87,8 @@ pub struct Reads {
     found: Option<std::time::Instant>,
     // each, and the bytes of it read so far
     read: BTreeMap<PathBuf, u64>,
+    // what each session's agent last said - the reason for the reads that follow it
+    said: BTreeMap<String, String>,
 }
 
 impl Reads {
@@ -116,7 +120,13 @@ impl Reads {
         for (f, from) in self.read.iter_mut() {
             let (records, end) = tail(f, *from);
             *from = end;
-            out.extend(records.iter().flat_map(|r| reads_of(r, root)));
+            for r in &records {
+                let session = r["sessionId"].as_str().unwrap_or_default();
+                if let Some(text) = narration(r) {
+                    self.said.insert(session.to_string(), text);
+                }
+                out.extend(reads_of(r, root, self.said.get(session).map(String::as_str)));
+            }
         }
         out.sort_by_key(|r| r.at_ms);
         out
@@ -147,18 +157,28 @@ fn tail(path: &Path, from: u64) -> (Vec<Value>, u64) {
         return (Vec::new(), from);
     }
     let end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    let call = b"\"tool_use\"";
+    let has = |l: &[u8], pat: &[u8]| l.windows(pat.len()).any(|w| w == pat);
     let records = buf[..end]
         .split(|&b| b == b'\n')
-        // a tool's answer can run to megabytes - only the calls are parsed
-        .filter(|l| l.windows(call.len()).any(|w| w == call))
+        // a tool's answer can run to megabytes - only the calls, and what the agent said, are parsed
+        .filter(|l| has(l, b"\"tool_use\"") || (has(l, b"\"type\":\"assistant\"") && has(l, b"\"type\":\"text\"")))
         .filter_map(|l| serde_json::from_slice(l).ok())
         .collect();
     (records, from + end as u64)
 }
 
-// the files inside the project one transcript record's tool calls read
-fn reads_of(rec: &Value, root: &Path) -> Vec<Read> {
+// what an agent said in one transcript record, if it said anything
+fn narration(rec: &Value) -> Option<String> {
+    if rec["type"] != "assistant" {
+        return None;
+    }
+    let text: Vec<&str> = rec["message"]["content"].as_array()?.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+    let said = crate::prompts::said(&text.join("\n"));
+    (!said.is_empty()).then_some(said)
+}
+
+// the files inside the project one transcript record's tool calls read - `said` what its agent last said
+fn reads_of(rec: &Value, root: &Path, said: Option<&str>) -> Vec<Read> {
     if rec["type"] != "assistant" {
         return Vec::new();
     }
@@ -174,6 +194,8 @@ fn reads_of(rec: &Value, root: &Path) -> Vec<Read> {
             continue;
         };
         let input = &b["input"];
+        // a shell call carries the agent's own description of it; any other takes what it last said
+        let why = input["description"].as_str().map(crate::prompts::said).filter(|d| !d.is_empty()).or_else(|| said.map(str::to_string));
         let named: Vec<(PathBuf, Option<(usize, usize)>)> = match tool {
             "Read" => input["file_path"].as_str().map(|p| (cwd.join(p), read_range(input))).into_iter().collect(),
             "NotebookRead" => input["notebook_path"].as_str().map(|p| (cwd.join(p), None)).into_iter().collect(),
@@ -184,7 +206,7 @@ fn reads_of(rec: &Value, root: &Path) -> Vec<Read> {
         };
         out.extend(named.into_iter().filter_map(|(p, lines)| {
             let path = inside(root, &p)?;
-            Some(Read { at_ms, session: session.to_string(), call: call.to_string(), tool: tool.to_string(), path, lines })
+            Some(Read { at_ms, session: session.to_string(), call: call.to_string(), tool: tool.to_string(), path, lines, why: why.clone() })
         }));
     }
     out
@@ -421,7 +443,7 @@ mod tests {
     fn a_read_is_seen_at_the_function_its_lines_lie_in() {
         let src = "fn a() {\n    1;\n}\n\nfn b() {\n    2;\n}\n";
         let caches = vec![crate::scan::read_one(Path::new("src/x.rs"), src).unwrap()];
-        let read = |lines| Read { at_ms: 0, session: "s".into(), call: "c".into(), tool: "Read".into(), path: "src/x.rs".into(), lines };
+        let read = |lines| Read { at_ms: 0, session: "s".into(), call: "c".into(), tool: "Read".into(), path: "src/x.rs".into(), lines, why: None };
         assert_eq!(read(Some((2, 2))).sites(&caches), [("src/x.rs".to_string(), 1, true)]);
         assert_eq!(
             read(Some((2, 6))).sites(&caches),
@@ -453,15 +475,21 @@ mod tests {
         reads.found_now(vec![log.clone()]);
         assert!(reads.tail(&root).is_empty(), "history");
 
+        // what the agent says before it reads is why it reads, unless the call describes itself
+        text += &json!({"type": "assistant", "sessionId": "s1", "message": {"content": [{"type": "text", "text": "Reading **the parser** to see\nwhere it splits:"}]}}).to_string();
+        text += "\n";
         text += &call("t1", "Read", json!({"file_path": root.join("src/a.rs"), "offset": 10, "limit": 5}));
-        text += &call("t2", "Bash", json!({"command": "sed -n '1,3p' src/b.rs && cat /etc/hosts"}));
+        text += &call("t2", "Bash", json!({"command": "sed -n '1,3p' src/b.rs && cat /etc/hosts", "description": "Read b's head"}));
         text += &call("t3", "mcp__ccc__file", json!({"path": "src/c.rs"}));
         text += &json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}}).to_string();
         text += "\n";
         let half = call("t4", "Read", json!({"file_path": root.join("src/d.rs")}));
         std::fs::write(&log, format!("{text}{}", &half[..20])).unwrap();
-        let got: Vec<(String, String, String)> = reads.tail(&root).into_iter().map(|r| (r.what(), r.call, r.tool)).map(|(w, c, t)| (c, t, w)).collect();
+        let found = reads.tail(&root);
+        let got: Vec<(String, String, String)> = found.iter().map(|r| (r.call.clone(), r.tool.clone(), r.what())).collect();
         assert_eq!(got, [("t1".into(), "Read".into(), "src/a.rs:10-14".into()), ("t2".into(), "Bash".into(), "src/b.rs:1-3".into())]);
+        let why: Vec<Option<&str>> = found.iter().map(|r| r.why.as_deref()).collect();
+        assert_eq!(why, [Some("Reading the parser to see where it splits:"), Some("Read b's head")]);
 
         std::fs::write(&log, format!("{text}{half}")).unwrap();
         let got: Vec<String> = reads.tail(&root).into_iter().map(|r| r.what()).collect();

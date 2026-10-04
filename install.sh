@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# This script is part of Collateral Code Check (ccc) and is distributed under the
+# This script is part of Code Change Capture (ccc) and is distributed under the
 # MIT License (see https://github.com/colwill/ccc/LICENSE).
 #
-# Collateral Code Check (ccc) installer
+# Code Change Capture (ccc) installer
 # Auto-detects OS and architecture, downloads the matching release asset from
 # https://github.com/colwill/ccc, then lets the binary install itself onto
 # your PATH with `ccc install` (defaults to ~/.local/bin; no sudo).

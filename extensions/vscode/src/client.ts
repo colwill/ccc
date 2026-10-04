@@ -30,6 +30,11 @@ export interface RawReply {
   body: string;
 }
 
+export interface BytesReply {
+  status: number;
+  body: Buffer;
+}
+
 const TIMEOUT_FAST_MS = 5000;
 // a cold rescan of a large repo is slow and waiting beats failing
 const TIMEOUT_SLOW_MS = 60000;
@@ -92,6 +97,11 @@ export class CccClient {
     return this.send('GET', path, TIMEOUT_SLOW_MS, signal);
   }
 
+  // bytes as they are - the narration voice's files and the lines it read - either way
+  async bytes(method: 'GET' | 'POST', path: string, body?: Buffer, contentType?: string): Promise<BytesReply> {
+    return this.exchange(method, path, TIMEOUT_SLOW_MS, undefined, body, contentType);
+  }
+
   private getJson<T>(path: string, timeoutMs: number, signal?: AbortSignal): Promise<T> {
     return this.request<T>('GET', path, timeoutMs, signal);
   }
@@ -106,8 +116,20 @@ export class CccClient {
     }
   }
 
-  private send(method: string, path: string, timeoutMs: number, signal?: AbortSignal): Promise<RawReply> {
-    return new Promise<RawReply>((resolve, reject) => {
+  private async send(method: string, path: string, timeoutMs: number, signal?: AbortSignal): Promise<RawReply> {
+    const { status, body } = await this.exchange(method, path, timeoutMs, signal);
+    return { status, body: body.toString('utf8') };
+  }
+
+  private exchange(
+    method: string,
+    path: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    payload?: Buffer,
+    contentType?: string,
+  ): Promise<BytesReply> {
+    return new Promise<BytesReply>((resolve, reject) => {
       if (signal?.aborted) {
         reject(new AbortedError());
         return;
@@ -121,14 +143,18 @@ export class CccClient {
           method,
           agent: this.agent,
           // no Origin: the analyser rejects cross-origin and a Node request sending none is same-origin
-          headers: { Accept: 'application/json', 'User-Agent': this.userAgent },
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': this.userAgent,
+            ...(payload ? { 'Content-Type': contentType ?? 'application/octet-stream', 'Content-Length': String(payload.length) } : {}),
+          },
         },
         (res) => {
           const chunks: Buffer[] = [];
           res.on('data', (c: Buffer) => chunks.push(c));
           res.on('end', () => {
             cleanup();
-            const body = Buffer.concat(chunks).toString('utf8');
+            const body = Buffer.concat(chunks);
             const status = res.statusCode ?? 0;
             this.log.trace(`${method} ${path} -> ${status} ${body.length}b in ${Date.now() - started}ms`);
             resolve({ status, body });
@@ -152,7 +178,7 @@ export class CccClient {
         if (signal?.aborted) reject(new AbortedError());
         else reject(err);
       });
-      req.end();
+      req.end(payload);
     });
   }
 

@@ -1,4 +1,4 @@
-# Collateral Code Check (ccc) for VS Code
+# Code Change Capture (ccc) for VS Code
 
 Inline hints from the [`ccc`](../../README.md) static analyser, on the code they apply to.
 Open a file with work in progress and each changed function tells you whether tests cover it,
