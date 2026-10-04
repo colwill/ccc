@@ -39,6 +39,11 @@ fn git_raw(root: &Path, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+// a text kept for a replay, by the object id `texts_of` gave it
+pub(crate) fn text_of(root: &Path, id: &str) -> Option<String> {
+    git_raw(root, &["cat-file", "blob", id])
+}
+
 // git fed `input`, with `env` set - an error carries what git said
 fn git_in(root: &Path, args: &[&str], input: &[u8], env: &[(&str, &str)]) -> Result<String> {
     let mut child = Command::new("git")
@@ -105,20 +110,27 @@ pub(crate) fn by_changeset(turns: &[Turn]) -> BTreeMap<&str, Vec<&Turn>> {
 // The ask a step answers: the one whose calls named its changeset - the
 // latest made before it, as a changeset can be staged under one ask and
 // applied under the next - or, for a look, which names none, the ask made
-// last before it. A change made by hand answers none.
+// last before it, in its own session where it names one. A change made by
+// hand answers none.
 pub(crate) fn ask_of<'t>(
     human: bool,
     changeset: Option<&str>,
+    session: Option<&str>,
     at_ms: u64,
     turns: &'t [Turn],
     named: &BTreeMap<&str, Vec<&'t Turn>>,
 ) -> Option<&'t Turn> {
-    // a transcript's clock and the server's can sit a moment apart
-    let made_before = |t: &&Turn| t.epoch * 1000 <= at_ms as i64 + 5000;
+    // a transcript's clock and the server's can sit a moment apart - a look
+    // read from the transcript, which names its session, keeps the transcript's own
+    let lead = if session.is_some() { 0 } else { 5000 };
+    let made_before = |t: &&Turn| t.epoch * 1000 <= at_ms as i64 + lead;
     match (human, changeset) {
         (true, _) => None,
         (_, Some(c)) => named.get(c).and_then(|ts| ts.iter().rev().find(|t| made_before(t)).or(ts.first()).copied()),
-        (_, None) => turns.iter().filter(made_before).max_by_key(|t| t.epoch),
+        (_, None) => {
+            let latest = |s: Option<&str>| turns.iter().filter(made_before).filter(|t| s.is_none_or(|s| t.session == s)).max_by_key(|t| t.epoch);
+            session.and_then(|s| latest(Some(s))).or_else(|| latest(None))
+        }
     }
 }
 
@@ -294,7 +306,7 @@ pub fn save(root: &Path, opts: &SaveOptions) -> Result<Saved> {
         // a step no ask accounts for goes with the session it falls in
         let mut session: Option<String> = None;
         for mut v in steps {
-            let ask = ask_of(v["by"] == "human", v["changeset"].as_str(), v["at"].as_u64().unwrap_or(0), &turns, &named);
+            let ask = ask_of(v["by"] == "human", v["changeset"].as_str(), v["session"].as_str(), v["at"].as_u64().unwrap_or(0), &turns, &named);
             if let Some(t) = ask {
                 session = Some(t.session.clone());
             }
@@ -476,6 +488,33 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // A look read from a transcript keeps the transcript's clock and serves
+    // the ask its own session made last before it - not one made a moment
+    // after, nor another session's.
+    #[test]
+    fn a_look_from_a_transcript_serves_its_own_sessions_ask() {
+        let turn = |id: &str, session: &str, epoch| Turn {
+            id: id.into(),
+            agent: "claude".into(),
+            session: session.into(),
+            model: None,
+            ts: String::new(),
+            branch: None,
+            prompt: String::new(),
+            edits: Vec::new(),
+            changesets: Vec::new(),
+            epoch,
+        };
+        let turns = [turn("a", "s1", 100), turn("b", "s1", 102), turn("c", "s2", 150)];
+        let named = by_changeset(&turns);
+        let ask = |session, at_ms| ask_of(false, None, session, at_ms, &turns, &named).map(|t| t.id.as_str());
+        // the server's own look allows for the two clocks
+        assert_eq!(ask(None, 101_000), Some("b"));
+        assert_eq!(ask(Some("s1"), 101_000), Some("a"));
+        assert_eq!(ask(Some("s1"), 160_000), Some("b"));
+        assert_eq!(ask(None, 160_000), Some("c"));
+    }
+
     // a repository with a branch off `main`, and a bare remote both were pushed to
     struct Repo {
         dir: PathBuf,
@@ -555,7 +594,7 @@ mod tests {
         assert!(sh(&r.work, &["config", "--get-all", "remote.origin.fetch"]).contains(FETCH_SPEC));
 
         assert_eq!(save(&r.work, &push).unwrap().steps, 0, "nothing new");
-        feed(&r.work, &[step(4, "feature", "read", json!([]))]);
+        feed(&r.work, &[step(4, "feature", "inspect", json!([]))]);
         assert_eq!(save(&r.work, &push).unwrap().steps, 1);
         assert_eq!(lines(&r.work, "refs/ccc/replay/feature:sessions/unattributed.jsonl"), 4);
         assert_eq!(sh(&r.work, &["rev-list", "--count", "refs/ccc/replay/feature"]), "2");
