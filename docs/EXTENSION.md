@@ -86,6 +86,18 @@ graph alone and appear regardless.
 
 ## Worth knowing
 
+- **Session recording is asked, never assumed.** The first time the analyser starts for a folder
+  that is a git repository, a message asks whether its agent sessions may be recorded as
+  [replays](../README.md#replays-and-secrets). Put it aside and it asks again next time; answer and
+  it is kept in `git config ccc.replay`, shared with `ccc run`. `ccc: Session Recording…` asks again.
+  The message says who can read the remote - a public one gets no replay unless `.ccc/map.json`
+  allows it. Where `.ccc/map.json` encrypts replays to a team on Runccc Teams and nobody on this
+  machine has signed in, the answer is **Sign in and record**: the approval page opens in your
+  browser, its code shown in VS Code to check it against, and replays are saved from the next push.
+- **A line that looks like a secret is marked.** Anything the branch adds that looks like a
+  credential - committed, uncommitted or untracked, in any file - gets a warning in the Problems
+  view, and a message the first time it appears. Mark a line `ccc:allow-secret` if it is meant to
+  be there.
 - Cross-service hints need a `services` block in [`.ccc/map.json`](#dependencymap); cross-repository
   hints need [`externals` and `ccc:` comments](#externals). With no map, ccc groups by directory and
   the hints still mean something; where even that degenerates to one unit per file, it stays quiet

@@ -56,6 +56,11 @@ export class WorkspaceSession implements vscode.Disposable {
     return this.lastVulns;
   }
 
+  // the last analysis read - its change set carries what the branch adds that looks like a secret
+  get insights(): InsightsPayload | undefined {
+    return this.lastPayload;
+  }
+
   get serverState(): ServerState {
     return this.server.state;
   }

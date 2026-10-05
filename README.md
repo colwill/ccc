@@ -8,7 +8,6 @@
 
 What is becoming obvious is that understanding the changes being made by LLMs/Agents to projects is an increasingly complex problem. 
 
-
 ## Table of content
 
 <details>
@@ -24,6 +23,7 @@ What is becoming obvious is that understanding the changes being made by LLMs/Ag
 - [Insights](#insights)
 - [Architecture Visualiser](#architecture-visualiser)
 - [Extension](#extension)
+- [Replays and Secrets](#replays-and-secrets)
 - [Dependency Map](#dependencymap)
 - [Cross-Repository Calls](#externals)
 - [Agents.md](#agentsmd)
@@ -37,7 +37,7 @@ What is becoming obvious is that understanding the changes being made by LLMs/Ag
 
 ## The human contract
 
-The "human contract" as I've started to call it, centres around the idea that if you ask someone to review your work, code, idea that you are effectively asking them to help you and if that work was not created by you then asking a human to review it is in violation of that agreement.
+The "human contract" as I've started to call it, centres around the idea that if you ask someone to review your work, code or idea that you are effectively asking them for help. If that work was not created by you then asking a human to review it; is in violation of the human contract.
 
 This **was** widely understood and agreed on by software engineers across industry; you create a PR and ask some colleagues to review it, they didn't have to but they did because they would ask of you the same - ending the cycle. This is now being lost. Some are happy, some are not. Overall it seems to be to our detriment.
 
@@ -232,10 +232,91 @@ curl -s 'localhost:6767/vis/flow?file=src/scan.rs&line=76'       # one function'
 ## Extension
 
 [`extensions/vscode`](extensions/vscode) is an editor client for the same analysis. It runs
-`ccc serve` in the background for each workspace folder and reads it over loopback HTTP, so nothing
+`ccc run` in the background for each workspace folder and reads it over loopback HTTP, so nothing
 leaves the machine and no configuration is needed to get started.
 
+It also serves the visualiser component of the extension, so if you want the visualiser in VSCode you can just
+click the RUN button in the activity bar and see the visualiser in action.
+
 See ['EXTENSION.md'](docs/EXTENSION.md) for more information.
+
+<p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="visual.png" alt="Code Change Capture Visualiser Example"></a></p>
+
+## Replays and Secrets
+
+ccc can keep the story of a branch - each ask, what the agent read and changed, and its narration -
+as a **replay** beside the branch, under `refs/ccc/replay/<branch>`, so a reviewer can play back how
+a change was made. A replay never lives in a branch's files, so a merge cannot carry one into the
+default branch.
+
+**Recording is opt-in, per repository.** Nothing is recorded until someone says yes: `ccc run` asks
+once on a terminal, the VS Code extension asks once per folder (`ccc: Session Recording…` asks
+again), and the answer is kept in `git config ccc.replay`, so both agree.
+
+```sh
+ccc replay enable     # record this repository's agent sessions
+ccc replay disable    # stop - replays already saved stay where they are
+ccc replay status     # where recording stands, and who can read the remote
+```
+
+A replay carries your prompts and the code each step touched. That makes it ideal for a team on a
+**private** repository - everyone who can read the code can replay how it was written - and a leak
+on a public one. So:
+
+- **No replay goes to a public remote** - unless it is encrypted to your team (below). Before pushing
+  one, ccc asks the remote - signed out - whether it answers. If it does, the replay stays on your
+  machine. To allow it - your company's own
+  instance, say, where every repository is readable company-wide - add this to
+  [`.ccc/map.json`](#dependencymap), where the whole team sees it in review:
+
+  ```json
+  { "replays": { "allow_public_remote": true } }
+  ```
+
+- **Secrets are redacted first.** Before a replay is committed, anything that looks like a
+  credential - in a prompt, the agent's words, a diff or a file it touched - is replaced with
+  `[redacted: …]`, and a narration line that said one stays on your machine.
+
+**Team-encrypted replays.** A team on [runccc](https://teams.runccc.dev) can encrypt every replay to
+its project's key, so only the team opens one - wherever the repository lives, public remotes
+included. The project page gives the snippet for `.ccc/map.json`:
+
+```json
+{ "replays": { "encrypt": { "project": "prj_some_random_key" } } }
+```
+
+```sh
+ccc login     # sign in - approve the code in your browser
+ccc whoami    # who you are, your teams, and the project this repository encrypts to
+ccc logout    # revoke the token and forget it here
+```
+
+In VS Code there is nothing to run: turning recording on in a repository that encrypts its replays
+signs you in, the page opening in your browser.
+
+Each save fetches the project's public key and encrypts every replay. Nothing in `refs/ccc/` reads in the clear.
+
+Team members need to be in the same team in teams.runccc.dev to view shared repo replays.
+
+Where `encrypt` is set, a replay that cannot be encrypted - not signed in, not on the team, not paid
+for, runccc out of reach with no key fetched in the last day - is not saved (the push itself goes ahead with a not explaining why the replay wasn't saved). A replay a teammate's older ccc pushed in the clear is warned of by
+`ccc replay status` and the visualiser, and is encrypted - its history started over - the next time
+its branch is pushed. `service` beside `project`, or `RUNCCC_URL`, points ccc at another key
+service. The token and cached keys live in `~/.config/ccc/runccc/`, readable by you alone.
+
+**Secret warnings.** The same scanner warns before a secret is committed or pushed, whether or not
+you record replays. It knows provider token shapes (GitHub, AWS, Slack, Stripe, Google, OpenAI,
+Anthropic and more), private keys, JSON Web Tokens, passwords in URLs, and high-entropy values given
+to credential-shaped names - in any file, `.env`, YAML and JSON as well as code:
+
+- `security` and `ccc sast` report it as `secret-in-change`
+- `changes` and `pr_summary` open with a warning
+- the pre-push hook `ccc run` installs says so as you push - it never blocks the push, and
+  `git config ccc.secrets false` turns it off
+- VS Code marks the line and pops up a message when one first appears
+
+A line meant to carry one - a test fixture - can say so with `ccc:allow-secret` (`pragma: allowlist
+secret` and `gitleaks:allow` are read too).
 
 ## DependencyMap
 

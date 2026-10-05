@@ -3096,6 +3096,8 @@
     pumping: false,
     // the step shown last while following, and when
     shown: null,
+    // the newest step when following began - only those after it are news, and until one lands the player is waiting
+    liveFrom: 0,
     // the ask's plan or its result on show in place of a step - the step at `at` keeps the place in the story
     moment: null,
     // each step on show is seen alone: what it touched in full, the rest faded
@@ -3158,7 +3160,7 @@
 
   // the first sentence of what an agent said, kept to a subtitle's length
   function sentence(text, cap = 200) {
-    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    const t = plain(text).replace(/\s+/g, ' ').trim();
     const m = t.match(/^.+?[.!?](?=\s|$)/);
     const s = m && m[0].length >= 12 ? m[0] : t;
     return s.length > cap ? s.slice(0, cap - 1).replace(/\s+\S*$/, '') + '…' : s;
@@ -3173,7 +3175,7 @@
 
   // the first few sentences of what an agent said, kept to `cap` letters
   function sentences(text, n, cap) {
-    let rest = String(text || '').replace(/\s+/g, ' ').trim();
+    let rest = plain(text).replace(/\s+/g, ' ').trim();
     let out = '';
     for (let k = 0; k < n && rest; k++) {
       const m = rest.match(/^.+?[.!?](?=\s|$)/);
@@ -3218,7 +3220,7 @@
 
   // words as a chapter's title - what the agent said it would do, its opening words and backticks gone: "Next I'll check the voice chip." is "Check the voice chip"
   function titleFrom(text) {
-    const said = String(text || '').replace(/\s+/g, ' ').trim().match(/.+?(?:[.!?](?=\s|$)|$)/g) || [];
+    const said = plain(text).replace(/\s+/g, ' ').trim().match(/.+?(?:[.!?](?=\s|$)|$)/g) || [];
     let t = said[0] || '';
     for (const s of said) {
       const m = s.match(/\b(?:I'll|I will|let me|I'm going to|I need to)\s+(.+)/i);
@@ -3257,9 +3259,15 @@
     return runs;
   }
 
+  // markdown an agent wrote, as words - a link reads as its label, a linked file as code, and emphasis markers go
+  const plain = text =>
+    String(text || '')
+      .replace(/\[([^\]]+)\]\([^)\s]*\)/g, (_, label) => (/^[\w./:#-]+$/.test(label) ? '`' + label + '`' : label))
+      .replace(/\*\*|__/g, '');
+
   // what an agent wrote as runs of words - a name in backticks reads as code, coloured by what `touched` says a step did to it
   const prose = (text, touched) =>
-    String(text)
+    plain(text)
       .split(/`([^`]+)`/)
       .flatMap((part, k) => (!part ? [] : k % 2 ? [{ text: part, code: true, kind: touched && touched.get(part) }] : [{ text: part }]));
 
@@ -3343,7 +3351,7 @@
     const box = $('subs');
     const m = momentNow();
     // on show while it plays or is followed, drawn from its snapshot, or marked on the map as it is now - the plan and result whenever they are
-    const show = V.cc && !!m && !!(T.moment || T.replay || T.playing || T.follow || (S.marks && S.marks.ev === m.ev)) && !V.wait;
+    const show = V.cc && !!m && !!(T.moment || T.replay || T.playing || T.follow || (S.marks && S.marks.ev === m.ev)) && !V.wait && !liveIdle();
     box.hidden = !show;
     if (!show) return;
     // asks learned since change what a step's line says
@@ -3642,10 +3650,21 @@
     return null;
   }
 
+  // following the live changes as they land - the player is playing, as a live stream is
+  function isLive() {
+    return T.follow && (!T.replay || T.replay.live);
+  }
+
+  // following, and nothing has landed since it began - a quiet session, not a stalled one
+  function liveIdle() {
+    const last = T.steps[T.steps.length - 1];
+    return isLive() && !T.playing && (!last || last.seq <= T.liveFrom);
+  }
+
   // The follow switch: on, each live change is shown as it lands; off, the
   // step on show stays.
   function toggleFollow() {
-    if (!(T.follow && (!T.replay || T.replay.live))) return followLive();
+    if (!isLive()) return followLive();
     stopPlay();
     T.follow = false;
     T.queue = [];
@@ -3661,6 +3680,7 @@
     // live is now, whatever was still waiting its turn, in the latest ask
     T.queue = [];
     T.shown = null;
+    T.liveFrom = T.seq;
     endReplay();
     const last = T.steps[T.steps.length - 1];
     if (!last || last.status === 'discarded') {
@@ -3685,7 +3705,8 @@
       let drawn = -1;
       while (T.queue.length && T.follow && !T.playing) {
         const ev = T.queue[0];
-        const wait = T.shown ? T.shown.at + pace(T.shown.ev, ev) - Date.now() : 0;
+        // a step read aloud is followed after a breath; one not read keeps the time between them
+        const wait = T.shown ? T.shown.at + (T.shown.read ? 350 / T.speed : pace(T.shown.ev, ev)) - Date.now() : 0;
         if (wait > 0) {
           // waiting, only the count behind moves
           if (drawn !== T.queue.length) {
@@ -3699,6 +3720,7 @@
         if (!T.steps.includes(ev)) continue;
         T.shown = { ev, at: Date.now() };
         await arrive(ev);
+        if (isLive() && (await narrate({ kind: 'step', i: T.steps.indexOf(ev), ev }))) T.shown = { ev, at: Date.now(), read: true };
       }
     } finally {
       T.pumping = false;
@@ -3848,7 +3870,9 @@
   async function play(list) {
     if (T.playing) return stopPlay();
     if (V.wait) return endWait(false);
-    if (!T.steps.length) return;
+    // following live is playing - pausing stops on the step on show
+    if (!list && isLive()) return toggleFollow();
+    if (!T.steps.length) return followLive();
     const st = storyOf();
     // from the moment on show, or from the start once the story has ended
     const queue = list ? list.map(i => ({ kind: 'step', i, ev: T.steps[i] })) : st.all.slice(st.at < 0 || st.at >= st.all.length - 1 ? 0 : st.at);
@@ -3942,11 +3966,12 @@
     label.disabled = !n;
     $('tl-prev').disabled = st.at <= 0;
     $('tl-next').disabled = st.at < 0 || st.at >= st.all.length - 1;
-    $('tl-play').disabled = !n;
-    const busy = T.playing || !!V.wait;
+    const live = isLive();
+    // following live is playing too, so it pauses - with no steps yet, play goes live
+    const busy = T.playing || !!V.wait || live;
     $('tl-play-icon').setAttribute('d', busy ? 'M6.5 4.5h4v15h-4zM13.5 4.5h4v15h-4z' : 'M7 4.5v15l12.5-7.5z');
-    $('tl-play').setAttribute('aria-label', V.wait ? 'stop waiting for the voice' : T.playing ? 'pause' : 'play');
-    $('tl-play').title = V.wait ? 'Stop waiting (space)' : T.playing ? 'Pause (space)' : 'Play (space)';
+    $('tl-play').setAttribute('aria-label', V.wait ? 'stop waiting for the voice' : busy ? 'pause' : 'play');
+    $('tl-play').title = V.wait ? 'Stop waiting (space)' : busy ? 'Pause (space)' : 'Play (space)';
     // which side of a replayed step is drawn
     const full = ev && T.full.get(ev.seq);
     $('tl-side').hidden = !T.replay || !!T.moment;
@@ -3954,7 +3979,6 @@
       b.setAttribute('aria-pressed', String(T.side === b.dataset.side));
       b.disabled = !(full && full[b.dataset.side]);
     }
-    const live = T.follow && (!T.replay || T.replay.live);
     const follow = $('tl-follow');
     follow.setAttribute('aria-checked', String(live));
     follow.title = live ? 'Following live changes - each edit shown as it lands (L)' : 'Go live - the newest change, then each one as it lands (L)';
@@ -3967,7 +3991,17 @@
     drawOverlay(st, m);
     drawRail(st);
     showSubtitle();
+    drawWaiting();
     voiceChip();
+  }
+
+  // following live with nothing landed since - said where the subtitles sit, so a quiet session is not taken for a crashed one
+  function drawWaiting() {
+    const wait = liveIdle() && !V.wait;
+    $('live-wait').hidden = !wait;
+    if (!wait) return;
+    const last = T.steps[T.steps.length - 1];
+    $('live-wait-last').textContent = last ? `The last change landed ${when(last.at)}` : '';
   }
 
   function diffView(ev) {
@@ -4395,7 +4429,11 @@
         more.textContent = 'Fetching…';
         fill(true);
       });
-      box.replaceChildren(h('div', 'eyebrow', 'Replays'), rows.length ? list(rows) : h('p', 'hint', 'No replays yet - each branch pushed saves one'), more);
+      // where map.json encrypts replays, one a teammate's older ccc pushed in the clear is said
+      const clear = (r.in_the_clear || []).map(ref =>
+        h('p', 'hint', `${ref} is not encrypted - it was saved by a ccc that does not encrypt replays, and is encrypted the next time its branch is pushed with this one`),
+      );
+      box.replaceChildren(h('div', 'eyebrow', 'Replays'), rows.length ? list(rows) : h('p', 'hint', 'No replays yet - each branch pushed saves one'), ...clear, more);
     };
     fill(false);
   }
@@ -4971,13 +5009,15 @@
     if (!V.on || !m || V.pref === 'off') return false;
     if (V.pref !== 'browser') {
       const line = await lineFor(m).catch(() => null);
-      if (!T.playing || !sameMoment(momentNow(), m)) return true;
+      if (!(T.playing || isLive()) || !sameMoment(momentNow(), m)) return true;
       if (line) {
         await playLine(line);
         return true;
       }
     }
-    if (synth && (V.pref === 'browser' || V.impatient || V.state === 'failed')) {
+    // following live cannot hold for the natural voice as a replay does, so the browser's reads until it is up
+    const standIn = !T.playing && V.pref === 'kokoro' && V.state !== 'ready';
+    if (synth && (V.pref === 'browser' || V.impatient || V.state === 'failed' || standIn)) {
       await speakBrowser(compose(runsOf(m)).spoken);
       return true;
     }
@@ -5318,6 +5358,7 @@
       if (fresh.length) asksSoon(T.primed ? 2500 : 0);
       if (!T.primed) {
         T.primed = true;
+        T.liveFrom = T.seq;
         if (T.steps.length) T.at = T.steps.length - 1;
         drawTimeline();
       } else if (fresh.length) {

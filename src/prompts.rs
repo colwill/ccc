@@ -219,6 +219,9 @@ pub struct PromptsReport {
     // distinguishable from a missing one
     pub sources: Vec<SourceStatus>,
     pub counts: PromptsCounts,
+    // what the branch adds that looks like a credential - a pr summary says it first
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<crate::secrets::Finding>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1287,6 +1290,7 @@ pub fn prompts(root: &Path, root_label: &str, opts: &PromptsOptions) -> Result<P
         unattributed: attribution.unattributed,
         sources,
         counts,
+        secrets: crate::secrets::branch(root, opts.base.as_deref(), opts.worktree).findings,
     })
 }
 

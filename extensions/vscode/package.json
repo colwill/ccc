@@ -5,7 +5,7 @@
   "version": "1.7.0",
   "publisher": "colwill",
   "license": "MIT",
-  "icon": "media/icon.png",
+  "icon": "media/ccc.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/colwill/ccc"
@@ -107,6 +107,11 @@
       {
         "command": "ccc.stopServer",
         "title": "Stop Analyser",
+        "category": "ccc"
+      },
+      {
+        "command": "ccc.sessionRecording",
+        "title": "Session Recording…",
         "category": "ccc"
       },
       {
