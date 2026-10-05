@@ -43,7 +43,7 @@ This **was** widely understood and agreed on by software engineers across indust
 
 The human contract and conversation is the bulk of value in the PR review process, human thinking, edge cases, maintainability, how a product or consumer would be affected by a change etc. Slapping an agent onto your PR as-is invalidates the human contract and can cause significant frustration when engineers are reading through a change that is mostly written by an agent. It's hard to not consider this wasted time as an engineer.
 
-Now, PRs are generated and reviewed by agents with little-to-no oversight, however; the engineers are still responsible for the code they push in work. This creates a dynamic that tends towards laziness and frustration from both AI usage on both ends and an under-appreciation of what a technical craftsman brings to a project.
+Now, PRs are generated and reviewed by agents with little-to-no oversight, however; the engineers are still responsible for the code they push in work. This creates a dynamic that tends towards laziness and frustration from both AI usage on both ends and an under-appreciation of what a technical expert brings to a project.
 
 Let's keep the human contract and make it easier to honour.
 
