@@ -1231,6 +1231,34 @@ body.with-rail { --rail-w: 340px; }
 .tl-preview .k-modified { color: var(--sub-modified); }
 .tl-preview .k-removed { color: var(--sub-removed); }
 
+/* following live with nothing landed since, where the subtitles sit - the live dot beating so a quiet session reads as alive */
+.live-wait {
+  position: fixed;
+  left: calc((100vw - var(--rail-w, 0px)) / 2);
+  bottom: calc(var(--tl-top, 0px) + 16px);
+  transform: translateX(-50%);
+  z-index: 13;
+  max-width: calc(100vw - var(--rail-w, 0px) - 32px);
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  gap: 3px 10px;
+  align-items: center;
+  padding: 10px 16px 10px 14px;
+  border-radius: 10px;
+  background: var(--sub-bg);
+  color: var(--sub-fg);
+  pointer-events: none;
+}
+.live-wait[hidden] { display: none; }
+.live-wait i { width: 8px; height: 8px; border-radius: 50%; background: #e5484d; animation: live-beat 1.6s ease-out infinite; }
+.live-wait b { font-size: 14px; white-space: nowrap; }
+.live-wait small { grid-column: 2; color: var(--sub-dim); font-size: 12.5px; }
+.live-wait small:empty { display: none; }
+@keyframes live-beat {
+  from { box-shadow: 0 0 0 0 color-mix(in srgb, #e5484d 55%, transparent); }
+  to { box-shadow: 0 0 0 7px transparent; }
+}
+
 /* the story holding for the voice, where the subtitles sit */
 .voice-wait {
   position: fixed;
@@ -1302,4 +1330,5 @@ body.with-rail { --rail-w: 340px; }
 @media (prefers-reduced-motion: reduce) {
   .node.ping { animation: none; outline: 2px solid var(--primary); }
   .spin { animation-duration: 2.4s; }
+  .live-wait i { animation: none; box-shadow: 0 0 0 3px color-mix(in srgb, #e5484d 22%, transparent); }
 }

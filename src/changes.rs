@@ -60,6 +60,33 @@ pub struct ChangesConfig {
     // `.proto` schemas kept outside the project
     #[serde(default)]
     pub contracts: Vec<String>,
+    // what replays may do - pushing one to a remote anyone can read is allowed
+    // here, in the repository, where the whole team sees it, or not at all
+    #[serde(default)]
+    pub replays: ReplaysConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ReplaysConfig {
+    // push replays to a remote that answers without signing in - for a
+    // company's own instance where every repository is readable company-wide.
+    // A replay carries prompts and code, so this is never on by default.
+    #[serde(default)]
+    pub allow_public_remote: bool,
+    // encrypt every replay to a runccc project's key, so only its team opens
+    // one - wherever it is pushed. Set here, never on one machine, so no
+    // teammate's ccc saves a replay in the clear.
+    #[serde(default)]
+    pub encrypt: Option<EncryptConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EncryptConfig {
+    // the runccc project replays are sealed to - an id, not a secret
+    pub project: String,
+    // the key service's address - runccc's own when left out; `RUNCCC_URL` overrides both
+    #[serde(default)]
+    pub service: Option<String>,
 }
 
 impl ChangesConfig {
@@ -206,6 +233,8 @@ pub struct ChangesCounts {
     // telemetric definitions this branch moved
     pub telemetry_changes: usize,
     pub telemetry_breaking: usize,
+    // lines the branch adds that look like a credential
+    pub secrets: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +269,8 @@ pub struct ChangesReport {
     pub deps: Option<crate::deps::DepsReport>,
     // what this branch did to the OpenTelemetry metrics
     pub telemetry: crate::telemetry::TelemetryReport,
+    // what this branch adds that looks like a credential - said before it is pushed
+    pub secrets: crate::secrets::Report,
     pub counts: ChangesCounts,
 }
 
@@ -370,6 +401,9 @@ pub fn changes_with_caches(
             worktree: opts.worktree,
         },
     );
+
+    // What the branch adds that looks like a credential, while it can still be taken out
+    let secrets = crate::secrets::against(root, &base_label, &base_sha, opts.worktree);
 
     // Which request produced which change
     let (turns, attribution) = if opts.prompts {
@@ -523,6 +557,7 @@ pub fn changes_with_caches(
         unattributed_files: attribution.unattributed.len(),
         telemetry_changes: telemetry.changes.len(),
         telemetry_breaking: telemetry.counts.breaking,
+        secrets: secrets.findings.len(),
     };
 
     Ok(ChangesReport {
@@ -546,6 +581,7 @@ pub fn changes_with_caches(
         unattributed: attribution.unattributed,
         deps,
         telemetry,
+        secrets,
         counts,
     })
 }
@@ -1584,7 +1620,7 @@ fn ref_exists(root: &Path, r: &str) -> bool {
 }
 
 // resolve diff base
-fn resolve_base(root: &Path, base: Option<&str>) -> Result<(String, String)> {
+pub(crate) fn resolve_base(root: &Path, base: Option<&str>) -> Result<(String, String)> {
     const AUTO: &[&str] = &["origin/main", "main", "origin/master", "master"];
     let label = match base {
         Some(b) => {

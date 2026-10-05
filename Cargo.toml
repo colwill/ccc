@@ -45,6 +45,11 @@ tree-sitter-proto = "0.6"
 crossbeam-epoch = "0.9.20"
 # checks each file of the narration voice against the hash pinned for it
 sha2 = "0.10"
+# seals a team's replays to its project key; age-core builds the file keys the key service unwraps
+age = "0.12"
+age-core = "0.12"
+# a stanza's body and the file keys the key service sends back are base64
+base64 = "0.22"
 
 [profile.release]
 opt-level = 2

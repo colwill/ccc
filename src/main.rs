@@ -278,16 +278,42 @@ enum Command {
     },
     // Replays of what agents did on a branch, kept under `refs/ccc/replay/<branch>`
     // - beside the branches, never in them, so a merge cannot carry one to the
-    // default branch. `ccc run` installs a pre-push hook that saves each branch's
-    // replay as it is pushed; these do it by hand.
+    // default branch. Recording is opt-in per repository (`ccc replay enable`);
+    // once on, the pre-push hook `ccc run` installs saves each branch's replay as
+    // it is pushed, with anything that looks like a secret taken out first.
     Replay {
         #[command(subcommand)]
         action: ReplayCommand,
+    },
+    // what ccc's git hooks run - not for calling by hand
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        action: HookCommand,
     },
     // the narration voice the visualiser reads replays with - downloaded once, shared by every ccc on this machine
     Voice {
         #[command(subcommand)]
         action: VoiceCommand,
+    },
+    // sign in to runccc, the key service a team's replays are encrypted through - a code to approve in the browser
+    Login {
+        // the repository whose `.ccc/map.json` names the service - runccc's own where it names none
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // a json line with the code, then one with who signed in, the page left for the caller to open - what the VS Code extension reads
+        #[arg(long)]
+        json: bool,
+    },
+    // sign out of runccc on this machine - the token revoked, and the keys it fetched forgotten
+    Logout {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    // who is signed in to runccc here, their teams, and the project this repository's replays are encrypted to
+    Whoami {
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     // install this `ccc` binary onto your PATH (Linux; defaults to ~/.local/bin)
     Install {
@@ -327,11 +353,37 @@ enum ReplayCommand {
         #[arg(long)]
         quiet: bool,
     },
-    // install the pre-push hook that saves a replay with every push
+    // install the pre-push hook that checks each push for secrets and saves its replay where recording is on
     Install {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    // turn session recording on for this repository: agent sessions are kept as
+    // replays beside the branches and pushed with them - never to a remote anyone
+    // can read unless `.ccc/map.json` allows it, and with anything that looks
+    // like a secret taken out first
+    Enable {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    // turn session recording off for this repository - replays already saved stay where they are
+    Disable {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    // whether recording is on here, and how far a pushed replay would travel
+    Status {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCommand {
+    // a push: git's refs on stdin, the remote's name and address as arguments
+    PrePush { remote: String, url: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -684,7 +736,9 @@ fn run() -> Result<ExitCode> {
                 html: !no_html,
                 vis,
             };
-            codecache::serve(&canonical(&path), &opts)?;
+            let root = canonical(&path);
+            ask_recording(&root);
+            codecache::serve(&root, &opts)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Insights { path, html, base } => {
@@ -757,7 +811,35 @@ fn run() -> Result<ExitCode> {
                 println!("{}", codecache::replay::install_hook(&canonical(&path))?.describe());
                 Ok(ExitCode::SUCCESS)
             }
+            ReplayCommand::Enable { path } => {
+                let root = canonical(&path);
+                println!("{}", codecache::replay::set_consent(&root, true)?.describe());
+                println!("{}", codecache::replay::explain(&root));
+                Ok(ExitCode::SUCCESS)
+            }
+            ReplayCommand::Disable { path } => {
+                let root = canonical(&path);
+                codecache::replay::set_consent(&root, false)?;
+                println!("{}", codecache::replay::explain(&root));
+                Ok(ExitCode::SUCCESS)
+            }
+            ReplayCommand::Status { path, json } => {
+                let root = canonical(&path);
+                if json {
+                    println!("{}", codecache::replay::status(&root));
+                } else {
+                    println!("{}", codecache::replay::explain(&root));
+                }
+                Ok(ExitCode::SUCCESS)
+            }
         },
+        Command::Hook { action: HookCommand::PrePush { remote, url: _ } } => {
+            let mut updates = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut updates);
+            // git runs a hook at the top of the working tree
+            eprint!("{}", codecache::replay::pre_push(&canonical(Path::new(".")), &remote, &updates));
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Voice { action } => {
             let mb = |b: u64| b as f64 / 1e6;
             match action {
@@ -784,6 +866,64 @@ fn run() -> Result<ExitCode> {
                     println!("voice: ready");
                 }
                 VoiceCommand::Remove => println!("voice: removed, {:.0} MB freed", mb(codecache::voice::remove()?)),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Login { path, json } => {
+            let client = codecache::runccc::client_for(&canonical(&path));
+            let signed = client.login(&codecache::runccc::this_machine(), !json, &mut |code| {
+                if json {
+                    println!("{}", serde_json::to_string(code).unwrap_or_default());
+                } else {
+                    eprintln!("{}", client.asking(code));
+                }
+            })?;
+            if json {
+                println!("{}", serde_json::json!({ "login": signed.login, "service": client.base }));
+            } else {
+                println!("ccc: signed in to runccc as {} ({})", signed.login, client.base);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Logout { path } => {
+            let client = codecache::runccc::client_for(&canonical(&path));
+            match client.logout()? {
+                None => println!("ccc: not signed in to runccc ({})", client.base),
+                Some((login, None)) => println!("ccc: signed out of runccc - {login}'s token is revoked, and forgotten here"),
+                Some((login, Some(why))) => println!(
+                    "ccc: signed out of runccc here, but the service could not be told ({why}) - revoke {login}'s token on its settings page"
+                ),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Whoami { path } => {
+            let root = canonical(&path);
+            let client = codecache::runccc::client_for(&root);
+            let me = match client.me() {
+                Ok(me) => me,
+                Err(why) => {
+                    println!("ccc: {why}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            println!("ccc: signed in to runccc as {} ({})", me["login"].as_str().unwrap_or("?"), client.base);
+            let teams: Vec<String> = me["teams"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| format!("{} ({})", t["slug"].as_str().unwrap_or("?"), t["role"].as_str().unwrap_or("member")))
+                .collect();
+            println!("ccc: teams: {}", if teams.is_empty() { "none yet".to_string() } else { teams.join(", ") });
+            match codecache::runccc::team(&root) {
+                Ok(Some(team)) => match team.client.keys(&team.project) {
+                    Ok((keys, _)) => println!(
+                        "ccc: replays here are encrypted to {} (team {}, {}) - key v{}, {}",
+                        keys.project, keys.team, keys.name, keys.current, keys.status
+                    ),
+                    Err(why) => println!("ccc: replays here are encrypted to {} - {why}", team.project),
+                },
+                Ok(None) => {}
+                Err(why) => println!("ccc: {why}"),
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -1246,6 +1386,74 @@ fn dir_on_path(dir: &Path) -> bool {
                 .any(|p| p.canonicalize().unwrap_or(p) == canon)
         })
         .unwrap_or(false)
+}
+
+// The question `ccc run` asks once per repository, on a terminal: record
+// agent sessions as replays beside the branches? What it says depends on who
+// can read the remote, since a replay carries prompts and code. Off a
+// terminal - an editor starting it - nothing is asked and nothing recorded;
+// the editor asks for itself.
+fn ask_recording(root: &Path) {
+    use codecache::replay::{consent, exposure_here, is_repo, set_consent, Consent};
+    use std::io::IsTerminal;
+    if !is_repo(root) || consent(root) != Consent::Unasked {
+        return;
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eprintln!("ccc: session recording is off for this repository until someone turns it on - `ccc replay enable`");
+        return;
+    }
+    eprintln!(
+        "\nccc can record your agent sessions as replays, kept beside this repository's branches\n\
+         (refs/ccc) and pushed with them, so the team can watch how each change was made.\n\
+         A replay carries your prompts and the code each step touched - anything that looks\n\
+         like a secret is redacted first. For a team on a private repository that is ideal:\n\
+         everyone who can read the code can replay how it was written."
+    );
+    if let Some(e) = exposure_here(root) {
+        match e.public {
+            Some(true) if e.sealed => eprintln!(
+                "\n{} ({}) answers without signing in, but .ccc/map.json encrypts replays to the team's\n\
+                 runccc key, so only the team opens them.",
+                e.remote, e.url
+            ),
+            Some(true) if e.allowed => eprintln!(
+                "\n{} ({}) answers without signing in, and .ccc/map.json allows replays to it.",
+                e.remote, e.url
+            ),
+            Some(true) if e.public_host => eprintln!(
+                "\n{} ({}) can be read by anyone, without signing in. Replays would stay on this\n\
+                 machine - make the repository private to share them with your team.",
+                e.remote, e.url
+            ),
+            Some(true) => eprintln!(
+                "\n{} ({}) answers without signing in, so replays would stay on this machine.\n\
+                 If {} is your company's internal instance, where every repository is readable\n\
+                 company-wide, allow it in .ccc/map.json, where the team sees it: {}",
+                e.remote,
+                e.url,
+                e.host,
+                codecache::replay::ALLOW_PUBLIC
+            ),
+            Some(false) => eprintln!("\n{} needs a sign-in to read, so replays reach only people who can read the code.", e.remote),
+            None => eprintln!("\nccc could not tell whether {} ({}) can be read without signing in.", e.remote, e.url),
+        }
+    }
+    let yes = ask("\nRecord agent sessions for this repository? [y/N] ");
+    match set_consent(root, yes) {
+        Ok(_) if yes => eprintln!("ccc: recording on - `ccc replay disable` turns it off\n"),
+        Ok(_) => eprintln!("ccc: not recording - `ccc replay enable` turns it on later\n"),
+        Err(e) => eprintln!("ccc: could not keep the answer: {e:#}\n"),
+    }
+}
+
+// a yes-or-no on the terminal - anything but yes is no
+fn ask(question: &str) -> bool {
+    use std::io::Write;
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn canonical(path: &Path) -> PathBuf {

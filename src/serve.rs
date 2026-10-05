@@ -930,30 +930,32 @@ impl MapState {
         Some(json!({"event": json, "before": side(&before), "after": side(&after)}))
     }
 
-    // a branch's saved replay as the timeline's events, numbered from one - its narration fetched meanwhile, so the voice is there when it plays
-    fn replay_events(&self, branch: &str) -> Value {
+    // a branch's saved replay as the timeline's events, numbered from one - its narration fetched meanwhile, so the voice is there when it plays - and an encrypted one opened through the key service afresh
+    fn replay_events(&self, branch: &str) -> Result<Value, crate::runccc::Fault> {
         let (root, b) = (self.root.clone(), branch.to_string());
         std::thread::spawn(move || crate::replay::fetch_voice(&root, &b));
-        let steps: Vec<Value> = crate::replay::steps(&self.root, branch)
+        let steps: Vec<Value> = crate::replay::open(&self.root, branch)?
             .into_iter()
             .map(|mut v| {
                 v["snapshot"] = json!(self.git && drawable_json(&v));
                 v
             })
             .collect();
-        json!({
+        Ok(json!({
             "boot": 0,
             "latest": steps.len(),
             "first": steps.first().map(|v| v["seq"].clone()),
             "generated": self.ts,
             "replay": branch,
             "events": steps,
-        })
+        }))
     }
 
     // one step of a branch's saved replay drawn each side, from the texts the replay keeps of it
-    fn replay_step(&self, branch: &str, seq: u64) -> Option<Value> {
-        let json = crate::replay::steps(&self.root, branch).into_iter().find(|v| v["seq"].as_u64() == Some(seq))?;
+    fn replay_step(&self, branch: &str, seq: u64) -> Result<Option<Value>, crate::runccc::Fault> {
+        let Some(json) = crate::replay::steps(&self.root, branch)?.into_iter().find(|v| v["seq"].as_u64() == Some(seq)) else {
+            return Ok(None);
+        };
         let side = |s: Option<Arc<Value>>| s.as_deref().cloned().unwrap_or(Value::Null);
         let (before, after) = match self.rebuilt(&json) {
             Some(d) => {
@@ -965,7 +967,7 @@ impl MapState {
             }
             None => (None, None),
         };
-        Some(json!({"event": json, "before": side(before), "after": side(after)}))
+        Ok(Some(json!({"event": json, "before": side(before), "after": side(after)})))
     }
 
     // A step put back together from the texts the feed kept of it, as git
@@ -4109,6 +4111,28 @@ fn md_prompts(v: &Value, page: Page) -> String {
     out
 }
 
+// what a branch adds that looks like a credential, as the warning a summary opens with - nothing when there is none
+pub(crate) fn md_secrets(findings: &[Value]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n## WARNING: {} line(s) this branch adds look like a secret\ntake each out before it is pushed - once in git history it has to be rotated\n",
+        findings.len()
+    );
+    for s in findings {
+        out.push_str(&format!(
+            "{}:{} {} {}{}\n",
+            jstr(s, "file"),
+            jnum(s, "line"),
+            jstr(s, "what"),
+            jstr(s, "evidence"),
+            if jbool(s, "uncommitted") { " - not committed yet" } else { "" },
+        ));
+    }
+    out
+}
+
 fn md_changes(v: &Value, page: Page) -> String {
     if let Some(why) = md_unavailable("changes", v) {
         return why;
@@ -4129,6 +4153,7 @@ fn md_changes(v: &Value, page: Page) -> String {
             if s.is_empty() { "(none)".into() } else { s }
         },
     );
+    out.push_str(&md_secrets(&jarr(&v["secrets"], "findings")));
 
     let funcs = jarr(v, "changed_functions");
     let (window, note) = page.apply(&funcs);
@@ -4667,7 +4692,7 @@ fn browser_origin(addr: &std::net::SocketAddr) -> String {
     }
 }
 
-fn open_in_browser(url: &str) -> Result<(), String> {
+pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("open", &[])
@@ -5574,7 +5599,11 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
                 if !crate::replay::branch_ok(b) {
                     return bad(400, format!("no replay for '{b}'"));
                 }
-                return ok(map.replay_events(b));
+                // an encrypted replay that will not open says why - not on the team, not paid for, not signed in
+                return match map.replay_events(b) {
+                    Ok(v) => ok(v),
+                    Err(why) => bad(why.status(), why.to_string()),
+                };
             }
             ok(map.timeline_since(since))
         }
@@ -5582,7 +5611,10 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
         ("GET", "/vis/asks") => {
             let map = state.read().expect("map lock poisoned");
             if let Some(b) = get("replay").filter(|b| crate::replay::branch_ok(b)) {
-                return ok(replay_asks(&crate::replay::steps(&map.root, b)));
+                return match crate::replay::steps(&map.root, b) {
+                    Ok(steps) => ok(replay_asks(&steps)),
+                    Err(why) => bad(why.status(), why.to_string()),
+                };
             }
             ok(map.timeline_asks())
         }
@@ -5593,8 +5625,9 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
             let map = state.read().expect("map lock poisoned");
             if let Some(b) = get("replay").filter(|b| crate::replay::branch_ok(b)) {
                 return match map.replay_step(b, seq) {
-                    Some(v) => ok(v),
-                    None => bad(404, format!("no step {seq} in {b}'s replay")),
+                    Ok(Some(v)) => ok(v),
+                    Ok(None) => bad(404, format!("no step {seq} in {b}'s replay")),
+                    Err(why) => bad(why.status(), why.to_string()),
                 };
             }
             match map.timeline_step(seq) {
@@ -5648,7 +5681,12 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
             if let Some(Err(e)) = &fetched {
                 return bad(502, format!("{e:#}"));
             }
-            ok(json!({"replays": crate::replay::list(&map.root), "branch": crate::replay::branch_of(&map.root)}))
+            // where map.json encrypts replays, any a teammate's older ccc left in the clear is said
+            let clear = match crate::runccc::team(&map.root) {
+                Ok(Some(_)) => crate::replay::held_in_the_clear(&map.root),
+                _ => Vec::new(),
+            };
+            ok(json!({"replays": crate::replay::list(&map.root), "branch": crate::replay::branch_of(&map.root), "in_the_clear": clear}))
         }
         ("GET", "/vis/code") => {
             let Some(file) = get("file") else {

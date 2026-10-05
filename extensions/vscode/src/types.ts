@@ -123,7 +123,20 @@ export interface ChangesSection {
   services_to_test: string[];
   untested: ChangedFunction[];
   unassigned_files: string[];
+  // what the branch adds that looks like a credential
+  secrets?: { base: string; findings: SecretFinding[]; error?: string };
   counts: Record<string, number>;
+}
+
+// a line the branch adds that looks like a credential, its value redacted
+export interface SecretFinding {
+  file: string;
+  line: number;
+  what: string;
+  severity: string;
+  evidence: string;
+  // still only in the working tree - nothing is in git history yet
+  uncommitted: boolean;
 }
 
 export interface ServiceSite {

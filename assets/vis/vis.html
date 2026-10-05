@@ -74,6 +74,12 @@
 <div class="message" id="message" hidden></div>
 <!-- the step on show told in a line, read aloud while the story plays -->
 <div class="subs" id="subs" aria-live="polite" hidden></div>
+<!-- following live with nothing landed since, so a quiet session is not taken for a crashed one -->
+<div class="live-wait" id="live-wait" role="status" aria-live="polite" hidden>
+  <i aria-hidden="true"></i>
+  <b>Waiting for changes</b>
+  <small id="live-wait-last"></small>
+</div>
 <!-- the story holding for the voice, the way a video buffers -->
 <div class="voice-wait" id="voice-wait" role="status" aria-live="polite" hidden>
   <span class="spin" aria-hidden="true"></span>

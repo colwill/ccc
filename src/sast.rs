@@ -16,6 +16,7 @@
 use crate::languages::Language;
 use crate::changes;
 use crate::scan::collect_files;
+use crate::secrets::{entropy, redacted, PLACEHOLDERS, SECRET_NAMES};
 use serde::Serialize;
 use std::path::Path;
 use tree_sitter::{Node, Parser};
@@ -72,6 +73,7 @@ impl SastReport {
 
 pub const RULES: &[&str] = &[
     "hardcoded-secret",
+    "secret-in-change",
     "tls-verification-disabled",
     "shell-injection",
     "sql-injection",
@@ -134,6 +136,31 @@ pub fn analyse(root: &Path, include_tests: bool) -> SastReport {
         };
         scanned += 1;
         findings.extend(apply_rules(&rel, lang, &collected, include_tests));
+    }
+
+    // What the branch adds that reads as a credential, in any file - a key in
+    // a `.env` or a config the parse above never reads - while it can still be
+    // taken out before it is committed or pushed.
+    for s in crate::secrets::branch(root, None, true).findings {
+        if !include_tests && changes::is_test_path(&s.file) {
+            continue;
+        }
+        // a literal the parse already found is one finding, not two
+        if findings.iter().any(|f: &Finding| f.rule == "hardcoded-secret" && f.file == s.file && f.line == s.line) {
+            continue;
+        }
+        findings.push(Finding {
+            rule: "secret-in-change",
+            severity: s.severity,
+            cwe: "CWE-798",
+            language: Language::from_path(Path::new(&s.file)).map_or("text", |l| l.as_str()),
+            message: format!("what looks like {} is added on this branch{}", s.what, if s.uncommitted { ", not committed yet" } else { "" }),
+            file: s.file,
+            line: s.line,
+            function: String::new(),
+            evidence: s.evidence,
+            hint: "take it out before it is committed or pushed and read it from a secret store or the environment - once it is in git history it has to be rotated",
+        });
     }
 
     // worst first, then by location so the order is stable
@@ -377,35 +404,6 @@ fn push(
     });
 }
 
-// credentials that announce themselves by shape - prefix, charset and length
-const TOKEN_SHAPES: &[(&str, &str, usize)] = &[
-    ("AKIA", "an AWS access key id", 20),
-    ("ASIA", "an AWS temporary access key id", 20),
-    ("ghp_", "a GitHub personal access token", 40),
-    ("gho_", "a GitHub OAuth token", 40),
-    ("ghs_", "a GitHub server token", 40),
-    ("github_pat_", "a GitHub fine-grained token", 40),
-    ("xoxb-", "a Slack bot token", 24),
-    ("xoxp-", "a Slack user token", 24),
-    ("sk_live_", "a Stripe live secret key", 24),
-    ("rk_live_", "a Stripe restricted key", 24),
-    ("AIza", "a Google API key", 39),
-    ("SG.", "a SendGrid API key", 40),
-    ("glpat-", "a GitLab personal access token", 20),
-];
-
-// names that make a literal beside them a credential rather than a string
-const SECRET_NAMES: &[&str] = &[
-    "password", "passwd", "pwd", "secret", "api_key", "apikey", "access_key", "token",
-    "credential", "private_key", "auth", "passphrase", "client_secret",
-];
-
-// values that look like secrets but are placeholders
-const PLACEHOLDERS: &[&str] = &[
-    "changeme", "change_me", "password", "secret", "token", "example", "placeholder", "your",
-    "xxx", "todo", "none", "null", "test", "dummy", "sample", "redacted", "hunter2",
-];
-
 fn secret_rule(file: &str, lang: Language, lit: &Literal, out: &mut Vec<Finding>) {
     let v = lit.value.trim();
 
@@ -422,17 +420,15 @@ fn secret_rule(file: &str, lang: Language, lit: &Literal, out: &mut Vec<Finding>
     }
 
     // a shaped token needs no surrounding context to be recognised
-    for (prefix, what, min_len) in TOKEN_SHAPES {
-        if v.starts_with(prefix) && v.len() >= *min_len && !v.contains(' ') {
-            push(
-                out, "hardcoded-secret", Severity::High, "CWE-798", file, lang, lit.line,
-                &lit.function,
-                format!("a literal that looks like {what}"),
-                redact(v),
-                "move it to a secret store or an environment variable, and rotate it - it is in git history",
-            );
-            return;
-        }
+    if let Some(what) = crate::secrets::shape_of(v) {
+        push(
+            out, "hardcoded-secret", Severity::High, "CWE-798", file, lang, lit.line,
+            &lit.function,
+            format!("a literal that looks like {what}"),
+            redacted(v),
+            "move it to a secret store or an environment variable, and rotate it - it is in git history",
+        );
+        return;
     }
 
     // a JWT carries its own header
@@ -441,7 +437,7 @@ fn secret_rule(file: &str, lang: Language, lit: &Literal, out: &mut Vec<Finding>
             out, "hardcoded-secret", Severity::Medium, "CWE-798", file, lang, lit.line,
             &lit.function,
             "a literal that looks like a JSON Web Token".to_string(),
-            redact(v),
+            redacted(v),
             "move it to a secret store or an environment variable, and rotate it - it is in git history",
         );
         return;
@@ -474,7 +470,7 @@ fn secret_rule(file: &str, lang: Language, lit: &Literal, out: &mut Vec<Finding>
     push(
         out, "hardcoded-secret", Severity::High, "CWE-798", file, lang, lit.line, &lit.function,
         "a high-entropy literal is assigned to a credential-shaped name".to_string(),
-        format!("{} = {}", first_secret_name(&lit.context).unwrap_or_else(|| "<name>".into()), redact(v)),
+        format!("{} = {}", first_secret_name(&lit.context).unwrap_or_else(|| "<name>".into()), redacted(v)),
         "move it to a secret store or an environment variable, and rotate it - it is in git history",
     );
 }
@@ -486,33 +482,6 @@ fn first_secret_name(context: &str) -> Option<String> {
         .filter_map(|n| lower.find(n).map(|i| (i, *n)))
         .min_by_key(|(i, _)| *i)?;
     Some(hit.1.to_string())
-}
-
-fn redact(v: &str) -> String {
-    let head: String = v.chars().take(4).collect();
-    format!("{head}... ({} chars, redacted)", v.chars().count())
-}
-
-// shannon entropy per char, which is what separates a key from a word
-fn entropy(s: &str) -> f64 {
-    if s.is_empty() {
-        return 0.0;
-    }
-    let mut counts = [0usize; 256];
-    let mut total = 0usize;
-    for b in s.bytes() {
-        counts[b as usize] += 1;
-        total += 1;
-    }
-    let total = total as f64;
-    counts
-        .iter()
-        .filter(|&&c| c > 0)
-        .map(|&c| {
-            let p = c as f64 / total;
-            -p * p.log2()
-        })
-        .sum()
 }
 
 fn tls_rule(file: &str, lang: Language, call: &Call, out: &mut Vec<Finding>) {
@@ -733,6 +702,7 @@ fn only_literal_args(text: &str) -> bool {
 pub fn rule_catalogue() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         ("hardcoded-secret", "CWE-798", "credentials written into source"),
+        ("secret-in-change", "CWE-798", "a credential this branch adds, in any file, before it is pushed"),
         ("tls-verification-disabled", "CWE-295", "certificate checks turned off"),
         ("shell-injection", "CWE-78", "a command line built at runtime"),
         ("sql-injection", "CWE-89", "a statement assembled instead of parameterised"),

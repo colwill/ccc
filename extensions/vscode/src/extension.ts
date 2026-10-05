@@ -5,8 +5,10 @@ import { type CommandHost, registerCommands } from './commands';
 import { type Cfg, needsDecorationReload, readConfig } from './config';
 import { DecorationSet } from './decorations';
 import { CccHoverProvider } from './hover';
-import { Log } from './log';
+import { describe, Log } from './log';
 import { isSupportedDocument, keyOf } from './paths';
+import { askToRecord } from './recording';
+import { SecretWarnings } from './secretwarnings';
 import { WorkspaceSession } from './session';
 import { type ActiveFileState, StatusBar } from './status';
 import { ComplexityPanel } from './complexitypanel';
@@ -46,6 +48,9 @@ class Extension implements CommandHost {
   private readonly hover: CccHoverProvider;
   private readonly testPanel: TestTriggerPanel;
   private readonly vulns = new VulnerabilityMarks();
+  private readonly secrets = new SecretWarnings();
+  // folders asked about session recording this window - one put aside waits for the next
+  private readonly recordingAsked = new Set<string>();
   private readonly complexityPanel: ComplexityPanel;
   private readonly visualiser: VisualiserView;
   private cfg: Cfg;
@@ -110,6 +115,15 @@ class Extension implements CommandHost {
       this.testPanel,
       this.complexityPanel,
       this.vulns,
+      this.secrets,
+      vscode.commands.registerCommand('ccc.sessionRecording', () => {
+        const session = this.activeSession();
+        if (!session) {
+          void vscode.window.showWarningMessage('ccc: the analyser is not running yet.');
+          return;
+        }
+        this.askRecording(session.folder, true);
+      }),
       vscode.languages.registerCodeLensProvider({ scheme: 'file' }, this.codeLens),
       vscode.languages.registerHoverProvider({ scheme: 'file' }, this.hover),
       this.visualiser,
@@ -271,11 +285,13 @@ class Extension implements CommandHost {
       // the refresh path fires twice, once for the analysis and once for the
       // advisories - redrawing on both is what made the marks blink
       if (this.vulns.update(folder.uri, session.vulnerabilities)) this.vulns.applyAll();
+      this.secrets.update(folder.uri, session.insights);
       void this.render();
     });
     try {
       await session.ensureStarted();
       await vscode.commands.executeCommand('setContext', 'ccc.active', true);
+      this.askRecording(folder);
     } catch (err) {
       this.reportStartFailure(folder, err);
     }
@@ -481,6 +497,18 @@ class Extension implements CommandHost {
 
   private clearAllDecorations(): void {
     for (const editor of vscode.window.visibleTextEditors) this.decorations.clear(editor);
+    this.secrets.clear();
+  }
+
+  // Whether this folder's agent sessions may be recorded - asked once a window,
+  // and only while nobody has answered; the command asks it again on purpose.
+  private askRecording(folder: vscode.WorkspaceFolder, again = false): void {
+    const key = folder.uri.toString();
+    if (!again && this.recordingAsked.has(key)) return;
+    this.recordingAsked.add(key);
+    void askToRecord(folder, readConfig(folder), this.log, this.context.globalStorageUri, again).catch((err) =>
+      this.log.warn(`[${folder.name}] could not ask about session recording: ${describe(err)}`),
+    );
   }
 
   refreshAll(reason: string): void {

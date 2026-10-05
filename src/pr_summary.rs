@@ -26,6 +26,8 @@ pub fn markdown(report: &PromptsReport, limit: Option<usize>, offset: usize) -> 
         report.counts.attributed_files,
         report.counts.unattributed_files,
     );
+    let secrets: Vec<serde_json::Value> = report.secrets.iter().filter_map(|f| serde_json::to_value(f).ok()).collect();
+    out.push_str(&crate::serve::md_secrets(&secrets));
 
     if report.turns.is_empty() {
         out.push_str(
@@ -159,6 +161,7 @@ mod tests {
             attributed,
             unattributed,
             sources: vec![],
+            secrets: vec![],
         }
     }
 

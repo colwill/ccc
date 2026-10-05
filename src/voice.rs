@@ -423,6 +423,11 @@ pub fn note_line(root: &Path, name: &str, meta: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// has this project noted any line it read - without one there is no narration to share
+pub fn noted(root: &Path) -> bool {
+    std::fs::metadata(root.join(".ccc").join(INDEX)).is_ok_and(|m| m.len() > 0)
+}
+
 // the lines kept on this machine for these steps and the plan and outcome of each ask they carry, by what each reads - the latest reading wins
 pub fn lines_for(root: &Path, steps: &[Value]) -> std::collections::BTreeMap<String, String> {
     let mut want: std::collections::BTreeSet<String> = steps.iter().map(step_key).collect();
