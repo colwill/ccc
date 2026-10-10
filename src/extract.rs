@@ -4,8 +4,10 @@ use crate::languages::Language;
 use crate::model::{
     Annotation, Boundary, CallSite, Const, Func, FuncMetrics, Import, LoopInfo, Note, Ref, ResourceOp, TypeDef,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use tree_sitter::{Node, Parser};
 
 // `CallSite::caller` for a call that sits outside any function
@@ -24,6 +26,8 @@ pub fn skips_ignored() -> bool {
     IGNORE_SKIP.load(Ordering::Relaxed)
 }
 
+// everything one parse yields - nothing in it depends on the path, so `parse_cache` keys it on content
+#[derive(Serialize, Deserialize)]
 pub struct Extracted {
     pub consts: Vec<Const>,
     pub funcs: Vec<Func>,
@@ -69,8 +73,110 @@ enum Scope {
     Type { name: String, recv: Option<String> },
 }
 
+// the roles a node kind plays in the walk, one bit each
+const FUNC: u16 = 1;
+const CONST: u16 = 1 << 1;
+const CALL: u16 = 1 << 2;
+const USE: u16 = 1 << 3;
+const VARIANT: u16 = 1 << 4;
+const IMPORT: u16 = 1 << 5;
+const COMMENT: u16 = 1 << 6;
+const MODULE: u16 = 1 << 7;
+const LOOP: u16 = 1 << 8;
+const BRANCH: u16 = 1 << 9;
+const GUARD: u16 = 1 << 10;
+const DECLARATION: u16 = 1 << 11;
+
+// local declarations `bind_declaration` reads a type off, in any grammar
+const DECLARATION_KINDS: &[&str] = &[
+    "let_declaration",       // rust
+    "short_var_declaration", // go `x := ...`
+    "var_spec",              // go `var x T`
+    "const_spec",
+    "variable_declarator", // js/ts
+    "declaration",         // c++
+    "field_declaration",
+];
+
+// each node kind's roles by numeric kind id - built once per grammar from the `languages` name lists
+struct Kinds {
+    roles: Vec<u16>,
+    // the label `type_kinds` gives a type definition's kind
+    type_def: Vec<Option<&'static str>>,
+    // the field `construct_kinds` names a construction's type by
+    construct: Vec<Option<&'static str>>,
+}
+
+impl Kinds {
+    fn of(lang: Language) -> &'static Kinds {
+        static TABLES: OnceLock<Vec<Kinds>> = OnceLock::new();
+        let tables = TABLES.get_or_init(|| Language::ALL.iter().map(|&l| Kinds::build(l)).collect());
+        &tables[Language::ALL.iter().position(|&l| l == lang).unwrap_or(0)]
+    }
+
+    fn build(lang: Language) -> Kinds {
+        let ts = lang.ts_language();
+        let n = ts.node_kind_count();
+        let lists: [(u16, &[&str]); 12] = [
+            (FUNC, lang.func_kinds()),
+            (CONST, lang.const_kinds()),
+            (CALL, lang.call_kinds()),
+            (USE, lang.use_kinds()),
+            (VARIANT, lang.variant_kinds()),
+            (IMPORT, lang.import_kinds()),
+            (COMMENT, lang.comment_kinds()),
+            (MODULE, lang.module_kinds()),
+            (LOOP, lang.loop_kinds()),
+            (BRANCH, lang.branch_kinds()),
+            (GUARD, lang.guard_kinds()),
+            (DECLARATION, DECLARATION_KINDS),
+        ];
+        let mut kinds = Kinds {
+            roles: vec![0; n],
+            type_def: vec![None; n],
+            construct: vec![None; n],
+        };
+        for id in 0..n {
+            let Some(name) = ts.node_kind_for_id(id as u16) else { continue };
+            for (role, names) in lists {
+                if names.contains(&name) {
+                    kinds.roles[id] |= role;
+                }
+            }
+            kinds.type_def[id] = lang.type_kinds().iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
+            kinds.construct[id] = lang.construct_kinds().iter().find(|(k, _)| *k == name).map(|(_, f)| *f);
+        }
+        kinds
+    }
+
+    // an error node's id lies past the grammar's kinds - no role
+    fn role(&self, id: u16) -> u16 {
+        self.roles.get(usize::from(id)).copied().unwrap_or(0)
+    }
+
+    fn type_def(&self, id: u16) -> Option<&'static str> {
+        self.type_def.get(usize::from(id)).copied().flatten()
+    }
+
+    fn construct(&self, id: u16) -> Option<&'static str> {
+        self.construct.get(usize::from(id)).copied().flatten()
+    }
+}
+
+// one function's measurements, taken as the walk passes through its body
+struct Measure {
+    // where the definition sits in `Ctx::funcs`
+    func: usize,
+    name: String,
+    // loop and guard depth at the definition - depths count from the function, not the file
+    loops_above: usize,
+    guards_above: usize,
+    metrics: FuncMetrics,
+}
+
 struct Ctx<'a> {
     lang: Language,
+    kinds: &'static Kinds,
     src: &'a str,
     consts: Vec<Const>,
     funcs: Vec<Func>,
@@ -106,6 +212,11 @@ struct Ctx<'a> {
     // names of enclosing Python Enum-subclass definitions; members are
     // const-like definitions typed by the innermost one
     enum_types: Vec<String>,
+    // a measurement per enclosing function, innermost last - each node counts toward all of them
+    measuring: Vec<Measure>,
+    // loops and resource guards the walk is inside, counted from the root
+    loop_depth: usize,
+    guard_depth: usize,
 }
 
 impl Ctx<'_> {
@@ -169,6 +280,7 @@ pub(crate) fn extract_with(lang: Language, src: &str, honour_skips: bool) -> Opt
 
     let mut ctx = Ctx {
         lang,
+        kinds: Kinds::of(lang),
         src,
         consts: Vec::new(),
         funcs: Vec::new(),
@@ -190,6 +302,9 @@ pub(crate) fn extract_with(lang: Language, src: &str, honour_skips: bool) -> Opt
         test_mod_depth: 0,
         import_depth: 0,
         enum_types: Vec::new(),
+        measuring: Vec::new(),
+        loop_depth: 0,
+        guard_depth: 0,
     };
     visit(tree.root_node(), &mut ctx);
 
@@ -273,8 +388,11 @@ pub(crate) fn extract_with(lang: Language, src: &str, honour_skips: bool) -> Opt
 
 fn visit(node: Node, ctx: &mut Ctx) {
     let kind = node.kind();
+    let id = node.kind_id();
+    let role = ctx.kinds.role(id);
     let lang = ctx.lang;
     let mut pushed = 0usize;
+    let measured = ctx.measuring.len();
 
     // rust unit tests conventionally live in an inline `mod tests`; track it so
     // call sites inside are flagged as test context for `changes`
@@ -287,11 +405,11 @@ fn visit(node: Node, ctx: &mut Ctx) {
     // BDD suites name their tests with a string, not an identifier
     // (`test("charge", () => { ... })`) - the callback is the test body, so it
     // is a test scope whose "name" is that label.
-    let bdd_label = bdd_test_label(node, ctx);
+    let bdd_label = bdd_test_label(node, kind, ctx);
     if test_mod || bdd_label.is_some() {
         ctx.test_mod_depth += 1;
     }
-    let import = lang.import_kinds().contains(&kind);
+    let import = role & IMPORT != 0;
     if import {
         if ctx.import_depth == 0 {
             extract_import(node, ctx);
@@ -322,7 +440,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
     // dispatch below, because several of their node kinds (a Rust `trait_item`,
     // a C++ `class_specifier`, a TS `class_declaration`) are also type scopes
     // and would otherwise be swallowed by that branch
-    if let Some(kind) = lang.type_kinds().iter().find(|(k, _)| *k == kind).map(|(_, v)| *v) {
+    if let Some(kind) = ctx.kinds.type_def(id) {
         if let Some(name) = type_def_name(node, ctx) {
             ctx.types.push(TypeDef {
                 line: pos(node).0,
@@ -333,7 +451,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
     }
     // A test scope is a module the language recognises but not one the project
     // is built out of
-    if lang.module_kinds().contains(&kind) && ctx.test_mod_depth == 0 {
+    if role & MODULE != 0 && ctx.test_mod_depth == 0 {
         // a go `package_clause` has no `name` field; its identifier child is it
         let name = node
             .child_by_field_name("name")
@@ -349,13 +467,15 @@ fn visit(node: Node, ctx: &mut Ctx) {
             }
         }
     }
-    bind_declaration(node, ctx);
+    if role & DECLARATION != 0 {
+        bind_declaration(node, ctx);
+    }
 
-    if let Some((name, recv)) = type_scope(node, ctx) {
+    if let Some((name, recv)) = type_scope(node, kind, ctx) {
         ctx.scope_stack.push(Scope::Type { name, recv });
         pushed += 1;
-    } else if lang.func_kinds().contains(&kind) {
-        if let Some(func) = extract_func(node, ctx) {
+    } else if role & FUNC != 0 {
+        if let Some(mut func) = extract_func(node, ctx) {
             let owner = func_owner(node, ctx);
             let entry = (func.line, func.col, func.ret.clone());
             match &owner {
@@ -369,6 +489,14 @@ fn visit(node: Node, ctx: &mut Ctx) {
                 }
             }
             let name = func.name.clone();
+            // the body is measured on the walk's way through it, in `measure`
+            ctx.measuring.push(Measure {
+                func: ctx.funcs.len(),
+                name: name.clone(),
+                loops_above: ctx.loop_depth,
+                guards_above: ctx.guard_depth,
+                metrics: std::mem::take(&mut func.metrics),
+            });
             ctx.funcs.push(func);
             // go has to be special, methods carry their receiver on the definition rather than
             // nesting inside a type node ugh...
@@ -392,7 +520,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
             ctx.scope_stack.push(Scope::Func(label.clone()));
             pushed += 1;
         }
-    } else if lang.const_kinds().contains(&kind) {
+    } else if role & CONST != 0 {
         // python Enum members live in a class body, which const_eligible
         // rejects - admit them when directly inside an Enum subclass
         let py_enum_member =
@@ -400,7 +528,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
         if const_eligible(ctx) || py_enum_member {
             extract_consts(node, ctx);
         }
-    } else if lang.variant_kinds().contains(&kind) {
+    } else if role & VARIANT != 0 {
         if !ctx.in_function() {
             extract_variant(node, ctx);
         }
@@ -412,7 +540,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
         if !ctx.in_function() {
             extract_odin_enum(node, ctx);
         }
-    } else if lang.call_kinds().contains(&kind) {
+    } else if role & CALL != 0 {
         if let Some(call) = classify_call(node, ctx) {
             ctx.calls.push(call);
         }
@@ -421,11 +549,11 @@ fn visit(node: Node, ctx: &mut Ctx) {
         if let Some(site) = loose_call(node, ctx) {
             ctx.loose_calls.push(site);
         }
-    } else if let Some(&(_, field)) = lang.construct_kinds().iter().find(|(k, _)| *k == kind) {
+    } else if let Some(field) = ctx.kinds.construct(id) {
         if let Some(site) = construct_site(node, field, ctx) {
             ctx.constructs.push(site);
         }
-    } else if lang.comment_kinds().contains(&kind) {
+    } else if role & COMMENT != 0 {
         maybe_note(node, ctx);
         maybe_annotations(node, ctx);
         maybe_skips(node, ctx);
@@ -433,15 +561,22 @@ fn visit(node: Node, ctx: &mut Ctx) {
         // macro bodies (`assert_eq!(charge(1), 31)`) are token trees, not
         // expressions - approximate the calls inside so `changes` sees them
         scan_macro_tokens(node, ctx);
-    } else if lang.use_kinds().contains(&kind) {
+    } else if role & USE != 0 {
         maybe_use(node, ctx);
     }
+
+    // a guard covers the node itself - a loop only what it repeats
+    let guard = role & GUARD != 0;
+    let looped = role & LOOP != 0;
+    ctx.guard_depth += usize::from(guard);
+    measure(node, kind, role, ctx);
+    ctx.loop_depth += usize::from(looped);
 
     // one type-environment frame per scope, so a `let x: T` in an inner block
     // cannot leak its binding out to the enclosing function
     if pushed > 0 {
         ctx.type_env.push(HashMap::new());
-        if lang.func_kinds().contains(&kind) {
+        if role & FUNC != 0 {
             bind_signature(node, ctx);
         }
     }
@@ -452,6 +587,16 @@ fn visit(node: Node, ctx: &mut Ctx) {
     }
     if pushed > 0 {
         ctx.type_env.pop();
+    }
+    ctx.loop_depth -= usize::from(looped);
+    ctx.guard_depth -= usize::from(guard);
+    // the whole body has been walked - its measurements are complete
+    if ctx.measuring.len() > measured {
+        if let Some(mut m) = ctx.measuring.pop() {
+            m.metrics.loops.sort_by_key(|l| l.line);
+            m.metrics.resources.sort_by_key(|r| r.line);
+            ctx.funcs[m.func].metrics = m.metrics;
+        }
     }
     for _ in 0..pushed {
         ctx.scope_stack.pop();
@@ -467,12 +612,12 @@ fn visit(node: Node, ctx: &mut Ctx) {
     }
 }
 
-fn type_scope(node: Node, ctx: &Ctx) -> Option<(String, Option<String>)> {
+fn type_scope(node: Node, kind: &str, ctx: &Ctx) -> Option<(String, Option<String>)> {
     let name_of = |field: &str| {
         node.child_by_field_name(field)
             .map(|n| oneline(text(n, ctx.src)))
     };
-    match (ctx.lang, node.kind()) {
+    match (ctx.lang, kind) {
         (Language::Rust, "impl_item") => Some((name_of("type")?, Some("self".to_string()))),
         (Language::Rust, "trait_item") => Some((name_of("name")?, Some("self".to_string()))),
         (Language::Python, "class_definition") => {
@@ -616,7 +761,12 @@ fn extract_func(node: Node, ctx: &Ctx) -> Option<Func> {
     let (line, col) = pos(name_node);
     let ret = func_return(node, ctx);
     let comment = preceding_comment(node, ctx);
-    let metrics = func_metrics(node, &name, ctx);
+    // the body's outline - what is inside it `measure` counts on the walk's way through
+    let metrics = FuncMetrics {
+        body_lines: node.end_position().row - node.start_position().row + 1,
+        params: count_params(node, ctx),
+        ..FuncMetrics::default()
+    };
     let owner = func_owner(node, ctx).map(|(t, _)| normalize_type(&t));
     let param_types = param_pairs(node, ctx)
         .into_iter()
@@ -782,20 +932,6 @@ fn bind_signature(node: Node, ctx: &mut Ctx) {
 // types are recorded - an inferred `let c = make_client()` stays unknown
 // rather than being guessed at.
 fn bind_declaration(node: Node, ctx: &mut Ctx) {
-    let kind = node.kind();
-    let interesting = matches!(
-        kind,
-        "let_declaration"               // rust
-            | "short_var_declaration"   // go `x := ...`
-            | "var_spec"                // go `var x T`
-            | "const_spec"
-            | "variable_declarator"     // js/ts
-            | "declaration"             // c++
-            | "field_declaration"
-    );
-    if !interesting {
-        return;
-    }
     let src = ctx.src;
     let name_of = |n: Node| oneline(text(n, src));
 
@@ -908,22 +1044,6 @@ fn constructed_type(value: &str) -> Option<String> {
     None
 }
 
-// Measure a function body: size, decision points, loop nesting, and
-// acquire/release calls. One extra walk of the definition's subtree, so a
-// closure nested in a function is counted into that function too - which is
-// what "how big is this body" should mean.
-fn func_metrics(node: Node, own_name: &str, ctx: &Ctx) -> FuncMetrics {
-    let mut m = FuncMetrics {
-        body_lines: node.end_position().row - node.start_position().row + 1,
-        params: count_params(node, ctx),
-        ..FuncMetrics::default()
-    };
-    walk_metrics(node, ctx, own_name, 0, 0, &mut m);
-    m.loops.sort_by_key(|l| l.line);
-    m.resources.sort_by_key(|r| r.line);
-    m
-}
-
 fn count_params(node: Node, ctx: &Ctx) -> usize {
     if ctx.lang == Language::Proto {
         return usize::from(proto_rpc_types(node, ctx).0.is_some());
@@ -957,46 +1077,39 @@ fn param_list<'a>(node: Node<'a>, ctx: &Ctx) -> Option<Node<'a>> {
     None
 }
 
-fn walk_metrics(
-    node: Node,
-    ctx: &Ctx,
-    own_name: &str,
-    loop_depth: usize,
-    guard_depth: usize,
-    m: &mut FuncMetrics,
-) {
-    let lang = ctx.lang;
-    let kind = node.kind();
-    m.nodes += 1;
-
-    let is_loop = lang.loop_kinds().contains(&kind);
-    let depth = if is_loop {
-        let d = loop_depth + 1;
-        m.loops.push(LoopInfo {
-            line: pos(node).0,
-            kind: loop_label(kind),
-            depth: d,
-            trip: literal_trip(node, ctx),
-        });
-        d
-    } else {
-        loop_depth
-    };
-    let guard = guard_depth + usize::from(lang.guard_kinds().contains(&kind));
-
-    if lang.branch_kinds().contains(&kind) {
-        m.branches += 1;
+// count one node toward every enclosing function, nested closures included - depths relative to each
+fn measure(node: Node, kind: &str, role: u16, ctx: &mut Ctx) {
+    if ctx.measuring.is_empty() {
+        return;
     }
-    if let Some(op) = resource_op(node, ctx, guard > 0) {
-        m.resources.push(op);
-    }
-    if lang.call_kinds().contains(&kind) && callee_name(node, ctx).as_deref() == Some(own_name) {
-        m.recursive = true;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_metrics(child, ctx, own_name, depth, guard, m);
+    // what the node is, worked out once however many functions it counts toward
+    let looped = (role & LOOP != 0).then(|| (pos(node).0, loop_label(kind), literal_trip(node, ctx)));
+    let callee = if role & CALL != 0 { callee_name(node, ctx) } else { None };
+    let op = resource_op(node, kind, callee.as_deref(), ctx);
+    let branch = role & BRANCH != 0;
+    let (loops, guards) = (ctx.loop_depth, ctx.guard_depth);
+    for m in &mut ctx.measuring {
+        m.metrics.nodes += 1;
+        if let Some((line, label, trip)) = &looped {
+            m.metrics.loops.push(LoopInfo {
+                line: *line,
+                kind: label.clone(),
+                depth: loops - m.loops_above + 1,
+                trip: *trip,
+            });
+        }
+        if branch {
+            m.metrics.branches += 1;
+        }
+        if let Some(op) = &op {
+            m.metrics.resources.push(ResourceOp {
+                guarded: guards > m.guards_above,
+                ..op.clone()
+            });
+        }
+        if callee.as_deref() == Some(m.name.as_str()) {
+            m.metrics.recursive = true;
+        }
     }
 }
 
@@ -1020,14 +1133,13 @@ pub(crate) fn loop_label(kind: &str) -> String {
     }
 }
 
-// A resource acquire/release call, matched on the callee's rightmost name.
-// C++ `new`/`delete` are operators rather than calls, so they are matched on
-// their own node kinds.
-fn resource_op(node: Node, ctx: &Ctx, guarded: bool) -> Option<ResourceOp> {
+// a resource acquire/release by the callee's rightmost name, or c++ `new`/`delete` by kind - `measure` sets `guarded`
+fn resource_op(node: Node, kind: &str, callee: Option<&str>, ctx: &Ctx) -> Option<ResourceOp> {
     let pairs = ctx.lang.resource_pairs();
-    let line = pos(node).0;
+    let guarded = false;
     if ctx.lang == Language::Cpp {
-        match node.kind() {
+        let line = pos(node).0;
+        match kind {
             "new_expression" => {
                 return Some(ResourceOp {
                     line,
@@ -1049,16 +1161,11 @@ fn resource_op(node: Node, ctx: &Ctx, guarded: bool) -> Option<ResourceOp> {
             _ => {}
         }
     }
-    if !ctx.lang.call_kinds().contains(&node.kind()) {
-        return None;
-    }
-    let name = callee_name(node, ctx)?;
+    let name = callee?;
     for (acq, rel) in pairs {
-        if name == *acq {
-            return Some(ResourceOp { line, name, pair: acq, acquire: true, guarded });
-        }
-        if name == *rel {
-            return Some(ResourceOp { line, name, pair: acq, acquire: false, guarded });
+        if name == *acq || name == *rel {
+            let (line, acquire) = (pos(node).0, name == *acq);
+            return Some(ResourceOp { line, name: name.to_string(), pair: acq, acquire, guarded });
         }
     }
     None
@@ -1161,11 +1268,11 @@ pub(crate) const BDD_REGISTRARS: &[&str] = &[
 // `test("charge", () => { ... })` -> `test("charge")`. These callbacks are the
 // only "test functions" JS/TS suites have - without this they are anonymous and
 // every call inside them is attributed to `<top>`.
-fn bdd_test_label(node: Node, ctx: &Ctx) -> Option<String> {
+fn bdd_test_label(node: Node, kind: &str, ctx: &Ctx) -> Option<String> {
     if !matches!(
         ctx.lang,
         Language::JavaScript | Language::TypeScript | Language::Tsx
-    ) || !matches!(node.kind(), "arrow_function" | "function_expression")
+    ) || !matches!(kind, "arrow_function" | "function_expression")
     {
         return None;
     }
@@ -1773,13 +1880,14 @@ fn maybe_use(node: Node, ctx: &mut Ctx) {
         return;
     }
     if let Some(parent) = node.parent() {
+        let role = ctx.kinds.role(parent.kind_id());
         // the callee of a call is already recorded as a call site
-        let is_callee = ctx.lang.call_kinds().contains(&parent.kind())
+        let is_callee = role & CALL != 0
             && parent
                 .child_by_field_name("function")
                 .is_some_and(|f| f.id() == node.id());
         // nested paths (`a::b::C`) record only at the outermost node
-        if is_callee || ctx.lang.use_kinds().contains(&parent.kind()) {
+        if is_callee || role & USE != 0 {
             return;
         }
     }

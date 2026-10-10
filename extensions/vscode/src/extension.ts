@@ -291,7 +291,6 @@ class Extension implements CommandHost {
     try {
       await session.ensureStarted();
       await vscode.commands.executeCommand('setContext', 'ccc.active', true);
-      this.askRecording(folder);
     } catch (err) {
       this.reportStartFailure(folder, err);
     }
@@ -500,8 +499,8 @@ class Extension implements CommandHost {
     this.secrets.clear();
   }
 
-  // Whether this folder's agent sessions may be recorded - asked once a window,
-  // and only while nobody has answered; the command asks it again on purpose.
+  // Whether this folder's agent sessions may be recorded - asked only when the
+  // Session Recording command is run, never on its own.
   private askRecording(folder: vscode.WorkspaceFolder, again = false): void {
     const key = folder.uri.toString();
     if (!again && this.recordingAsked.has(key)) return;

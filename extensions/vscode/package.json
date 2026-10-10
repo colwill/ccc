@@ -1,8 +1,8 @@
 {
   "name": "run-ccc",
   "displayName": "Code Change Capture (ccc)",
-  "description": "ccc static analyser",
-  "version": "1.7.0",
+  "description": "See what every change touches, watch agents edit on a live map of your code, and replay how a branch was built.",
+  "version": "1.8.0",
   "publisher": "colwill",
   "license": "MIT",
   "icon": "media/ccc.png",
@@ -122,11 +122,6 @@
       {
         "command": "ccc.showOutput",
         "title": "Show Log",
-        "category": "ccc"
-      },
-      {
-        "command": "ccc.openInsights",
-        "title": "Open Insights UI in Browser",
         "category": "ccc"
       },
       {
@@ -291,10 +286,6 @@
           "when": "ccc.active"
         },
         {
-          "command": "ccc.openInsights",
-          "when": "ccc.active"
-        },
-        {
           "command": "ccc.copyTestCommand",
           "when": "ccc.active"
         }
@@ -405,6 +396,33 @@
           "type": "boolean",
           "default": false,
           "description": "Read every `ccc:skip` comment as an ordinary comment (`--ignore-skip`), so the code it marks is mapped, searched and edited like the rest."
+        },
+        "ccc.search.mode": {
+          "type": "string",
+          "enum": ["none", "allow", "block"],
+          "enumDescriptions": [
+            "No rules: the `search` tool may fetch any https URL.",
+            "Only URLs matching an entry in `ccc.search.urls` may be fetched.",
+            "URLs matching an entry in `ccc.search.urls` are refused; everything else may be fetched."
+          ],
+          "default": "none",
+          "markdownDescription": "Which URLs the analyser's `search` MCP tool may reach. Requests are https only, whatever the mode."
+        },
+        "ccc.search.urls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "The URL list `#ccc.search.mode#` applies to. An entry with a scheme is a URL pattern (`https://docs.corp/**`); one without is a host pattern (`*.corp.example`). Matching ignores case."
+        },
+        "ccc.search.endpoints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Search pages the `search` tool sends queries to, with `{query}` where the words go, e.g. `https://wiki.corp/search?q={query}`. Each request still passes `#ccc.search.mode#`."
         },
         "ccc.hints.testTriggers": {
           "type": "boolean",

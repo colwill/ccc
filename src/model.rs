@@ -1,10 +1,11 @@
 //! data model for extracted symbols and a whole-file cache entry.
 
 use crate::languages::Language;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 // module/file-level constant or static binding.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Const {
     pub line: usize, // 1-based
     pub name: String,
@@ -12,14 +13,14 @@ pub struct Const {
 }
 
 // named type definition `struct`/`enum`/`class`/`interface`/`trait`/alias.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeDef {
     pub line: usize,
     pub name: String,
     pub kind: String, // struct | enum | class | interface | trait | alias | union | protocol
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopInfo {
     pub line: usize,
     pub kind: String, // for | while | do | loop | comprehension
@@ -28,7 +29,7 @@ pub struct LoopInfo {
 }
 
 // a call that acquires or releases a resource, for the leak heuristic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ResourceOp {
     pub line: usize,
     pub name: String,
@@ -38,8 +39,31 @@ pub struct ResourceOp {
     pub guarded: bool,
 }
 
+// a stored `ResourceOp` - its pair must name an acquire a language table holds, or the file is parsed afresh
+#[derive(Deserialize)]
+struct StoredOp {
+    line: usize,
+    name: String,
+    pair: String,
+    acquire: bool,
+    guarded: bool,
+}
+
+impl<'de> Deserialize<'de> for ResourceOp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let op = StoredOp::deserialize(d)?;
+        let pair = Language::ALL
+            .iter()
+            .flat_map(|l| l.resource_pairs())
+            .map(|(acquire, _)| *acquire)
+            .find(|acquire| *acquire == op.pair)
+            .ok_or_else(|| serde::de::Error::custom(format!("no language pairs `{}`", op.pair)))?;
+        Ok(ResourceOp { line: op.line, name: op.name, pair, acquire: op.acquire, guarded: op.guarded })
+    }
+}
+
 // structural measurements of one function body.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FuncMetrics {
     pub body_lines: usize,
     pub params: usize,
@@ -80,7 +104,7 @@ impl FuncMetrics {
 }
 
 // function / method definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Func {
     pub line: usize, // 1-based (position of the name token)
     pub col: usize,  // 1-based
@@ -100,7 +124,7 @@ pub struct Func {
 }
 
 // a call site kept in "loose" form: every call in the file, resolved or not.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallSite {
     // nearest enclosing function (`<top>` at file level)
     pub caller: String,
@@ -115,7 +139,7 @@ pub struct CallSite {
 
 // resolved call: `caller` (at `call_line`) invokes a function defined in the
 // same file at (`target_line`, `target_col`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ref {
     pub caller: String,
     pub call_line: usize,
@@ -126,14 +150,14 @@ pub struct Ref {
 }
 
 // A free-form "note" (TODO/FIXME/NOTE/...).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Note {
     pub line: usize,
     pub text: String,
 }
 
 // Which side of a boundary an annotation describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Boundary {
     // this function handles the key: `ccc:serves grpc billing.v1.Charge`
     Serves,
@@ -151,7 +175,7 @@ impl Boundary {
 }
 
 // An author-written hint that a call leaves this process
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Annotation {
     pub line: usize,
     pub boundary: Boundary,
@@ -165,7 +189,7 @@ pub struct Annotation {
 }
 
 // one import/use/include statement, in loose form
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
     pub line: usize,
     pub module: String,

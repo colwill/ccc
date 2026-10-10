@@ -20,14 +20,14 @@ const FOUND_SLOW: std::time::Duration = std::time::Duration::from_secs(600);
 const READ_SITES: usize = 59;
 
 // commands that read the files they name and write none
-const READERS: &[&str] = &[
+pub(crate) const READERS: &[&str] = &[
     "cat", "head", "tail", "sed", "awk", "nl", "less", "more", "bat", "batcat", "view", "grep", "egrep", "fgrep", "rg", "ag",
     "wc", "cut", "sort", "uniq", "diff", "strings", "xxd", "od", "jq",
 ];
 // readers whose first word is a pattern or a script rather than a file
-const PATTERNED: &[&str] = &["sed", "awk", "grep", "egrep", "fgrep", "rg", "ag", "jq"];
+pub(crate) const PATTERNED: &[&str] = &["sed", "awk", "grep", "egrep", "fgrep", "rg", "ag", "jq"];
 // words ahead of a command that only change how it runs
-const WRAPPERS: &[&str] = &["sudo", "env", "time", "command", "nohup", "exec", "nice"];
+pub(crate) const WRAPPERS: &[&str] = &["sudo", "env", "time", "command", "nohup", "exec", "nice"];
 
 // One file an agent read with its own tools.
 #[derive(Debug, Clone, PartialEq)]
@@ -134,7 +134,7 @@ impl Reads {
 }
 
 // claude's transcripts for this project, each session's subagents beside it
-fn transcripts(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn transcripts(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for main in crate::prompts::claude_transcripts(root).0 {
         out.extend(crate::prompts::jsonl_files(&main.with_extension("").join("subagents")));
@@ -224,7 +224,7 @@ fn read_range(input: &Value) -> Option<(usize, usize)> {
 }
 
 // an absolute path as a path inside the project, relative to it
-fn inside(root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn inside(root: &Path, path: &Path) -> Option<String> {
     let mut abs = PathBuf::new();
     for c in path.components() {
         match c {
@@ -278,7 +278,7 @@ fn shell_reads(line: &str, cwd: &Path) -> Vec<(PathBuf, Option<(usize, usize)>)>
 }
 
 // `NAME=value` ahead of a command
-fn assignment(word: &str) -> bool {
+pub(crate) fn assignment(word: &str) -> bool {
     word.split_once('=')
         .is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
@@ -319,11 +319,23 @@ enum Into {
     Fed,
     // written with `>` - no read
     Written,
+    // `>&2`: a stream joined to another, no file at all
+    Joined,
+}
+
+// one simple command: its words, the files a `<` feeds it, the files a `>`
+// writes, and whether a pipe feeds it rather than the files it names
+#[derive(Default)]
+pub(crate) struct Part {
+    pub(crate) words: Vec<String>,
+    pub(crate) fed: Vec<String>,
+    pub(crate) written: Vec<String>,
+    pub(crate) piped: bool,
 }
 
 // a command line on its way to its simple commands
 struct Split {
-    commands: Vec<(Vec<String>, Vec<String>)>,
+    parts: Vec<Part>,
     word: Option<String>,
     into: Into,
 }
@@ -337,19 +349,20 @@ impl Split {
         let Some(w) = self.word.take() else {
             return;
         };
-        let Some((args, fed)) = self.commands.last_mut() else {
+        let Some(part) = self.parts.last_mut() else {
             return;
         };
         match std::mem::replace(&mut self.into, Into::Arg) {
-            Into::Arg => args.push(w),
-            Into::Fed => fed.push(w),
-            Into::Written => {}
+            Into::Arg => part.words.push(w),
+            Into::Fed => part.fed.push(w),
+            Into::Written => part.written.push(w),
+            Into::Joined => {}
         }
     }
 
-    fn command(&mut self) {
+    fn command(&mut self, piped: bool) {
         self.word();
-        self.commands.push(Default::default());
+        self.parts.push(Part { piped, ..Default::default() });
     }
 }
 
@@ -357,7 +370,16 @@ impl Split {
 // off and the words a `<` feeds it apart. A heredoc's body is text, not
 // commands, so the line is read no further than one.
 fn commands(line: &str) -> Vec<(Vec<String>, Vec<String>)> {
-    let mut s = Split { commands: vec![Default::default()], word: None, into: Into::Arg };
+    parts(line)
+        .into_iter()
+        .filter(|p| !p.words.is_empty() || !p.fed.is_empty())
+        .map(|p| (p.words, p.fed))
+        .collect()
+}
+
+// a command line as its simple commands, with what each writes and whether a pipe feeds it
+pub(crate) fn parts(line: &str) -> Vec<Part> {
+    let mut s = Split { parts: vec![Part::default()], word: None, into: Into::Arg };
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -379,10 +401,18 @@ fn commands(line: &str) -> Vec<(Vec<String>, Vec<String>)> {
             }
             '\\' => chars.next().into_iter().filter(|&n| n != '\n').for_each(|n| s.push(n)),
             ' ' | '\t' => s.word(),
-            '\n' | ';' | '|' | '&' | '(' | ')' => s.command(),
+            // `||` runs the next command after this one; `|` and `|&` feed it
+            '|' => {
+                let or = chars.next_if_eq(&'|').is_some();
+                if !or {
+                    chars.next_if_eq(&'&');
+                }
+                s.command(!or);
+            }
+            '\n' | ';' | '&' | '(' | ')' => s.command(false),
             '#' if s.word.is_none() => {
                 chars.by_ref().take_while(|&c| c != '\n').for_each(drop);
-                s.command();
+                s.command(false);
             }
             '<' if chars.peek() == Some(&'<') => break,
             '<' => {
@@ -395,15 +425,18 @@ fn commands(line: &str) -> Vec<(Vec<String>, Vec<String>)> {
                     s.word = None;
                 }
                 s.word();
-                while chars.next_if(|&c| c == '>' || c == '&').is_some() {}
-                s.into = Into::Written;
+                let mut joined = false;
+                while let Some(c) = chars.next_if(|&c| c == '>' || c == '&') {
+                    joined |= c == '&';
+                }
+                s.into = if joined { Into::Joined } else { Into::Written };
             }
             c => s.push(c),
         }
     }
-    s.command();
-    s.commands.retain(|(args, fed)| !args.is_empty() || !fed.is_empty());
-    s.commands
+    s.command(false);
+    s.parts.retain(|p| !p.words.is_empty() || !p.fed.is_empty() || !p.written.is_empty());
+    s.parts
 }
 
 #[cfg(test)]

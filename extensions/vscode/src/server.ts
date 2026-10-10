@@ -126,6 +126,10 @@ export class ServerProcess implements vscode.Disposable {
         ? ['--no-watch']
         : ['--watch-interval', String(this.cfg.server.watchIntervalSec)]),
       ...(this.cfg.server.ignoreSkip ? ['--ignore-skip'] : []),
+      // only when set, so a ccc older than `search` still starts
+      ...(this.cfg.search.mode !== 'none' ? ['--search-mode', this.cfg.search.mode] : []),
+      ...this.cfg.search.urls.flatMap((u) => ['--search-url', u]),
+      ...this.cfg.search.endpoints.flatMap((e) => ['--search-endpoint', e]),
       ...this.cfg.server.extraArgs,
     ];
     this.log.info(`[${this.label}] spawning: ${bin} serve ${args.join(' ')}`);

@@ -160,8 +160,9 @@ function testList(tests: TestLink[]): string[] {
   return out;
 }
 
-// only the weak tie is worth a word - the strong ones are what "covered by" already implies
+// the weak tie and the run-observed one are worth a word - the rest are what "covered by" already implies
 function evidenceNote(evidence: string | undefined): string {
+  if (evidence === 'observed') return ' _(a recorded run saw it execute this)_';
   return evidence === 'name-only' ? ' _(matched on the name alone)_' : '';
 }
 

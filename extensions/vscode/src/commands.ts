@@ -38,16 +38,6 @@ export function registerCommands(host: CommandHost): vscode.Disposable[] {
       host.render();
     }),
 
-    vscode.commands.registerCommand('ccc.openInsights', async () => {
-      const session = host.activeSession();
-      const url = session?.insightsUrl;
-      if (!url) {
-        void vscode.window.showWarningMessage('ccc: the analyser is not running yet.');
-        return;
-      }
-      await vscode.env.openExternal(vscode.Uri.parse(url));
-    }),
-
     vscode.commands.registerCommand('ccc.openLocation', async (arg: unknown) => {
       const target = readLocation(arg);
       const session = host.activeSession();

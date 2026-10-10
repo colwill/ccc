@@ -8,11 +8,13 @@
 //! labelled accordingly; do not present these as proofs.
 
 use crate::contracts::ContractIndex;
-use crate::coverage::{self, CoverageIndex, TestSite};
+use crate::coverage::{self, CoverageIndex, DefId, TestSite};
+use crate::observed::{Observed, Selection};
 use crate::extract::TOP_LEVEL;
 use crate::languages::Language;
 use crate::model::{FileCache, Func, FuncMetrics};
 use crate::changes::{self, ChangesConfig};
+use crate::par;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
@@ -103,6 +105,15 @@ impl<'a> Graph<'a> {
 // file granularity. A call with no evidence, or with evidence for more than
 // one target, produces no edge: an absent edge is better than a wrong one.
 pub(crate) fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex) -> Graph<'a> {
+    build_graph_over(caches, contracts, &coverage::Reach::of(caches))
+}
+
+// `build_graph` through the qualifier and import tables coverage resolves through too
+pub(crate) fn build_graph_over<'a>(
+    caches: &'a [FileCache],
+    contracts: &ContractIndex,
+    reach: &coverage::Reach,
+) -> Graph<'a> {
     let mut nodes = Vec::new();
     // (file, name) -> every node with that name, in definition order. A name
     // is not unique within a file: overloads share one, and so does an
@@ -160,7 +171,7 @@ pub(crate) fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex
     // What a qualifier can name, and what each file imports from where. Built
     // in `coverage` and shared with it, so a qualifier means the same thing to
     // the call graph and to the coverage relation derived beside it.
-    let aliases = coverage::file_aliases(caches);
+    let (aliases, imported) = (&reach.aliases, &reach.imported);
     // (owning type, method) -> nodes, for receiver-typed calls
     let mut by_owner: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (pos, NodeId(fi, ki)) in g.nodes.iter().copied().enumerate() {
@@ -170,7 +181,6 @@ pub(crate) fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex
             by_owner.entry((owner, f.name.as_str())).or_default().push(pos);
         }
     }
-    let imported = coverage::imported_names(caches);
 
     // Which definition of `name` in file `fi` a call on `line` belongs to.
     // With one candidate this is the old behaviour; with several - an overload
@@ -210,9 +220,10 @@ pub(crate) fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex
         }
     }
 
-    // cross-file edges, with evidence
-    for (a, c) in caches.iter().enumerate() {
-        for call in &c.calls {
+    // cross-file edges, with evidence - resolved per file at once, then added in file and call order so counts hold
+    let cross: Vec<Vec<(usize, usize, bool)>> = par::map(caches.len(), |a| {
+        let mut edges = Vec::new();
+        for call in &caches[a].calls {
             let Some(from) = owner_of(a, call.caller.as_str(), call.line) else {
                 continue;
             };
@@ -235,15 +246,14 @@ pub(crate) fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex
             // local's type to know which method it means.
             if let Some(ty) = call.recv_type.as_deref() {
                 if let Some([to]) = by_owner.get(&(ty, call.name.as_str())).map(|v| &v[..]) {
-                    let to = *to;
-                    if to != from && g.out[from].insert(to) {
-                        g.into[to].insert(from);
-                        g.call_sites[to] += 1;
+                    if *to != from {
+                        edges.push((from, *to, true));
                     }
                     continue;
                 }
             }
             let Some(candidates) = candidates else { continue };
+            let imports_name = imported[a].get(call.name.as_str());
             let evidenced: Vec<usize> = candidates
                 .iter()
                 .copied()
@@ -253,17 +263,21 @@ pub(crate) fn build_graph<'a>(caches: &'a [FileCache], contracts: &ContractIndex
                         return false;
                     }
                     let by_qualifier = qual.iter().any(|q| aliases[b].contains(*q));
-                    let by_import = imported[a]
-                        .get(call.name.as_str())
-                        .is_some_and(|s| s.contains(&b));
+                    let by_import = imports_name.is_some_and(|s| s.contains(&b));
                     by_qualifier || by_import
                 })
                 .collect();
             if let [to] = evidenced[..] {
-                g.out[from].insert(to);
-                g.into[to].insert(from);
-                g.call_sites[to] += 1;
+                edges.push((from, to, false));
             }
+        }
+        edges
+    });
+    for (from, to, typed) in cross.into_iter().flatten() {
+        // a typed call counts once per caller, an evidenced one at every site
+        if g.out[from].insert(to) || !typed {
+            g.into[to].insert(from);
+            g.call_sites[to] += 1;
         }
     }
 
@@ -392,17 +406,20 @@ fn flame_node(
 // chain that many callers funnel into is where a change ripples furthest. It is
 // not an execution frequency - nothing is measured at runtime.
 fn deepest_chains(g: &Graph, roots: &[usize]) -> Vec<Value> {
-    let mut chains: Vec<(usize, usize, Vec<usize>)> = Vec::new();
-    for &r in roots {
+    // each root's walk has its own budget and reads the graph alone - all walked at once, kept in root order
+    let mut chains: Vec<(usize, usize, Vec<usize>)> = par::map(roots.len(), |k| {
         let mut best = Vec::new();
         let mut path = Vec::new();
         let mut on_path = BTreeSet::new();
-        longest(g, r, &mut path, &mut on_path, &mut best, &mut 20_000);
-        if best.len() > 1 {
+        longest(g, roots[k], &mut path, &mut on_path, &mut best, &mut 20_000);
+        (best.len() > 1).then(|| {
             let weight = best.iter().map(|&i| g.call_sites[i]).sum();
-            chains.push((best.len(), weight, best));
-        }
-    }
+            (best.len(), weight, best)
+        })
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     chains.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
     chains.truncate(TOP_N);
     chains
@@ -1092,16 +1109,13 @@ fn test_targets(
         sites[sites.len() * 9 / 10].max(3)
     };
 
-    let mut targets: Vec<(usize, bool, Value)> = Vec::new();
-    // `i` indexes several parallel structures and the graph accessors, not just
-    // one slice, so a range loop reads better than zipping them
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..n {
+    // each row reads the graph and coverage alone - all written at once, kept in map order for the ranking
+    let mut targets: Vec<(usize, bool, Value)> = par::map(n, |i| {
         if g.is_test(i) {
-            continue; // do not recommend tests for tests
+            return None; // do not recommend tests for tests
         }
         if g.is_module(i) {
-            continue; // there is no module scope to call from a test
+            return None; // there is no module scope to call from a test
         }
         let f = g.func(i);
         let m = &f.metrics;
@@ -1140,7 +1154,7 @@ fn test_targets(
         // a trivial leaf nobody calls is noise, not a gap - unless the branch
         // just changed it, in which case it is exactly the gap being looked for
         if !pinned && !covered && cx <= 1 && call_outs == 0 && callers == 0 && m.body_lines <= 3 {
-            continue;
+            return None;
         }
 
         let mut why: Vec<Value> = Vec::new();
@@ -1267,7 +1281,7 @@ fn test_targets(
         if m.recursive {
             score += 6;
         }
-        targets.push((
+        Some((
             score,
             pinned,
             json!({
@@ -1299,8 +1313,11 @@ fn test_targets(
                     "recursive": m.recursive,
                 },
             }),
-        ));
-    }
+        ))
+    })
+    .into_iter()
+    .flatten()
+    .collect();
 
     targets.sort_by(|a, b| b.0.cmp(&a.0));
     let total = targets.len();
@@ -1356,15 +1373,20 @@ fn target_id(file: &str, function: &str) -> String {
 // is ranked by complexity so that if the cap does bite, what it keeps is the
 // end of the list anyone came here for.
 fn complexity_table(g: &Graph, ctx: &ServiceCtx) -> Value {
-    let mut rows: Vec<(usize, Value)> = Vec::new();
-    for i in 0..g.nodes.len() {
-        if g.is_module(i) {
-            continue; // a file's top level is a frame, not a function anyone wrote
-        }
-        let f = g.func(i);
-        let cx = f.metrics.complexity();
-        rows.push((
-            cx,
+    // ranked first with a stable sort, so equals keep map order - only the rows the cap keeps are built
+    let mut ranked: Vec<(usize, usize)> = (0..g.nodes.len())
+        // a file's top level is a frame, not a function anyone wrote
+        .filter(|&i| !g.is_module(i))
+        .map(|i| (g.func(i).metrics.complexity(), i))
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    let total = ranked.len();
+    let truncated = total > MAX_COMPLEXITY_ROWS;
+    let rows: Vec<Value> = ranked
+        .into_iter()
+        .take(MAX_COMPLEXITY_ROWS)
+        .map(|(cx, i)| {
+            let f = g.func(i);
             json!({
                 "id": target_id(&g.file(i), &f.name),
                 "function": f.name,
@@ -1384,14 +1406,11 @@ fn complexity_table(g: &Graph, ctx: &ServiceCtx) -> Value {
                 // a test's own complexity is real, but it is not code anyone
                 // ships - the panel defaults to hiding these
                 "test": g.is_test(i),
-            }),
-        ));
-    }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
-    let total = rows.len();
-    let truncated = total > MAX_COMPLEXITY_ROWS;
+            })
+        })
+        .collect();
     json!({
-        "functions": rows.into_iter().take(MAX_COMPLEXITY_ROWS).map(|(_, v)| v).collect::<Vec<_>>(),
+        "functions": rows,
         "total": total,
         "truncated": truncated,
         "note": "`complexity` is cyclomatic-style: one path, plus one per decision point and \
@@ -1416,13 +1435,9 @@ fn arity(params: usize) -> &'static str {
 // The working-tree view: an engineer's uncommitted edit has to count, and CI
 // re-runs this against the committed tree anyway.
 // ccc:skip
-fn change_set(
-    g: &Graph,
-    root: &Path,
-    root_label: &str,
-    base: Option<&str>,
-) -> Result<changes::ChangesReport, String> {
-    let opts = changes::ChangesOptions {
+// what the change set is asked for: the working tree against `base`, with the request behind each change
+fn change_opts(base: Option<&str>) -> changes::ChangesOptions {
+    changes::ChangesOptions {
         // `ccc insights --base` passes one, so a page built on the default
         // branch can diff against a tag instead of against itself
         base: base.map(str::to_string),
@@ -1430,8 +1445,7 @@ fn change_set(
         worktree: true,
         prompts: true,
         deps: false,
-    };
-    changes::changes_with_caches(root, root_label, &opts, g.caches).map_err(|e| format!("{e:#}"))
+    }
 }
 
 // How a runner selects a single test, per language. Emitted so a CI job can
@@ -1722,11 +1736,98 @@ fn test_triggers(report: &changes::ChangesReport, trig: &Triggered, targets: &Va
     })
 }
 
+// What a recorded run saw - the fixtures that executed the change, chosen both
+// ways so a caller takes the safe set or the cheapest cover without asking
+// again. It adds to the static `run` list rather than replacing it: a test
+// written since the recording exists only in the source.
+fn observed_triggers(report: &changes::ChangesReport, caches: &[FileCache], observed: &Observed) -> Value {
+    let by_path: BTreeMap<String, usize> =
+        caches.iter().enumerate().map(|(i, c)| (changes::path_str(&c.rel_path), i)).collect();
+    let mut changed: Vec<(DefId, &str)> = Vec::new();
+    let mut unobserved = Vec::new();
+    // a changed test that a record names is a fixture to rerun whatever else is chosen
+    let mut rerun: BTreeSet<usize> = BTreeSet::new();
+    for c in &report.changed_functions {
+        let Some(&fi) = by_path.get(&c.file) else { continue };
+        let Some(ki) = caches[fi].funcs.iter().position(|f| f.name == c.function && f.start_line == c.lines[0]) else {
+            continue;
+        };
+        rerun.extend(observed.fixture_at(&c.file, &c.function));
+        let is_test = changes::is_test_path(&c.file) || caches[fi].funcs[ki].test_ctx || changes::is_test_fn_name(&c.function);
+        if observed.ran.contains_key(&(fi, ki)) {
+            changed.push(((fi, ki), c.function.as_str()));
+        } else if !is_test {
+            unobserved.push(json!({"file": c.file, "function": c.function, "lines": c.lines}));
+        }
+    }
+    let defs: Vec<DefId> = changed.iter().map(|(d, _)| *d).collect();
+    let chosen = |sel: Selection| -> Value {
+        let picked: Vec<usize> = sel.fixtures.iter().chain(&rerun).copied().collect::<BTreeSet<_>>().into_iter().collect();
+        let mut by_lang: BTreeMap<&str, Vec<TestSite>> = BTreeMap::new();
+        for &f in &picked {
+            let site = observed.fixtures[f].site();
+            by_lang.entry(site.language).or_default().push(site);
+        }
+        let commands: Vec<Value> = by_lang
+            .iter()
+            .filter_map(|(lang, sites)| {
+                let refs: Vec<&TestSite> = sites.iter().collect();
+                run_command(lang, &refs).map(|(command, caveat)| {
+                    json!({"language": lang, "command": command, "selects": sites.len(), "caveat": caveat})
+                })
+            })
+            .collect();
+        let fixtures: Vec<Value> = picked
+            .iter()
+            .map(|&f| {
+                let fx = &observed.fixtures[f];
+                let covers: Vec<&str> =
+                    changed.iter().filter(|(d, _)| observed.ran[d].contains(&f)).map(|(_, name)| *name).take(8).collect();
+                json!({
+                    "fixture": fx.name,
+                    "file": fx.file,
+                    "line": fx.line,
+                    "language": fx.language,
+                    "kind": fx.kind.label(),
+                    "duration_ms": fx.duration_ms,
+                    "cost": fx.cost(),
+                    "runs": fx.runs,
+                    "services": fx.services,
+                    "covers": covers,
+                    // the fixture is itself one of the changed functions
+                    "changed": rerun.contains(&f),
+                })
+            })
+            .collect();
+        json!({"fixtures": fixtures, "cost": observed.cost_of(&picked), "exact": sel.exact, "commands": commands})
+    };
+    json!({
+        "sources": observed.sources,
+        "errors": observed.errors,
+        "records": observed.records,
+        "bad_lines": observed.bad_lines,
+        "fixtures": observed.fixtures.len(),
+        "unmatched_files": observed.unmatched_files.len(),
+        "unmatched": observed.unmatched,
+        "default": "safe",
+        "safe": chosen(observed.safe(&defs)),
+        "minimal": chosen(observed.minimal(&defs)),
+        "observed_functions": defs.len(),
+        // changed functions no recorded fixture ran - the static `run` list is all there is for these
+        "unobserved": unobserved,
+        "note": "Fixtures a recorded run saw execute the changed functions. The static `run` list still \
+                 stands beside it: a test written since the recording exists only in the source.",
+    })
+}
+
 // Analyse `root` from scratch: walk, parse and build the payload
 pub fn analyse(root: &Path, root_label: &str, base: Option<&str>) -> anyhow::Result<Value> {
     let files = crate::scan::collect_files(root)?;
     let caches = crate::scan::build_caches(root, &files);
-    Ok(insights(&caches, root, root_label, &crate::render::now_ts(), base))
+    let report = insights(&caches, root, root_label, &crate::render::now_ts(), base);
+    // a large map takes a while to free, and the caller only wants the report
+    std::thread::spawn(move || drop(caches));
+    Ok(report)
 }
 
 // Build the whole insights payload for a parsed map.
@@ -1740,222 +1841,278 @@ pub fn insights(
 ) -> Value {
     let started = Instant::now();
     let contracts = ContractIndex::for_root(root, caches);
-    let g = build_graph(caches, &contracts);
-    // The coverage relation, built from the same evidence rules as the graph
-    // and shared by every section that reports what a test reaches.
     let project_ids: BTreeSet<String> = changes::manifest_identities(root)
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    let cov = coverage::build(caches, &project_ids, &contracts);
+    let change_opts = change_opts(base);
+    // The graph, the coverage relation and the git half of the change set read
+    // nothing of each other's, so they are built side by side. The coverage
+    // relation follows the same evidence rules as the graph and is shared by
+    // every section that reports what a test reaches.
+    // where a recorded run's records live, when the project names any
+    let sources = ChangesConfig::load(root).map(|c| c.observed).unwrap_or_default();
+    let (g, mut cov, prepared, observed) = std::thread::scope(|s| {
+        let prepared = s.spawn(|| changes::prepare(root, &change_opts));
+        let observed = s.spawn(|| crate::observed::load(root, &sources, caches));
+        // what qualifiers name and what each file imports, built once for the graph and coverage alike
+        let reach = coverage::Reach::of(caches);
+        let (g, cov) = std::thread::scope(|inner| {
+            let cov = inner.spawn(|| coverage::build_over(caches, &project_ids, &contracts, &reach));
+            (build_graph_over(caches, &contracts, &reach), joined(cov))
+        });
+        // the tables are large, and nothing reads them from here on
+        std::thread::spawn(move || drop(reach));
+        (g, cov, joined(prepared), joined(observed))
+    });
+    cov.observe(&observed);
     let ctx = service_ctx(&g, root, &contracts);
     let n = g.nodes.len();
-
-    // The change set is computed once, here, and every consumer refers to this
-    // one copy: the `changes` section below, the trigger list, and the ranked
-    // targets that back it. It used to be recomputed inside `test_triggers`
-    // and restated in its output, which made the same facts arrive twice.
-    let change_set = change_set(&g, root, root_label, base);
-    // The trigger walk runs first: its gap list is exactly the set of target
-    // rows that must survive truncation, since `add` cites them by id alone.
-    let trig = change_set.as_ref().ok().map(|r| triggered(&g, &cov, r));
-    let must_keep: BTreeSet<(String, String)> = trig
-        .as_ref()
-        .map(|t| {
-            t.gaps
-                .iter()
-                .map(|(file, function, _)| (file.clone(), function.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let targets = test_targets(&g, &cov, &ctx, &must_keep);
-    let (changes_section, triggers) = match (&change_set, &trig) {
-        (Ok(r), Some(t)) => (
-            serde_json::to_value(r).unwrap_or(Value::Null),
-            test_triggers(r, t, &targets),
-        ),
-        // no git, no base ref, shallow clone: say why rather than render an
-        // empty tab that reads as "nothing to run"
-        _ => {
-            let reason = change_set.as_ref().err().cloned().unwrap_or_default();
-            let why = json!({
-                "available": false,
-                "reason": reason,
-                "hint": "The change set diffs the branch against its base. In CI, fetch history \
-                         (actions/checkout with fetch-depth: 0); locally, make sure the branch \
-                         has an upstream such as origin/main.",
-            });
-            (why.clone(), why)
-        }
-    };
+    // each file's path as text, written once rather than per sort comparison
+    let paths: Vec<String> = caches.iter().map(|c| changes::path_str(&c.rel_path)).collect();
+    let path = |i: usize| paths[g.node_file(i)].as_str();
 
     // roots: nothing *else* calls them - a self-recursive function with no
     // other caller is still an entry point. Test functions are roots too, but
     // they drown out the application tree, so they are ranked last :)
     let mut roots: Vec<usize> = (0..n).filter(|&i| g.is_root(i)).collect();
-    roots.sort_by_key(|&i| {
+    roots.sort_by_cached_key(|&i| {
         (
             g.is_test(i),
             std::cmp::Reverse(g.out[i].len()),
-            g.file(i),
+            path(i),
             g.func(i).line,
         )
     });
 
-    let mut budget = FLAME_NODES;
-    let (tree, flame_truncated) = flame(&g, &ctx, &roots, &mut budget);
-    let (lint_rows, lints_truncated) = lints(&g);
+    // every section from here on only reads the graph and the maps beside it - each gets a thread of its own
+    std::thread::scope(|s| {
+        let change_part = s.spawn(|| {
+            // The change set is computed once, here, and every consumer refers
+            // to this one copy: the `changes` section below, the trigger list,
+            // and the ranked targets that back it. It used to be recomputed
+            // inside `test_triggers` and restated in its output, which made the
+            // same facts arrive twice.
+            let change_set = prepared
+                .and_then(|p| changes::assemble(root, root_label, &change_opts, caches, p, Some((&contracts, &cov))))
+                .map_err(|e| format!("{e:#}"));
+            // The trigger walk runs first: its gap list is exactly the set of
+            // target rows that must survive truncation, since `add` cites them
+            // by id alone.
+            let trig = change_set.as_ref().ok().map(|r| triggered(&g, &cov, r));
+            let must_keep: BTreeSet<(String, String)> = trig
+                .as_ref()
+                .map(|t| {
+                    t.gaps
+                        .iter()
+                        .map(|(file, function, _)| (file.clone(), function.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let targets = test_targets(&g, &cov, &ctx, &must_keep);
+            let (changes_section, triggers) = match (&change_set, &trig) {
+                (Ok(r), Some(t)) => {
+                    let mut triggers = test_triggers(r, t, &targets);
+                    // only where records were looked for, so a project without them reads as it always has
+                    if observed.configured() {
+                        triggers["observed"] = observed_triggers(r, caches, &observed);
+                    }
+                    (serde_json::to_value(r).unwrap_or(Value::Null), triggers)
+                }
+                // no git, no base ref, shallow clone: say why rather than render
+                // an empty tab that reads as "nothing to run"
+                _ => {
+                    let reason = change_set.as_ref().err().cloned().unwrap_or_default();
+                    let why = json!({
+                        "available": false,
+                        "reason": reason,
+                        "hint": "The change set diffs the branch against its base. In CI, fetch history \
+                                 (actions/checkout with fetch-depth: 0); locally, make sure the branch \
+                                 has an upstream such as origin/main.",
+                    });
+                    (why.clone(), why)
+                }
+            };
+            (changes_section, targets, triggers)
+        });
+        let flames = s.spawn(|| {
+            let mut budget = FLAME_NODES;
+            let (tree, flame_truncated) = flame(&g, &ctx, &roots, &mut budget);
+            // One flame graph per service that declares dependencies in
+            // map.json - those are the services whose call trees are expected
+            // to leave their own boundary. With no `deps` declared, every
+            // service gets one instead, so the view is not empty just because
+            // nobody filled in the config - but not when the grouping
+            // degenerated to one unit per file, where it would just redraw the
+            // same tree once per module.
+            let flame_keys: Vec<String> = if !ctx.relatives.is_empty() {
+                ctx.relatives.keys().cloned().collect()
+            } else if ctx.per_file {
+                Vec::new()
+            } else {
+                ctx.map.keys().cloned().collect()
+            };
+            let mut groups = vec![json!({
+                "service": "(whole map)",
+                "declares": Value::Null,
+                "roots": tree,
+                "truncated": flame_truncated,
+            })];
+            for key in flame_keys.iter().take(MAX_FLAME_GROUPS) {
+                // a service's entry points: called by nobody, or only from
+                // outside it. Those are the frames a caller in another service
+                // actually lands on.
+                let svc_roots: Vec<usize> = (0..n)
+                    .filter(|&i| ctx.of_node(&g, i) == Some(key.as_str()))
+                    .filter(|&i| {
+                        g.into[i]
+                            .iter()
+                            .all(|&c| c == i || ctx.of_node(&g, c) != Some(key.as_str()))
+                    })
+                    .collect();
+                let mut b = FLAME_NODES;
+                let (t, cut) = flame(&g, &ctx, &svc_roots, &mut b);
+                groups.push(json!({
+                    "service": key,
+                    "declares": ctx.relatives.get(key),
+                    "roots": t,
+                    "truncated": cut,
+                }));
+            }
+            (groups, flame_keys.len() > MAX_FLAME_GROUPS)
+        });
+        let lint_part = s.spawn(|| lints(&g));
+        let chains = s.spawn(|| deepest_chains(&g, &roots));
+        let cycle_rows = s.spawn(|| cycles(&g));
+        let service_map = s.spawn(|| services(&g, &ctx));
+        let complexity = s.spawn(|| complexity_table(&g, &ctx));
 
-    // One flame graph per service that declares dependencies in map.json -
-    // those are the services whose call trees are expected to leave their own
-    // boundary. With no `deps` declared, every service gets one instead, so the
-    // view is not empty just because nobody filled in the config.
-    // With `deps` declared, those services are exactly the ones whose call
-    // trees are expected to leave their own boundary. Without them every real
-    // service gets one - but not when the grouping degenerated to one unit per
-    // file, where it would just redraw the same tree once per module.
-    let flame_keys: Vec<String> = if !ctx.relatives.is_empty() {
-        ctx.relatives.keys().cloned().collect()
-    } else if ctx.per_file {
-        Vec::new()
-    } else {
-        ctx.map.keys().cloned().collect()
-    };
-    let mut groups = vec![json!({
-        "service": "(whole map)",
-        "declares": Value::Null,
-        "roots": tree,
-        "truncated": flame_truncated,
-    })];
-    for key in flame_keys.iter().take(MAX_FLAME_GROUPS) {
-        // a service's entry points: called by nobody, or only from outside it.
-        // Those are the frames a caller in another service actually lands on.
-        let svc_roots: Vec<usize> = (0..n)
-            .filter(|&i| ctx.of_node(&g, i) == Some(key.as_str()))
-            .filter(|&i| {
-                g.into[i]
-                    .iter()
-                    .all(|&c| c == i || ctx.of_node(&g, c) != Some(key.as_str()))
-            })
-            .collect();
-        let mut b = FLAME_NODES;
-        let (t, cut) = flame(&g, &ctx, &svc_roots, &mut b);
-        groups.push(json!({
-            "service": key,
-            "declares": ctx.relatives.get(key),
-            "roots": t,
-            "truncated": cut,
-        }));
-    }
-    let groups_truncated = flame_keys.len() > MAX_FLAME_GROUPS;
+        // the rankings, on this thread while the others run
+        let (most_called, widest, most_complex) = {
+            let mut by_callers: Vec<usize> = (0..n).collect();
+            by_callers.sort_by_key(|&i| {
+                (
+                    std::cmp::Reverse(g.into[i].len()),
+                    std::cmp::Reverse(g.call_sites[i]),
+                    path(i),
+                )
+            });
+            let mut by_fanout: Vec<usize> = (0..n).collect();
+            by_fanout.sort_by_key(|&i| (std::cmp::Reverse(g.out[i].len()), path(i)));
+            let mut by_complexity: Vec<usize> = (0..n).collect();
+            by_complexity.sort_by_key(|&i| (std::cmp::Reverse(g.func(i).metrics.complexity()), path(i)));
 
-    let mut by_callers: Vec<usize> = (0..n).collect();
-    by_callers.sort_by_key(|&i| {
-        (
-            std::cmp::Reverse(g.into[i].len()),
-            std::cmp::Reverse(g.call_sites[i]),
-            g.file(i),
-        )
-    });
-    let mut by_fanout: Vec<usize> = (0..n).collect();
-    by_fanout.sort_by_key(|&i| (std::cmp::Reverse(g.out[i].len()), g.file(i)));
-    let mut by_complexity: Vec<usize> = (0..n).collect();
-    by_complexity.sort_by_key(|&i| (std::cmp::Reverse(g.func(i).metrics.complexity()), g.file(i)));
-
-    let row = |i: usize| {
-        let f = g.func(i);
-        json!({
-            "name": f.name,
-            "file": g.file(i),
-            "line": f.line,
-            "callers": g.into[i].len(),
-            "call_sites": g.call_sites[i],
-            "calls": g.out[i].len(),
-            "lines": f.metrics.body_lines,
-            "complexity": f.metrics.complexity(),
-            "loop_depth": f.metrics.max_loop_depth(),
-            "recursive": f.metrics.recursive,
-            "language": g.lang(i).as_str(),
-            "test": g.is_test(i),
-        })
-    };
-    let take = |v: &Vec<usize>, pred: &dyn Fn(usize) -> bool| {
-        v.iter()
-            .copied()
-            .filter(|&i| pred(i))
-            .take(TOP_N)
-            .map(row)
-            .collect::<Vec<_>>()
-    };
-
-    // per-language totals, so the UI can say which rules even apply
-    let mut langs: BTreeMap<&str, (usize, usize, usize, usize)> = BTreeMap::new();
-    for c in caches {
-        let e = langs.entry(c.language.as_str()).or_default();
-        e.0 += 1;
-        e.1 += c.funcs.len();
-        e.2 += c.funcs.iter().map(|f| f.metrics.complexity()).sum::<usize>();
-        e.3 += c.lines;
-    }
-    let total_lines: usize = caches.iter().map(|c| c.lines).sum();
-
-    let edge_count: usize = g.out.iter().map(|s| s.len()).sum();
-    json!({
-        "schema": SCHEMA,
-        "root": root_label,
-        // when the map this was computed from was parsed
-        "generated": generated,
-        // how long this analysis took, measured over the whole build above
-        "took_ns": started.elapsed().as_nanos() as u64,
-        "totals": {
-            "files": caches.len(),
-            // source lines across every mapped file
-            "lines": total_lines,
-            // definitions only - the module frames the graph adds for top-level
-            // code are nodes, but nobody wrote them as functions
-            "functions": caches.iter().map(|c| c.funcs.len()).sum::<usize>(),
-            "edges": edge_count,
-            "roots": roots.len(),
-        },
-        "languages": langs.iter().map(|(name, (files, funcs, cx, lines))| json!({
-            "language": name,
-            "files": files,
-            "funcs": funcs,
-            "lines": lines,
-            "avg_complexity": if *funcs == 0 { 0.0 } else { *cx as f64 / *funcs as f64 },
-        })).collect::<Vec<_>>(),
-        "flame": {
-            // one group per service declaring deps, plus the whole map
-            "groups": groups,
-            "groups_truncated": groups_truncated,
-            "note": "static call tree - `value` counts reachable call sites, not time. \
-                     Recursion is cut where it repeats. A highlighted frame is one the \
-                     call reached by leaving its caller's service.",
-        },
-        "hot": {
+            let row = |i: usize| {
+                let f = g.func(i);
+                json!({
+                    "name": f.name,
+                    "file": g.file(i),
+                    "line": f.line,
+                    "callers": g.into[i].len(),
+                    "call_sites": g.call_sites[i],
+                    "calls": g.out[i].len(),
+                    "lines": f.metrics.body_lines,
+                    "complexity": f.metrics.complexity(),
+                    "loop_depth": f.metrics.max_loop_depth(),
+                    "recursive": f.metrics.recursive,
+                    "language": g.lang(i).as_str(),
+                    "test": g.is_test(i),
+                })
+            };
+            let take = |v: &Vec<usize>, pred: &dyn Fn(usize) -> bool| {
+                v.iter()
+                    .copied()
+                    .filter(|&i| pred(i))
+                    .take(TOP_N)
+                    .map(row)
+                    .collect::<Vec<_>>()
+            };
             // module frames are callers, not functions, so they carry the
             // `most_called` counts without ever being ranked as a row
-            "most_called": take(&by_callers, &|i| !g.into[i].is_empty() && !g.is_module(i)),
-            "widest": take(&by_fanout, &|i| !g.out[i].is_empty() && !g.is_module(i)),
-            "most_complex": take(&by_complexity, &|i| !g.is_test(i) && !g.is_module(i)),
-            "deepest_chains": deepest_chains(&g, &roots),
-            "cycles": cycles(&g),
-            "note": "structural, not measured: ranks by call-graph shape, not execution frequency.",
-        },
-        "services": services(&g, &ctx),
-        "complexity": complexity_table(&g, &ctx),
-        // the one canonical change set; `test_triggers` refers to it
-        "changes": changes_section,
-        "test_targets": targets,
-        "test_triggers": triggers,
-        "lints": {
-            "findings": lint_rows,
-            "truncated": lints_truncated,
-            "rules": rule_catalogue(),
-            "note": "syntax-level heuristics with no type or data-flow information. \
-                     Every finding cites the measurement it came from - verify before acting.",
-        },
+            (
+                take(&by_callers, &|i| !g.into[i].is_empty() && !g.is_module(i)),
+                take(&by_fanout, &|i| !g.out[i].is_empty() && !g.is_module(i)),
+                take(&by_complexity, &|i| !g.is_test(i) && !g.is_module(i)),
+            )
+        };
+
+        // per-language totals, so the UI can say which rules even apply
+        let mut langs: BTreeMap<&str, (usize, usize, usize, usize)> = BTreeMap::new();
+        for c in caches {
+            let e = langs.entry(c.language.as_str()).or_default();
+            e.0 += 1;
+            e.1 += c.funcs.len();
+            e.2 += c.funcs.iter().map(|f| f.metrics.complexity()).sum::<usize>();
+            e.3 += c.lines;
+        }
+        let total_lines: usize = caches.iter().map(|c| c.lines).sum();
+        let edge_count: usize = g.out.iter().map(|s| s.len()).sum();
+
+        let (changes_section, targets, triggers) = joined(change_part);
+        let (groups, groups_truncated) = joined(flames);
+        let (lint_rows, lints_truncated) = joined(lint_part);
+        let (chains, cycle_rows) = (joined(chains), joined(cycle_rows));
+        let (service_map, complexity) = (joined(service_map), joined(complexity));
+        json!({
+            "schema": SCHEMA,
+            "root": root_label,
+            // when the map this was computed from was parsed
+            "generated": generated,
+            // how long this analysis took, measured over the whole build above
+            "took_ns": started.elapsed().as_nanos() as u64,
+            "totals": {
+                "files": caches.len(),
+                // source lines across every mapped file
+                "lines": total_lines,
+                // definitions only - the module frames the graph adds for
+                // top-level code are nodes, but nobody wrote them as functions
+                "functions": caches.iter().map(|c| c.funcs.len()).sum::<usize>(),
+                "edges": edge_count,
+                "roots": roots.len(),
+            },
+            "languages": langs.iter().map(|(name, (files, funcs, cx, lines))| json!({
+                "language": name,
+                "files": files,
+                "funcs": funcs,
+                "lines": lines,
+                "avg_complexity": if *funcs == 0 { 0.0 } else { *cx as f64 / *funcs as f64 },
+            })).collect::<Vec<_>>(),
+            "flame": {
+                // one group per service declaring deps, plus the whole map
+                "groups": groups,
+                "groups_truncated": groups_truncated,
+                "note": "static call tree - `value` counts reachable call sites, not time. \
+                         Recursion is cut where it repeats. A highlighted frame is one the \
+                         call reached by leaving its caller's service.",
+            },
+            "hot": {
+                "most_called": most_called,
+                "widest": widest,
+                "most_complex": most_complex,
+                "deepest_chains": chains,
+                "cycles": cycle_rows,
+                "note": "structural, not measured: ranks by call-graph shape, not execution frequency.",
+            },
+            "services": service_map,
+            "complexity": complexity,
+            // the one canonical change set; `test_triggers` refers to it
+            "changes": changes_section,
+            "test_targets": targets,
+            "test_triggers": triggers,
+            "lints": {
+                "findings": lint_rows,
+                "truncated": lints_truncated,
+                "rules": rule_catalogue(),
+                "note": "syntax-level heuristics with no type or data-flow information. \
+                         Every finding cites the measurement it came from - verify before acting.",
+            },
+        })
     })
+}
+
+// a section's result, or its panic carried on to the caller as if it had run here
+fn joined<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 
 #[cfg(test)]
@@ -2966,6 +3123,83 @@ pub fn helper() -> u64 { 1 }
             assert!(!t["reason"].as_str().unwrap().is_empty(), "{key}");
             assert!(t["hint"].as_str().unwrap().contains("fetch-depth"), "{key}");
         }
+        drop(dir);
+    }
+
+    // A python suite reaches a go function over http, which no call in the
+    // source shows. A recorded run does, and its fixtures are chosen both ways.
+    #[test]
+    fn a_recorded_run_selects_the_fixtures_that_executed_the_change() {
+        let (dir, _) = map(
+            "observed",
+            &[
+                ("svc/fee.go", "package svc\nfunc Fee() int { return 30 }\nfunc Spare() int { return 1 }\n"),
+                ("tests/test_api.py", "def test_refund(client):\n    assert client.post('/refund').ok\n\ndef test_soak(client):\n    assert client.get('/').ok\n"),
+            ],
+        );
+        let d = dir.path();
+        std::fs::create_dir_all(d.join(".ccc/observed")).unwrap();
+        let record = |name: &str, kind: &str, ms: u64| {
+            format!(r#"{{"schema":"ccc-observed/1","fixture":{{"name":"{name}","kind":"{kind}","file":"tests/test_api.py","language":"python"}},"run":"nightly-7","duration_ms":{ms},"files":[{{"path":"svc/fee.go","functions":[{{"name":"Fee"}}]}}]}}"#)
+        };
+        std::fs::write(
+            d.join(".ccc/observed/nightly.jsonl"),
+            [record("test_refund", "integration", 2_000), record("test_soak", "smoke", 90_000)].join("\n"),
+        )
+        .unwrap();
+        run_git(d, &["init", "-q", "-b", "main"]);
+        run_git(d, &["add", "-A"]);
+        run_git(d, &["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                     "commit", "-qm", "base"]);
+        run_git(d, &["checkout", "-q", "-b", "work"]);
+        std::fs::write(d.join("svc/fee.go"), "package svc\nfunc Fee() int { return 45 }\nfunc Spare() int { return 1 }\n").unwrap();
+
+        let files = scan::collect_files(d).unwrap();
+        let caches = scan::build_caches(d, &files);
+        let v = insights(&caches, d, "demo", "ts", None);
+        let o = &v["test_triggers"]["observed"];
+        assert_eq!(o["records"], 2, "{o}");
+        assert_eq!(o["observed_functions"], 1, "{o}");
+
+        let picked = |mode: &str| -> Vec<&str> {
+            o[mode]["fixtures"].as_array().unwrap().iter().map(|f| f["fixture"].as_str().unwrap()).collect()
+        };
+        assert_eq!(picked("safe"), vec!["test_refund", "test_soak"]);
+        // the integration run covers `Fee` for a fraction of the smoke run's cost
+        assert_eq!(picked("minimal"), vec!["test_refund"]);
+        assert_eq!(o["minimal"]["exact"], true);
+        let cmd = o["minimal"]["commands"][0]["command"].as_str().unwrap();
+        assert_eq!(cmd, "pytest -k \"test_refund\"");
+
+        // the change report names the fixtures as what tests `Fee`, strongest evidence first
+        let fee = v["changes"]["changed_functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["function"] == "Fee")
+            .unwrap();
+        assert_eq!(fee["tested"], true);
+        assert_eq!(fee["tested_by_sites"][0]["evidence"], "observed");
+        assert_eq!(fee["tested_by_sites"][0]["test"], "test_refund");
+        // and no gap is reported for a function a run saw executed
+        assert!(v["test_triggers"]["add"].as_array().unwrap().is_empty(), "{}", v["test_triggers"]["add"]);
+        drop(dir);
+    }
+
+    // Without records the payload is exactly what it was before they existed.
+    #[test]
+    fn no_records_means_no_observed_section() {
+        let (dir, _) = map("unobserved", &[("src/a.rs", "pub fn one() -> u64 { 1 }\n")]);
+        let d = dir.path();
+        run_git(d, &["init", "-q", "-b", "main"]);
+        run_git(d, &["add", "-A"]);
+        run_git(d, &["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                     "commit", "-qm", "base"]);
+        let files = scan::collect_files(d).unwrap();
+        let caches = scan::build_caches(d, &files);
+        let v = insights(&caches, d, "demo", "ts", None);
+        assert_eq!(v["test_triggers"]["available"], true);
+        assert!(v["test_triggers"].get("observed").is_none());
         drop(dir);
     }
 

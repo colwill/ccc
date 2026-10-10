@@ -8,6 +8,7 @@ use crate::contracts::ContractIndex;
 use crate::coverage;
 use crate::extract::BDD_REGISTRARS;
 use crate::model::{Boundary, FileCache};
+use crate::par;
 use crate::scan;
 use anyhow::{anyhow, bail, Context, Result};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -60,6 +61,9 @@ pub struct ChangesConfig {
     // `.proto` schemas kept outside the project
     #[serde(default)]
     pub contracts: Vec<String>,
+    // where a recorded run's `ccc-observed/1` records are read from - files, directories or urls
+    #[serde(default)]
+    pub observed: Vec<crate::observed::Source>,
     // what replays may do - pushing one to a remote anyone can read is allowed
     // here, in the repository, where the whole team sees it, or not at all
     #[serde(default)]
@@ -277,8 +281,16 @@ pub struct ChangesReport {
 // Analyze `root` and build the changes report, parsing the tree first.
 pub fn changes(root: &Path, root_label: &str, opts: &ChangesOptions) -> Result<ChangesReport> {
     let files = scan::collect_files(root)?;
-    let caches = scan::build_caches(root, &files);
-    changes_with_caches(root, root_label, opts, &caches)
+    // the git half needs nothing from the map, so it runs while the map is parsed
+    let (caches, prepared) = std::thread::scope(|s| {
+        let prepared = s.spawn(|| prepare(root, opts));
+        let caches = scan::build_caches(root, &files);
+        (caches, prepared.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+    });
+    let report = assemble(root, root_label, opts, &caches, prepared?, None);
+    // a large map takes a while to free, and the caller only wants the report
+    std::thread::spawn(move || drop(caches));
+    report
 }
 
 // Same analysis against an already-parsed map, so a caller that holds one
@@ -289,6 +301,30 @@ pub fn changes_with_caches(
     opts: &ChangesOptions,
     caches: &[FileCache],
 ) -> Result<ChangesReport> {
+    assemble(root, root_label, opts, caches, prepare(root, opts)?, None)
+}
+
+// What a change report needs from git and the disk and nothing from the parsed
+// map - the diff and what it did to dependencies, metrics, secrets and which
+// request made it - so a caller can have it read while the map is parsed.
+pub(crate) struct Prepared {
+    config: ChangesConfig,
+    matchers: Vec<(String, GlobSet)>,
+    service_names: Vec<String>,
+    base_label: String,
+    base_sha: String,
+    head_sha: String,
+    statuses: Vec<(String, String)>,
+    hunks: BTreeMap<String, Vec<(usize, usize)>>,
+    uncommitted: BTreeSet<String>,
+    deps: Option<crate::deps::DepsReport>,
+    telemetry: crate::telemetry::TelemetryReport,
+    secrets: crate::secrets::Report,
+    turns: Vec<crate::prompts::Turn>,
+    attribution: crate::prompts::Attribution,
+}
+
+pub(crate) fn prepare(root: &Path, opts: &ChangesOptions) -> Result<Prepared> {
     let mut config = ChangesConfig::load(root)?;
     for (name, glob) in &opts.service_flags {
         config
@@ -328,11 +364,6 @@ pub fn changes_with_caches(
     }
     let matchers = build_matchers(&config.services)?;
     let service_names: Vec<String> = config.services.keys().cloned().collect();
-    // the rpcs every schema declares, and the code in any language tied to them
-    let schemas = crate::contracts::load_schemas(root, &config.contracts);
-    let contracts = ContractIndex::build(caches, &schemas);
-    let externals = crate::externals::resolve_all(root, &config.externals, &contracts.schemas);
-
     let (base_label, base_sha) = resolve_base(root, opts.base.as_deref())?;
     let head_sha = git(root, &["rev-parse", "HEAD"])?.trim().to_string();
     // With `worktree`, omitting the second ref makes git diff the base against
@@ -378,65 +409,147 @@ pub fn changes_with_caches(
         BTreeSet::new()
     };
 
-    // What the branch did to the dependency tree
-    let deps = opts.deps.then(|| {
-        crate::deps::analyse(
-            root,
-            &crate::deps::DepsOptions {
-                base_sha: &base_sha,
-                head_sha: &head_sha,
-                worktree: opts.worktree,
-                touched: &statuses,
-                offline: false,
-            },
+    // These four share nothing and each waits on git or the disk, so they run
+    // side by side: the slowest sets the pace rather than their sum.
+    let (deps, telemetry, secrets, (turns, attribution)) = std::thread::scope(|s| {
+        // what the branch did to the dependency tree
+        let deps = s.spawn(|| {
+            opts.deps.then(|| {
+                crate::deps::analyse(
+                    root,
+                    &crate::deps::DepsOptions {
+                        base_sha: &base_sha,
+                        head_sha: &head_sha,
+                        worktree: opts.worktree,
+                        touched: &statuses,
+                        offline: false,
+                    },
+                )
+            })
+        });
+        // what the branch did to the metrics the source emits
+        let telemetry = s.spawn(|| {
+            crate::telemetry::analyse(
+                root,
+                &crate::telemetry::TelemetryOptions {
+                    base_sha: &base_sha,
+                    head_sha: &head_sha,
+                    worktree: opts.worktree,
+                },
+            )
+        });
+        // what the branch adds that looks like a credential, while it can still be taken out
+        let secrets = s.spawn(|| crate::secrets::against(root, &base_label, &base_sha, opts.worktree));
+        // which request produced which change
+        let prompts = if opts.prompts {
+            let (turns, _) = crate::prompts::collect(root, &crate::prompts::PromptsOptions::default());
+            let times = write_times(root, &base_sha, &hunks, &uncommitted);
+            let attribution = crate::prompts::attribute(root, &turns, &hunks, &times);
+            (turns, attribution)
+        } else {
+            (Vec::new(), crate::prompts::Attribution::default())
+        };
+        (
+            deps.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            telemetry.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            secrets.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            prompts,
         )
     });
 
-    // What the branch did to the metrics the source emits
-    let telemetry = crate::telemetry::analyse(
-        root,
-        &crate::telemetry::TelemetryOptions {
-            base_sha: &base_sha,
-            head_sha: &head_sha,
-            worktree: opts.worktree,
-        },
-    );
+    Ok(Prepared {
+        config,
+        matchers,
+        service_names,
+        base_label,
+        base_sha,
+        head_sha,
+        statuses,
+        hunks,
+        uncommitted,
+        deps,
+        telemetry,
+        secrets,
+        turns,
+        attribution,
+    })
+}
 
-    // What the branch adds that looks like a credential, while it can still be taken out
-    let secrets = crate::secrets::against(root, &base_label, &base_sha, opts.worktree);
-
-    // Which request produced which change
-    let (turns, attribution) = if opts.prompts {
-        let (turns, _) = crate::prompts::collect(root, &crate::prompts::PromptsOptions::default());
-        let times = write_times(root, &base_sha, &hunks, &uncommitted);
-        let attribution = crate::prompts::attribute(root, &turns, &hunks, &times);
-        (turns, attribution)
-    } else {
-        (Vec::new(), crate::prompts::Attribution::default())
+// The half of a change report that reads the parsed map. `built` hands in a
+// contract index and coverage relation the caller already has, so `insights`
+// does not build them twice.
+pub(crate) fn assemble(
+    root: &Path,
+    root_label: &str,
+    opts: &ChangesOptions,
+    caches: &[FileCache],
+    prepared: Prepared,
+    built: Option<(&ContractIndex, &coverage::CoverageIndex)>,
+) -> Result<ChangesReport> {
+    let _ = opts;
+    let Prepared {
+        config,
+        matchers,
+        service_names,
+        base_label,
+        base_sha,
+        head_sha,
+        statuses,
+        hunks,
+        uncommitted,
+        deps,
+        telemetry,
+        secrets,
+        turns,
+        attribution,
+    } = prepared;
+    // the rpcs every schema declares, and the code in any language tied to them
+    let own_contracts;
+    let contracts = match built {
+        Some((contracts, _)) => contracts,
+        None => {
+            own_contracts = ContractIndex::build(caches, &crate::contracts::load_schemas(root, &config.contracts));
+            &own_contracts
+        }
     };
+    let externals = crate::externals::resolve_all(root, &config.externals, &contracts.schemas);
 
-    let idx = build_indexes(root, caches, &matchers);
-    // Which tests reach which definitions. One relation, shared with
-    // `insights`, so the two reports cannot disagree about what is covered.
     let project_ids: BTreeSet<String> =
         manifest_identities(root).into_iter().map(|(id, _)| id).collect();
-    let cov = coverage::build(caches, &project_ids, &contracts);
-
-    // cross-service edges + per-symbol caller map
-    let (mut edges, mut symbol_callers, mut unresolved_calls) = detect_edges(&idx, &config.relatives);
-    merge_rpc_edges(
-        &mut edges,
-        &mut symbol_callers,
-        &mut unresolved_calls,
-        caches,
-        &matchers,
-        &contracts,
-    );
-
-    // boundary crossings: the calls that leave the process, which the call
-    // graph cannot see - named by an author, or derived from a schema
-    let crossings = detect_crossings(caches, &matchers, &externals, &contracts);
-    merge_crossings(&mut edges, &crossings);
+    // Coverage and the service edges each read the map and not each other, so
+    // they are built side by side.
+    let (own_cov, edges, symbol_callers, unresolved_calls, crossings) = std::thread::scope(|s| {
+        // which tests reach which definitions - one relation, shared with
+        // `insights`, so the two reports cannot disagree about what is covered
+        let own_cov = s.spawn(|| {
+            built.is_none().then(|| {
+                let mut cov = coverage::build(caches, &project_ids, contracts);
+                // what a recorded run saw each test execute, on top of what the source shows
+                cov.observe(&crate::observed::load(root, &config.observed, caches));
+                cov
+            })
+        });
+        // cross-service edges + per-symbol caller map
+        // one service and no relatives leaves nothing to cross into - the case with no `.ccc/map.json`
+        let (mut edges, mut symbol_callers, mut unresolved_calls) =
+            if matchers.len() < 2 && config.relatives.is_empty() {
+                (Vec::new(), BTreeMap::new(), Vec::new())
+            } else {
+                detect_edges(&build_indexes(root, caches, &matchers), &config.relatives)
+            };
+        merge_rpc_edges(&mut edges, &mut symbol_callers, &mut unresolved_calls, caches, &matchers, contracts);
+        // boundary crossings: the calls that leave the process, which the call
+        // graph cannot see - named by an author, or derived from a schema
+        let crossings = detect_crossings(caches, &matchers, &externals, contracts);
+        merge_crossings(&mut edges, &crossings);
+        let own_cov = own_cov.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+        (own_cov, edges, symbol_callers, unresolved_calls, crossings)
+    });
+    let cov = match (built, &own_cov) {
+        (Some((_, cov)), _) => cov,
+        (None, Some(cov)) => cov,
+        (None, None) => unreachable!("built above when none was handed in"),
+    };
 
     // changed files -> services
     let mut changed_files = Vec::new();
@@ -479,7 +592,7 @@ pub fn changes_with_caches(
             // Coverage is looked up by *definition*, not by name: two functions
             // sharing a name - in another module, or another language - are two
             // different things, and only one of them is the one that changed.
-            let covering = cov.covering((fi, ki));
+            let covering = cov.tested_by((fi, ki));
             let tested = is_test_code || cov.is_covered((fi, ki));
             let tested_by: Vec<String> =
                 covering.iter().map(|r| r.site.name.clone()).collect();
@@ -794,15 +907,16 @@ fn build_indexes(
         }
     }
 
-    // pass 2: imports, calls, type references
-    for cache in caches {
+    // pass 2: imports, calls, type references - read only what pass 1 built, so worked out at once per file
+    let per_file = par::map(caches.len(), |i| {
+        let cache = &caches[i];
         let rel = path_str(&cache.rel_path);
         let services = assign(matchers, &rel);
         let typed = cache.language.is_typed();
 
         // which services each imported name could have come from
         let mut wildcard: BTreeSet<String> = BTreeSet::new();
-        let bound = idx.imports.entry(rel.clone()).or_default();
+        let mut bound: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for imp in &cache.imports {
             let mut from: BTreeSet<String> = BTreeSet::new();
             for seg in module_segments(&imp.module) {
@@ -832,13 +946,10 @@ fn build_indexes(
             }
         }
 
-        if !wildcard.is_empty() {
-            idx.wildcard_imports.entry(rel.clone()).or_default().extend(wildcard);
-        }
-
+        let mut calls = Vec::new();
         for c in &cache.calls {
             for s in &services {
-                idx.calls.push(OwnedCall {
+                calls.push(OwnedCall {
                     service: s.clone(),
                     file: rel.clone(),
                     line: c.line,
@@ -852,6 +963,7 @@ fn build_indexes(
 
         // a signature that mentions another service's type depends on it even
         // if it never calls into it
+        let mut type_refs = Vec::new();
         if typed {
             for f in &cache.funcs {
                 let mentioned = f
@@ -862,7 +974,7 @@ fn build_indexes(
                     .chain(f.owner.iter().cloned());
                 for t in mentioned.filter(|t| !t.is_empty()) {
                     for s in &services {
-                        idx.type_refs.push(TypeRef {
+                        type_refs.push(TypeRef {
                             service: s.clone(),
                             file: rel.clone(),
                             line: f.line,
@@ -872,6 +984,15 @@ fn build_indexes(
                 }
             }
         }
+        (rel, bound, wildcard, calls, type_refs)
+    });
+    for (rel, bound, wildcard, calls, type_refs) in per_file {
+        if !wildcard.is_empty() {
+            idx.wildcard_imports.entry(rel.clone()).or_default().extend(wildcard);
+        }
+        idx.imports.entry(rel).or_default().extend(bound);
+        idx.calls.extend(calls);
+        idx.type_refs.extend(type_refs);
     }
     idx
 }
@@ -1156,8 +1277,10 @@ fn detect_edges(
         }
     };
 
-    for call in &idx.calls {
-        match resolve_call(call, idx) {
+    // every call resolved at once from the indexes alone - recorded below in call order, as before
+    let resolved = par::map(idx.calls.len(), |k| resolve_call(&idx.calls[k], idx));
+    for (call, outcome) in idx.calls.iter().zip(resolved) {
+        match outcome {
             Ok((target, via)) => {
                 symbol_callers
                     .entry(call.name.clone())
