@@ -42,6 +42,7 @@ Then tell your agent to use the `ccc` MCP tools. [Advanced.md](Advanced.md#agent
 |---|---|
 | `--ignore-skip` | Treat every `ccc:skip` comment as an ordinary comment, so the code it marks is mapped, searched, measured and edited like the rest. |
 | `--no-parse-cache` | Parse every file again instead of reusing the parse kept from an earlier run. |
+| `--observed SRC` | Also read [observed coverage](#observed-coverage) records from `SRC`: a file, a directory or a URL. Repeatable. |
 | `-h`, `--help` | Show the command's help. |
 | `-V`, `--version` | Print the version (top level only: `ccc --version`). |
 
@@ -116,7 +117,7 @@ Reports what the branch changed at function level and what that means for servic
 It:
 
 - diffs the branch against its base and maps each changed hunk to the function it falls in
-- for each changed function, lists the tests that call it directly and the other services that call it
+- for each changed function, lists the tests that call it directly, the fixtures a [recorded run](#observed-coverage) saw execute it, and the other services that call it
 - lists `services_to_test`: the changed services and every service that calls them, directly or through others, using `.ccc/map.json`, gRPC schemas and matched `ccc:calls`/`ccc:serves` comments
 - lists changed functions no test calls, calls it couldn't resolve, and changed files that belong to no service
 - always includes the dependency delta and newly added secrets
@@ -148,6 +149,7 @@ Runs the whole analysis once and prints it as JSON. The output covers:
 
 - the shape of the call graph: hot paths, the deepest call chains, call cycles
 - `test_triggers`: the tests the branch's changes put at risk, found through the call graph, with a runnable command per language under `test_triggers.commands`
+- `test_triggers.observed`: when the project has [observed coverage](#observed-coverage) records, the fixtures a recorded run saw execute the changed functions, as a safe set and a cheapest one
 - `test_targets`: where a missing test would cost the most, and which kind to write
 - lints
 
@@ -160,6 +162,44 @@ ccc insights [PATH] [--base REF]
 | Option | Default | What it does |
 |---|---|---|
 | `--base REF` | same as `ccc changes` | Ref the test-trigger diff runs against. |
+
+### Observed coverage
+
+The call graph can't see a test that reaches code through another service, a framework or dynamic dispatch. A recorded test run can. Give ccc the records of a run and `changes`, `insights`, the `test_triggers` tool and the VS Code hints use them beside the call graph. A project without records gets the same output as before.
+
+Records are read from all of these:
+
+- `observed` in `.ccc/map.json`: a list of files, directories or URLs. A private URL takes its token from an environment variable: `{"from": "https://ci.example.com/artifacts/observed.jsonl", "auth": "env:CI_TOKEN"}`.
+- `--observed SRC`, repeatable, on any command.
+- `.ccc/observed/`, when neither of the above names anything. Keep it out of git.
+
+A directory is read for its `*.jsonl` and `*.json` files. A URL is fetched at most once every ten minutes.
+
+Each line of a record file is one JSON object, `ccc-observed/1`: one fixture, as one service saw it. Spread over lines here for reading:
+
+```json
+{"schema": "ccc-observed/1",
+ "fixture": {"name": "test_partial_refund", "kind": "contract", "file": "tests/api/test_refunds.py", "language": "python"},
+ "run": "nightly-4812",
+ "service": {"name": "billing", "commit": "3f2a9c1e"},
+ "duration_ms": 1840,
+ "files": [{"path": "internal/billing/fee.go", "functions": [{"name": "(*Server).ApplyFee", "line": 88}]}]}
+```
+
+- `fixture.name` is what the test runner selects it by. `kind` is `unit`, `contract`, `interop`, `integration` or `smoke`.
+- `files[].path` is relative to the repository root. An absolute path is matched by its tail, so a CI checkout's paths work. A relative path the map doesn't hold belongs to another repository, and is counted as unmatched.
+- A function is matched by name, then by owner, then by the nearest line, so a recording keeps matching after the code moves. A probe that sees lines rather than functions can send `"lines": [[start, end], ...]` instead. Those are used only while the file is unchanged since `service.commit`.
+
+With records:
+
+- A function a fixture ran counts as tested. The fixture is listed first among the tests that cover it, with evidence `observed`.
+- `test_triggers.observed` lists the fixtures that ran the branch's changed functions, two ways, each with its own run commands:
+  - `safe`, the default: every fixture that ran a changed function.
+  - `minimal`: the cheapest fixtures that still run each changed function once. A fixture costs its recorded duration, weighted by kind: unit 1, contract 2, interop 3, integration 4, smoke 5. The set is the cheapest possible unless `exact` is `false`.
+- `test_triggers.observed.unobserved` lists the changed functions no fixture ran. The static `run` list is all there is for those.
+- The static `run` list stays as it was. A test written since the recording exists only in the source.
+
+Agents get the same from the `test_triggers` tool. `select: "minimal"` asks for the cheaper set.
 
 ## ccc deps
 
@@ -255,8 +295,8 @@ Reads the agents' transcripts for this project (Claude Code, subagents included)
 | Rule | What it catches | Use instead |
 |---|---|---|
 | `writes-outside-ccc` | Edit/Write tools, `sed -i`, `perl -i`, `>`/`>>`, `tee`, `cp`/`mv`/`rm` or `git apply` on project files | ccc's `edit_*` tools |
-| `shell-exploration` | Read/Grep/Glob, or `cat`, `grep`, `rg`, `find`, `sed -n`, `head`, `ls` on the project | `index`, `find`, `references`, `file` |
-| `web-outside-search` | WebFetch, WebSearch, or `curl`/`wget` to anywhere but this machine | `search` |
+| `shell-exploration` | Grep/Glob, or `grep`, `rg`, `find`, `ls` on the project, or a `cat` of a glob such as `src/*.rs`. Reading a named file, with Read or the shell, doesn't count. | `index`, `find`, `references`, `file` |
+| `web-outside-search` | WebFetch, WebSearch, another MCP server's fetch or browser tool, or `curl`/`wget` to anywhere but this machine | `search` |
 | `blocked-url` | URLs the `search` tool refused | nothing: your rules refuse them |
 
 ```sh

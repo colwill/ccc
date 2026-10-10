@@ -50,7 +50,7 @@ impl Rule {
     pub fn says(self) -> &'static str {
         match self {
             Rule::WritesOutsideCcc => "project files are written only through ccc's edit tools",
-            Rule::ShellExploration => "the project is read and searched only through ccc's tools",
+            Rule::ShellExploration => "the project is searched and listed only through ccc's tools - reading a named file is fine",
             Rule::WebOutsideSearch => "the web is reached only through ccc's `search`",
             Rule::BlockedUrl => "a url the search rules refuse is not to be reached",
         }
@@ -280,8 +280,8 @@ fn classify(tool: &str, input: &Value, cwd: &Path, root: &Path) -> Vec<(Rule, Ve
     match tool {
         "Edit" | "Write" | "MultiEdit" => one(Rule::WritesOutsideCcc, path("file_path")),
         "NotebookEdit" => one(Rule::WritesOutsideCcc, path("notebook_path")),
-        "Read" => one(Rule::ShellExploration, path("file_path")),
-        "NotebookRead" => one(Rule::ShellExploration, path("notebook_path")),
+        // reading a named file is not exploring - searching or listing the tree is
+        "Read" | "NotebookRead" => Vec::new(),
         // a search with no path searches where the agent stands
         "Grep" | "Glob" | "LS" => {
             let at = input["path"].as_str().map_or_else(|| cwd.to_path_buf(), |p| cwd.join(p));
@@ -325,6 +325,8 @@ fn project_path(root: &Path, path: &Path) -> Option<String> {
 const WRITERS: &[&str] = &["tee", "rm", "rmdir", "unlink", "touch", "truncate", "shred"];
 // commands that list or search a tree, the current directory when they name none
 const WALKERS: &[&str] = &["find", "fd", "fdfind", "ls", "tree", "rg", "ag", "du"];
+// readers that search what they read rather than show it
+const SEARCHERS: &[&str] = &["grep", "egrep", "fgrep", "rg", "ag"];
 // commands that reach the network
 const FETCHERS: &[&str] = &["curl", "wget", "http", "https", "xh", "httpie", "aria2c", "lynx", "w3m", "links"];
 // git subcommands that write the working tree
@@ -388,7 +390,11 @@ fn shell(line: &str, cwd: &Path, root: &Path) -> Vec<(Rule, Vec<String>)> {
                     "find" => args.iter().copied().take_while(|a| !a.starts_with('-') && !matches!(*a, "(" | "!")).collect(),
                     _ => plain.iter().copied().filter(|a| !a.bytes().all(|b| b.is_ascii_digit())).skip(pattern).collect(),
                 };
-                let files: Vec<String> = named.iter().copied().chain(part.fed.iter().map(String::as_str)).filter_map(|f| at(f, &cwd)).collect();
+                // showing a named file is a read - searching or listing the tree or showing a glob explores it
+                let explores = SEARCHERS.contains(&n) || WALKERS.contains(&n);
+                let shown = named.iter().copied().filter(|f| explores || f.contains(['*', '?']));
+                let fed = part.fed.iter().map(String::as_str).filter(|_| explores);
+                let files: Vec<String> = shown.chain(fed).filter_map(|f| at(f, &cwd)).collect();
                 if !files.is_empty() {
                     reads.extend(files);
                 } else if named.is_empty() && part.fed.is_empty() && !part.piped && walks(n, &args) {
@@ -554,11 +560,11 @@ mod tests {
     }
 
     #[test]
-    fn exploring_with_the_shell_is_caught_but_filtering_a_pipe_is_not() {
-        for line in ["cat src/main.rs", "sed -n '1,40p' src/main.rs", "grep -rn insights src", "grep -rn insights", "rg foo", "find . -name '*.rs'", "ls docs", "head -20 README.md"] {
+    fn exploring_with_the_shell_is_caught_but_reading_a_file_or_filtering_a_pipe_is_not() {
+        for line in ["grep -rn insights src", "grep -rn insights", "grep -n fn src/main.rs", "rg foo", "find . -name '*.rs'", "ls docs", "cat src/*.rs"] {
             assert_eq!(rule_of(line), vec![Rule::ShellExploration], "{line}");
         }
-        for line in ["cargo test | grep FAILED", "git log | head", "ls /tmp", "cat /etc/hosts", "echo x | wc -l"] {
+        for line in ["cat src/main.rs", "sed -n '1,40p' src/main.rs", "head -20 README.md", "cargo test | grep FAILED", "git log | head", "ls /tmp", "cat /etc/hosts", "echo x | wc -l"] {
             assert!(rule_of(line).is_empty(), "{line}");
         }
     }
@@ -575,7 +581,7 @@ mod tests {
     #[test]
     fn a_cd_moves_where_relative_paths_land() {
         assert!(rule_of("cd /tmp && cat notes.txt").is_empty());
-        assert_eq!(rules("cd src && cat main.rs")[0].1, vec!["src/main.rs"]);
+        assert_eq!(rules("cd src && grep -n fn main.rs")[0].1, vec!["src/main.rs"]);
     }
 
     #[test]
@@ -584,10 +590,11 @@ mod tests {
         let c = |tool: &str, input: Value| classify(tool, &input, cwd, root).into_iter().map(|(r, _)| r).collect::<Vec<_>>();
         assert_eq!(c("Edit", json!({"file_path": "/p/src/x.rs"})), vec![Rule::WritesOutsideCcc]);
         assert!(c("Write", json!({"file_path": "/tmp/scratch.md"})).is_empty());
-        assert_eq!(c("Read", json!({"file_path": "/p/README.md"})), vec![Rule::ShellExploration]);
+        assert!(c("Read", json!({"file_path": "/p/README.md"})).is_empty());
         assert_eq!(c("Grep", json!({"pattern": "x"})), vec![Rule::ShellExploration]);
         assert_eq!(c("WebFetch", json!({"url": "https://example.com"})), vec![Rule::WebOutsideSearch]);
         assert_eq!(c("mcp__fetch__fetch", json!({"url": "https://example.com"})), vec![Rule::WebOutsideSearch]);
+        assert_eq!(c("mcp__playwright__browser_navigate", json!({"url": "https://example.com"})), vec![Rule::WebOutsideSearch]);
         assert!(c("mcp__ccc__find", json!({"query": "x"})).is_empty());
         assert!(c("mcp__ccc__search", json!({"url": "https://example.com"})).is_empty());
     }

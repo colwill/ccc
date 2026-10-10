@@ -14,6 +14,9 @@ to pick the new one up.
     - IF `ccc` tool calls are unable to find a term your are searching for; stop the session and respond with `CCC: unable to find <term> in ccc using calls: [calls]`
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
 - All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, vulnerabilities, deps, security, file, notes, changes, prompts, pr_summary, test_triggers, test_targets, lints, hot, services, search, violations, refresh)
+- The web, internal docs and portals included, goes through `search`: `query` to search the configured endpoints,
+  `url` to fetch one https page. Never WebFetch, WebSearch, another MCP server's fetch or browser tool, or
+  `curl`/`wget` - ccc can't track those, and `violations` reports each one. If `search` refuses a URL, leave it unreached.
 - ccc is the only writer in this project. Every change goes through its edit tools, never through your own
   Edit/Write/MultiEdit/NotebookEdit tools, `sed -i`, or shell redirection:
     - a symbol: take the handle a `find` / `references` answer ends with and pass it to `edit_rename`,

@@ -80,7 +80,7 @@ export interface TestedBySite {
   file: string;
   line: number;
   language: string;
-  // receiver-type | same-file | same-package | import | qualifier | name-only
+  // observed | receiver-type | same-file | same-package | import | qualifier | rpc | name-only
   evidence: string;
 }
 

@@ -61,6 +61,9 @@ pub struct ChangesConfig {
     // `.proto` schemas kept outside the project
     #[serde(default)]
     pub contracts: Vec<String>,
+    // where a recorded run's `ccc-observed/1` records are read from - files, directories or urls
+    #[serde(default)]
+    pub observed: Vec<crate::observed::Source>,
     // what replays may do - pushing one to a remote anyone can read is allowed
     // here, in the repository, where the whole team sees it, or not at all
     #[serde(default)]
@@ -518,7 +521,14 @@ pub(crate) fn assemble(
     let (own_cov, edges, symbol_callers, unresolved_calls, crossings) = std::thread::scope(|s| {
         // which tests reach which definitions - one relation, shared with
         // `insights`, so the two reports cannot disagree about what is covered
-        let own_cov = s.spawn(|| built.is_none().then(|| coverage::build(caches, &project_ids, contracts)));
+        let own_cov = s.spawn(|| {
+            built.is_none().then(|| {
+                let mut cov = coverage::build(caches, &project_ids, contracts);
+                // what a recorded run saw each test execute, on top of what the source shows
+                cov.observe(&crate::observed::load(root, &config.observed, caches));
+                cov
+            })
+        });
         // cross-service edges + per-symbol caller map
         // one service and no relatives leaves nothing to cross into - the case with no `.ccc/map.json`
         let (mut edges, mut symbol_callers, mut unresolved_calls) =
@@ -582,7 +592,7 @@ pub(crate) fn assemble(
             // Coverage is looked up by *definition*, not by name: two functions
             // sharing a name - in another module, or another language - are two
             // different things, and only one of them is the one that changed.
-            let covering = cov.covering((fi, ki));
+            let covering = cov.tested_by((fi, ki));
             let tested = is_test_code || cov.is_covered((fi, ki));
             let tested_by: Vec<String> =
                 covering.iter().map(|r| r.site.name.clone()).collect();

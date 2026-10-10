@@ -33,6 +33,8 @@ const GENERIC_DIRS: &[&str] = &[
 // strongest first, which is the order `tested_by` lists them in.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Evidence {
+    // a recorded run saw the test execute the definition - see `observed`
+    Observed,
     // the receiver's declared type addresses the method exactly
     ReceiverType,
     // the definition is in the file the test calls from
@@ -54,6 +56,7 @@ pub enum Evidence {
 impl Evidence {
     pub fn label(self) -> &'static str {
         match self {
+            Evidence::Observed => "observed",
             Evidence::ReceiverType => "receiver-type",
             Evidence::SameFile => "same-file",
             Evidence::SamePackage => "same-package",
@@ -83,7 +86,7 @@ pub struct TestRef {
 }
 
 // A definition: (index into `caches`, index into that file's `funcs`).
-type DefId = (usize, usize);
+pub(crate) type DefId = (usize, usize);
 
 // what one test call reaches and the evidence that tied it - `None` when it leaves the project
 type Reached = Option<(Vec<DefId>, Evidence)>;
@@ -100,6 +103,8 @@ pub struct CoverageIndex {
     // test calls dropped as leaving the project, reported so the gating is
     // auditable rather than silent
     external_calls: usize,
+    // fixtures a recorded run saw execute each definition - kept apart from `covering` so the call-graph walk stays static
+    observed: BTreeMap<DefId, Vec<TestRef>>,
 }
 
 impl CoverageIndex {
@@ -108,10 +113,31 @@ impl CoverageIndex {
         self.covering.get(&def).map(|v| &v[..]).unwrap_or_default()
     }
 
+    // every test tied to a definition - the fixtures a run saw execute it, then the tests the source shows, capped
+    pub fn tested_by(&self, def: DefId) -> Vec<TestRef> {
+        let seen = self.observed.get(&def).map(|v| &v[..]).unwrap_or_default();
+        let mut refs = seen.to_vec();
+        refs.extend(self.covering(def).iter().filter(|r| !seen.iter().any(|s| s.site == r.site)).cloned());
+        refs.truncate(MAX_TESTED_BY);
+        refs
+    }
+
     // Does any test reference this definition at all? True for a definition
     // reached only from file-level test setup, which names no test.
     pub fn is_covered(&self, def: DefId) -> bool {
-        self.covering.contains_key(&def) || self.touched.contains(&def)
+        self.covering.contains_key(&def) || self.touched.contains(&def) || self.observed.contains_key(&def)
+    }
+
+    // a recorded run's fixtures, each one the strongest evidence there is - it ran the definition
+    pub(crate) fn observe(&mut self, observed: &crate::observed::Observed) {
+        for (&def, fixtures) in &observed.ran {
+            let mut refs: Vec<TestRef> = fixtures
+                .iter()
+                .map(|&f| TestRef { site: observed.fixtures[f].site(), evidence: Evidence::Observed })
+                .collect();
+            refs.sort_by(|x, y| (&x.site.file, &x.site.name).cmp(&(&y.site.file, &y.site.name)));
+            self.observed.insert(def, refs);
+        }
     }
 
     pub fn total_tests(&self) -> usize {
@@ -447,6 +473,7 @@ pub(crate) fn build_over(
         touched,
         total_tests: tests.len(),
         external_calls,
+        observed: BTreeMap::new(),
     }
 }
 

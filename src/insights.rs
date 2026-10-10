@@ -8,7 +8,8 @@
 //! labelled accordingly; do not present these as proofs.
 
 use crate::contracts::ContractIndex;
-use crate::coverage::{self, CoverageIndex, TestSite};
+use crate::coverage::{self, CoverageIndex, DefId, TestSite};
+use crate::observed::{Observed, Selection};
 use crate::extract::TOP_LEVEL;
 use crate::languages::Language;
 use crate::model::{FileCache, Func, FuncMetrics};
@@ -1735,6 +1736,90 @@ fn test_triggers(report: &changes::ChangesReport, trig: &Triggered, targets: &Va
     })
 }
 
+// What a recorded run saw - the fixtures that executed the change, chosen both
+// ways so a caller takes the safe set or the cheapest cover without asking
+// again. It adds to the static `run` list rather than replacing it: a test
+// written since the recording exists only in the source.
+fn observed_triggers(report: &changes::ChangesReport, caches: &[FileCache], observed: &Observed) -> Value {
+    let by_path: BTreeMap<String, usize> =
+        caches.iter().enumerate().map(|(i, c)| (changes::path_str(&c.rel_path), i)).collect();
+    let mut changed: Vec<(DefId, &str)> = Vec::new();
+    let mut unobserved = Vec::new();
+    // a changed test that a record names is a fixture to rerun whatever else is chosen
+    let mut rerun: BTreeSet<usize> = BTreeSet::new();
+    for c in &report.changed_functions {
+        let Some(&fi) = by_path.get(&c.file) else { continue };
+        let Some(ki) = caches[fi].funcs.iter().position(|f| f.name == c.function && f.start_line == c.lines[0]) else {
+            continue;
+        };
+        rerun.extend(observed.fixture_at(&c.file, &c.function));
+        let is_test = changes::is_test_path(&c.file) || caches[fi].funcs[ki].test_ctx || changes::is_test_fn_name(&c.function);
+        if observed.ran.contains_key(&(fi, ki)) {
+            changed.push(((fi, ki), c.function.as_str()));
+        } else if !is_test {
+            unobserved.push(json!({"file": c.file, "function": c.function, "lines": c.lines}));
+        }
+    }
+    let defs: Vec<DefId> = changed.iter().map(|(d, _)| *d).collect();
+    let chosen = |sel: Selection| -> Value {
+        let picked: Vec<usize> = sel.fixtures.iter().chain(&rerun).copied().collect::<BTreeSet<_>>().into_iter().collect();
+        let mut by_lang: BTreeMap<&str, Vec<TestSite>> = BTreeMap::new();
+        for &f in &picked {
+            let site = observed.fixtures[f].site();
+            by_lang.entry(site.language).or_default().push(site);
+        }
+        let commands: Vec<Value> = by_lang
+            .iter()
+            .filter_map(|(lang, sites)| {
+                let refs: Vec<&TestSite> = sites.iter().collect();
+                run_command(lang, &refs).map(|(command, caveat)| {
+                    json!({"language": lang, "command": command, "selects": sites.len(), "caveat": caveat})
+                })
+            })
+            .collect();
+        let fixtures: Vec<Value> = picked
+            .iter()
+            .map(|&f| {
+                let fx = &observed.fixtures[f];
+                let covers: Vec<&str> =
+                    changed.iter().filter(|(d, _)| observed.ran[d].contains(&f)).map(|(_, name)| *name).take(8).collect();
+                json!({
+                    "fixture": fx.name,
+                    "file": fx.file,
+                    "line": fx.line,
+                    "language": fx.language,
+                    "kind": fx.kind.label(),
+                    "duration_ms": fx.duration_ms,
+                    "cost": fx.cost(),
+                    "runs": fx.runs,
+                    "services": fx.services,
+                    "covers": covers,
+                    // the fixture is itself one of the changed functions
+                    "changed": rerun.contains(&f),
+                })
+            })
+            .collect();
+        json!({"fixtures": fixtures, "cost": observed.cost_of(&picked), "exact": sel.exact, "commands": commands})
+    };
+    json!({
+        "sources": observed.sources,
+        "errors": observed.errors,
+        "records": observed.records,
+        "bad_lines": observed.bad_lines,
+        "fixtures": observed.fixtures.len(),
+        "unmatched_files": observed.unmatched_files.len(),
+        "unmatched": observed.unmatched,
+        "default": "safe",
+        "safe": chosen(observed.safe(&defs)),
+        "minimal": chosen(observed.minimal(&defs)),
+        "observed_functions": defs.len(),
+        // changed functions no recorded fixture ran - the static `run` list is all there is for these
+        "unobserved": unobserved,
+        "note": "Fixtures a recorded run saw execute the changed functions. The static `run` list still \
+                 stands beside it: a test written since the recording exists only in the source.",
+    })
+}
+
 // Analyse `root` from scratch: walk, parse and build the payload
 pub fn analyse(root: &Path, root_label: &str, base: Option<&str>) -> anyhow::Result<Value> {
     let files = crate::scan::collect_files(root)?;
@@ -1765,8 +1850,11 @@ pub fn insights(
     // nothing of each other's, so they are built side by side. The coverage
     // relation follows the same evidence rules as the graph and is shared by
     // every section that reports what a test reaches.
-    let (g, cov, prepared) = std::thread::scope(|s| {
+    // where a recorded run's records live, when the project names any
+    let sources = ChangesConfig::load(root).map(|c| c.observed).unwrap_or_default();
+    let (g, mut cov, prepared, observed) = std::thread::scope(|s| {
         let prepared = s.spawn(|| changes::prepare(root, &change_opts));
+        let observed = s.spawn(|| crate::observed::load(root, &sources, caches));
         // what qualifiers name and what each file imports, built once for the graph and coverage alike
         let reach = coverage::Reach::of(caches);
         let (g, cov) = std::thread::scope(|inner| {
@@ -1775,8 +1863,9 @@ pub fn insights(
         });
         // the tables are large, and nothing reads them from here on
         std::thread::spawn(move || drop(reach));
-        (g, cov, joined(prepared))
+        (g, cov, joined(prepared), joined(observed))
     });
+    cov.observe(&observed);
     let ctx = service_ctx(&g, root, &contracts);
     let n = g.nodes.len();
     // each file's path as text, written once rather than per sort comparison
@@ -1822,10 +1911,14 @@ pub fn insights(
                 .unwrap_or_default();
             let targets = test_targets(&g, &cov, &ctx, &must_keep);
             let (changes_section, triggers) = match (&change_set, &trig) {
-                (Ok(r), Some(t)) => (
-                    serde_json::to_value(r).unwrap_or(Value::Null),
-                    test_triggers(r, t, &targets),
-                ),
+                (Ok(r), Some(t)) => {
+                    let mut triggers = test_triggers(r, t, &targets);
+                    // only where records were looked for, so a project without them reads as it always has
+                    if observed.configured() {
+                        triggers["observed"] = observed_triggers(r, caches, &observed);
+                    }
+                    (serde_json::to_value(r).unwrap_or(Value::Null), triggers)
+                }
                 // no git, no base ref, shallow clone: say why rather than render
                 // an empty tab that reads as "nothing to run"
                 _ => {
@@ -3030,6 +3123,83 @@ pub fn helper() -> u64 { 1 }
             assert!(!t["reason"].as_str().unwrap().is_empty(), "{key}");
             assert!(t["hint"].as_str().unwrap().contains("fetch-depth"), "{key}");
         }
+        drop(dir);
+    }
+
+    // A python suite reaches a go function over http, which no call in the
+    // source shows. A recorded run does, and its fixtures are chosen both ways.
+    #[test]
+    fn a_recorded_run_selects_the_fixtures_that_executed_the_change() {
+        let (dir, _) = map(
+            "observed",
+            &[
+                ("svc/fee.go", "package svc\nfunc Fee() int { return 30 }\nfunc Spare() int { return 1 }\n"),
+                ("tests/test_api.py", "def test_refund(client):\n    assert client.post('/refund').ok\n\ndef test_soak(client):\n    assert client.get('/').ok\n"),
+            ],
+        );
+        let d = dir.path();
+        std::fs::create_dir_all(d.join(".ccc/observed")).unwrap();
+        let record = |name: &str, kind: &str, ms: u64| {
+            format!(r#"{{"schema":"ccc-observed/1","fixture":{{"name":"{name}","kind":"{kind}","file":"tests/test_api.py","language":"python"}},"run":"nightly-7","duration_ms":{ms},"files":[{{"path":"svc/fee.go","functions":[{{"name":"Fee"}}]}}]}}"#)
+        };
+        std::fs::write(
+            d.join(".ccc/observed/nightly.jsonl"),
+            [record("test_refund", "integration", 2_000), record("test_soak", "smoke", 90_000)].join("\n"),
+        )
+        .unwrap();
+        run_git(d, &["init", "-q", "-b", "main"]);
+        run_git(d, &["add", "-A"]);
+        run_git(d, &["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                     "commit", "-qm", "base"]);
+        run_git(d, &["checkout", "-q", "-b", "work"]);
+        std::fs::write(d.join("svc/fee.go"), "package svc\nfunc Fee() int { return 45 }\nfunc Spare() int { return 1 }\n").unwrap();
+
+        let files = scan::collect_files(d).unwrap();
+        let caches = scan::build_caches(d, &files);
+        let v = insights(&caches, d, "demo", "ts", None);
+        let o = &v["test_triggers"]["observed"];
+        assert_eq!(o["records"], 2, "{o}");
+        assert_eq!(o["observed_functions"], 1, "{o}");
+
+        let picked = |mode: &str| -> Vec<&str> {
+            o[mode]["fixtures"].as_array().unwrap().iter().map(|f| f["fixture"].as_str().unwrap()).collect()
+        };
+        assert_eq!(picked("safe"), vec!["test_refund", "test_soak"]);
+        // the integration run covers `Fee` for a fraction of the smoke run's cost
+        assert_eq!(picked("minimal"), vec!["test_refund"]);
+        assert_eq!(o["minimal"]["exact"], true);
+        let cmd = o["minimal"]["commands"][0]["command"].as_str().unwrap();
+        assert_eq!(cmd, "pytest -k \"test_refund\"");
+
+        // the change report names the fixtures as what tests `Fee`, strongest evidence first
+        let fee = v["changes"]["changed_functions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["function"] == "Fee")
+            .unwrap();
+        assert_eq!(fee["tested"], true);
+        assert_eq!(fee["tested_by_sites"][0]["evidence"], "observed");
+        assert_eq!(fee["tested_by_sites"][0]["test"], "test_refund");
+        // and no gap is reported for a function a run saw executed
+        assert!(v["test_triggers"]["add"].as_array().unwrap().is_empty(), "{}", v["test_triggers"]["add"]);
+        drop(dir);
+    }
+
+    // Without records the payload is exactly what it was before they existed.
+    #[test]
+    fn no_records_means_no_observed_section() {
+        let (dir, _) = map("unobserved", &[("src/a.rs", "pub fn one() -> u64 { 1 }\n")]);
+        let d = dir.path();
+        run_git(d, &["init", "-q", "-b", "main"]);
+        run_git(d, &["add", "-A"]);
+        run_git(d, &["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+                     "commit", "-qm", "base"]);
+        let files = scan::collect_files(d).unwrap();
+        let caches = scan::build_caches(d, &files);
+        let v = insights(&caches, d, "demo", "ts", None);
+        assert_eq!(v["test_triggers"]["available"], true);
+        assert!(v["test_triggers"].get("observed").is_none());
         drop(dir);
     }
 

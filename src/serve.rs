@@ -2972,8 +2972,7 @@ fn mcp_tools() -> Value {
         ),
         tool("refresh", "RESCANS the tree into memory. `edit_apply` and `edit_revert` already do this before they answer; call it after a change made outside ccc - a branch switch, a person editing - when the next answer cannot wait the three seconds the watcher takes to notice.", json!({}), &[]),
 
-        // analysis tools. All six are views onto one pass, computed once
-        // per (map generation, base), paged.
+        // analysis tools - each pages one pass computed once per map generation and base - pr_summary and a filtered prompts read transcripts instead
         tool(
             "changes",
             "ANSWERS what have I changed on this branch, at function granularity rather than line granularity. Use instead of reading `git diff` by hand when you want to know which functions moved and what they touch. Diffed against a base ref: changed functions with the tests that name them, which services need testing, service edges, and the calls the resolver refused to attribute. Includes uncommitted edits and untracked files by default. This is the change set `test_triggers` refers to.",
@@ -3012,9 +3011,10 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "test_triggers",
-            "CALL BEFORE RUNNING ANY TEST SUITE, and again after editing: it answers which tests your changes actually put at risk, so you run those instead of everything, and which changes no test covers at all. Tests are matched to changed functions through the call graph, so a change deep in the stack still surfaces the tests above it; `distance` is how many call hops away each sits. Returns a runnable command per language.",
+            "CALL BEFORE RUNNING ANY TEST SUITE, and again after editing: it answers which tests your changes actually put at risk, so you run those instead of everything, and which changes no test covers at all. Tests are matched to changed functions through the call graph, so a change deep in the stack still surfaces the tests above it; `distance` is how many call hops away each sits. Returns a runnable command per language. Where the project has records of a test run (`ccc-observed/1`), it also lists the fixtures that run saw execute the change - across services and languages the call graph cannot follow - as the `safe` set (every one of them, the default) or the `minimal` one (the cheapest that still runs each changed function).",
             json!({
                 "base": {"type": "string", "description": "git ref to diff against (default: merge-base with origin/main, main, origin/master or master - first that exists)"},
+                "select": {"type": "string", "enum": ["safe", "minimal"], "description": "which observed fixtures to list: `safe` every one that ran the change (default), `minimal` the cheapest that still runs each changed function"},
                 "limit": {"type": "integer", "description": "triggered tests and gaps per page (default 25, max 500)"},
                 "offset": {"type": "integer", "description": "triggered tests and gaps to skip (default 0)"},
             }),
@@ -3061,10 +3061,10 @@ fn mcp_tools() -> Value {
             &[],
         ),
 
-        // the write tools - the only way this project is changed
+        // the only way to the web - and where agents broke these rules
         tool(
             "search",
-            "USE INSTEAD OF WebFetch, WebSearch, curl or wget for anything on the web - internal docs and portals included. `query` runs a search against the endpoints the user configured (search pages with `{query}` where the words go) and returns each one's results as text, links written `[text](url)`; `url` fetches one https page as text - follow a result's link this way. https only. Every request, redirects included, passes the user's rules: in `allow` mode only listed urls are reachable, in `block` mode listed urls are refused, and with no mode any https url goes. A refusal names the rule that refused it - do not reach the url another way: `violations` reports that to the user. Long pages page: pass `offset` for the rest.",
+            "USE INSTEAD OF WebFetch, WebSearch, a browser or fetch tool from another MCP server, curl or wget for anything on the web - internal docs and portals included. `query` runs a search against the endpoints the user configured (search pages with `{query}` where the words go) and returns each one's results as text, links written `[text](url)`; `url` fetches one https page as text - follow a result's link this way. https only. Every request, redirects included, passes the user's rules: in `allow` mode only listed urls are reachable, in `block` mode listed urls are refused, and with no mode any https url goes. A refusal names the rule that refused it - do not reach the url another way: `violations` reports that to the user. Long pages page: pass `offset` for the rest.",
             json!({
                 "query": {"type": "string", "description": "words to search the configured endpoints for"},
                 "url": {"type": "string", "description": "one https page to fetch as text, instead of a query"},
@@ -3076,7 +3076,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "violations",
-            "ANSWERS whether any agent on this project broke ccc's rules, read from the agents' own transcripts (Claude Code, subagents included): writing project files around ccc's edit tools (Edit/Write, `sed -i`, `>` or `tee`, `cp`/`mv`/`rm`), reading or searching the project with Read/Grep/Glob or the shell (`cat`, `grep`, `rg`, `find`, `sed -n`, `ls`) instead of ccc's tools, reaching the web outside `search` (WebFetch, WebSearch, `curl`, `wget`), and urls `search` refused. Each violation carries its time, session, tool, the command or input, the files or urls it touched, and the ccc tool that does the job instead. Narrow with `rule`, `session` or `since` (days); pages with `offset`.",
+            "ANSWERS whether any agent on this project broke ccc's rules, read from the agents' own transcripts (Claude Code, subagents included): writing project files around ccc's edit tools (Edit/Write, `sed -i`, `>` or `tee`, `cp`/`mv`/`rm`), searching or listing the project with Grep/Glob or the shell (`grep`, `rg`, `find`, `ls`, or a `cat` of a glob) instead of ccc's tools - reading a named file is fine, reaching the web outside `search` (WebFetch, WebSearch, another MCP server's fetch or browser tool, `curl`, `wget`), and urls `search` refused. Each violation carries its time, session, tool, the command or input, the files or urls it touched, and the ccc tool that does the job instead. Narrow with `rule`, `session` or `since` (days); pages with `offset`.",
             json!({
                 "rule": {"type": "string", "enum": ["writes-outside-ccc", "shell-exploration", "web-outside-search", "blocked-url"], "description": "only this rule (optional)"},
                 "session": {"type": "string", "description": "only this session id (optional)"},
@@ -3086,6 +3086,8 @@ fn mcp_tools() -> Value {
             }),
             &[],
         ),
+
+        // the write tools - the only way this project is changed
         tool(
             "edit_rename",
             "CHANGES A NAME EVERYWHERE IT IS THE SAME SYMBOL, in one call instead of a read and an edit per file. Pass the `result` handle a `find` or `references` answer ends with, and `to`. A `references` handle renames that exact name; a `find` handle swaps the matched substring inside each identifier and keeps its case shape (`hello_all` -> `hi_all`, `HelloWorld` -> `HiWorld`). Renaming only the definitions would strand their callers, so each name is followed through every file the map ties to it - definitions, calls, usages, imports, re-exports, and lines the map does not index such as a `ccc:skip` body - provided it has exactly one definition and the lookup was not qualified. Only identifiers change: never a comment, a string, or the module segment of a path. Every same-named identifier it did NOT change is listed with the reason, under a new handle that pulls them in when passed back; comments and strings that spell the name are listed too, and a new name that collides with an existing definition is flagged. Stages a changeset and returns its diff - nothing is written until `edit_apply` (or apply=true).",
@@ -3195,7 +3197,7 @@ fn mcp_tools() -> Value {
 }
 
 // what `--auto` adds to the instructions - agents mark the calls that leave this process, which no parser can follow
-const CROSSINGS: &str = "\n\n4. CROSS-SERVICE CALLS - annotate every one you identify. A call that \
+const CROSSINGS: &str = "\n\n5. CROSS-SERVICE CALLS - annotate every one you identify. A call that \
     leaves this process - an HTTP or gRPC request to another service, a message published to or \
     consumed from a queue or topic, a webhook, a CLI or FFI hop - is invisible to the map until a \
     comment names it. Whenever you read, write or change one, mark each end that is in this project \
@@ -3272,7 +3274,13 @@ fn mcp_initialize(params: &Value, auto: bool) -> Value {
             connects, not every character of it: read the real source before writing code \
             that depends on its exact text. Never write under `.ccc` except map.json and \
             surface.json.\n\n\
-            3. TOOLS. Map: `index` project overview - every file named in path order, \
+            3. THE WEB - `search` is the only way to the web, internal docs and portals \
+            included: `query` searches the endpoints the user configured, `url` fetches one \
+            https page. Do not use WebFetch, WebSearch, another server's fetch or browser \
+            tool, `curl` or `wget` - ccc cannot see those calls, and `violations` reports \
+            each one to the user. A url `search` refuses is refused by the user's rules: \
+            never reach it another way.\n\n\
+            4. TOOLS. Map: `index` project overview - every file named in path order, \
             never collapsed into directory summaries, most projects whole; past ~1000 \
             lines the rest waits behind `offset`, and `path` narrows to a subtree. \
             `find` symbols by \
@@ -3295,7 +3303,7 @@ fn mcp_initialize(params: &Value, auto: bool) -> Value {
             what entered it, what left, what moved version and which advisories that introduced. \
             `security` syntax-level security findings in this \
             project's own code - secrets, disabled TLS, injection surfaces. `search` \
-            is the only way to the web, internal docs included, and `violations` \
+            is the only way to the web, internal portals included, and `violations` \
             reports where agents broke these rules. Edits: \
             `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` and `edit_text` \
             stage a changeset, `edit_apply` writes it, `edit_discard` drops it, \
@@ -4305,7 +4313,76 @@ fn md_changes(v: &Value, page: Page) -> String {
     out
 }
 
-fn md_triggers(v: &Value, targets: &Value, page: Page) -> String {
+// A name filter selecting 80 tests runs to kilobytes, and pasting it is
+// worse than running the suite. Never truncate it - a half-copied command
+// silently selects the wrong tests - so past the budget, describe it and
+// point at where in /insights.json it is served whole.
+fn md_commands(cmds: &[Value], whole_at: &str) -> String {
+    const MAX_COMMAND: usize = 1200;
+    cmds.iter()
+        .map(|x| {
+            let cmd = jstr(x, "command");
+            if cmd.len() > MAX_COMMAND {
+                format!(
+                    "({}: a filter naming {} tests, {} chars - omitted)\n  \
+                     Run the whole suite instead; the exact command is in /insights.json \
+                     under {whole_at}.\n",
+                    jstr(x, "language"),
+                    jnum(x, "selects"),
+                    cmd.len(),
+                )
+            } else {
+                format!(
+                    "$ {cmd}\n  ({}, selects {}) {}\n",
+                    jstr(x, "language"),
+                    jnum(x, "selects"),
+                    jstr(x, "caveat")
+                )
+            }
+        })
+        .collect()
+}
+
+// what a recorded run saw execute the change, in the selection asked for - safe unless `minimal`
+fn md_observed(v: &Value, select: Option<&str>) -> Option<(String, String)> {
+    let o = v.get("observed")?;
+    let mode = if select == Some("minimal") { "minimal" } else { "safe" };
+    let sel = &o[mode];
+    let fixtures = jarr(sel, "fixtures");
+    let mut body = format!(
+        "{} fixture(s), cost {} - a recorded run saw {} of {} changed function(s) execute, from {} record(s) in {} source(s){}\n",
+        fixtures.len(),
+        jnum(sel, "cost"),
+        jnum(o, "observed_functions"),
+        jnum(&v["counts"], "changed_functions"),
+        jnum(o, "records"),
+        jarr(o, "sources").len(),
+        if mode == "minimal" && !jbool(sel, "exact") { " - found greedily, so not proven the cheapest" } else { "" },
+    );
+    body.push_str(&md_commands(&jarr(sel, "commands"), &format!("test_triggers.observed.{mode}.commands")));
+    for f in &fixtures {
+        let covers: Vec<String> = jarr(f, "covers").iter().filter_map(|c| c.as_str().map(str::to_string)).collect();
+        let place = if jstr(f, "file").is_empty() { "(outside this repo)".to_string() } else { at(f) };
+        body.push_str(&format!(
+            "[{}] {} {} - ran {}{}\n",
+            jstr(f, "kind"),
+            place,
+            jstr(f, "fixture"),
+            if covers.is_empty() { "nothing that changed".to_string() } else { covers.join(", ") },
+            if jbool(f, "changed") { " - and changed itself" } else { "" },
+        ));
+    }
+    let unobserved = jarr(o, "unobserved").len();
+    if unobserved > 0 {
+        body.push_str(&format!("{unobserved} changed function(s) no recorded fixture ran - the run list above is all there is for them\n"));
+    }
+    for e in jarr(o, "errors") {
+        body.push_str(&format!("! {}\n", e.as_str().unwrap_or_default()));
+    }
+    Some((format!("observed - {mode}"), body))
+}
+
+fn md_triggers(v: &Value, targets: &Value, select: Option<&str>, page: Page) -> String {
     if let Some(why) = md_unavailable("test triggers", v) {
         return why;
     }
@@ -4327,35 +4404,7 @@ fn md_triggers(v: &Value, targets: &Value, page: Page) -> String {
         );
     }
 
-    // A name filter selecting 80 tests runs to kilobytes, and pasting it is
-    // worse than running the suite. Never truncate it - a half-copied command
-    // silently selects the wrong tests - so past the budget, describe it and
-    // point at the endpoint that serves it whole.
-    const MAX_COMMAND: usize = 1200;
-    let cmds: String = jarr(v, "commands")
-        .iter()
-        .map(|x| {
-            let cmd = jstr(x, "command");
-            if cmd.len() > MAX_COMMAND {
-                format!(
-                    "({}: a filter naming {} tests, {} chars - omitted)\n  \
-                     Run the whole suite instead; the exact command is in /insights.json \
-                     under test_triggers.commands.\n",
-                    jstr(x, "language"),
-                    jnum(x, "selects"),
-                    cmd.len(),
-                )
-            } else {
-                format!(
-                    "$ {cmd}\n  ({}, selects {}) {}\n",
-                    jstr(x, "language"),
-                    jnum(x, "selects"),
-                    jstr(x, "caveat")
-                )
-            }
-        })
-        .collect();
-    md_section(&mut out, "commands", &cmds);
+    md_section(&mut out, "commands", &md_commands(&jarr(v, "commands"), "test_triggers.commands"));
 
     let run = jarr(v, "run");
     let (window, note) = page.apply(&run);
@@ -4377,6 +4426,9 @@ fn md_triggers(v: &Value, targets: &Value, page: Page) -> String {
         })
         .collect();
     md_section(&mut out, &format!("run {note}"), &body);
+    if let Some((title, body)) = md_observed(v, select) {
+        md_section(&mut out, &title, &body);
+    }
 
     // Each gap is a `target` id into `test_targets`; the recommendation lives
     // there and is looked up rather than restated.
@@ -4955,14 +5007,13 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Res
                 }
             }
         }
-        "test_triggers" => {
-            let a = map.analysis(arg("base").as_deref());
-            Ok(md_triggers(
-                &a["test_triggers"],
-                &a["test_targets"],
-                Page::from(&args, 25),
-            ))
-        }
+        "test_triggers" => match arg("select").as_deref() {
+            Some(s) if !matches!(s, "safe" | "minimal") => Err(format!("select wants `safe` or `minimal`, got '{s}'")),
+            select => {
+                let a = map.analysis(arg("base").as_deref());
+                Ok(md_triggers(&a["test_triggers"], &a["test_targets"], select, Page::from(&args, 25)))
+            }
+        },
         "test_targets" => {
             let a = map.analysis(None);
             Ok(md_targets(
@@ -7430,6 +7481,39 @@ mod tests {
         assert_eq!(route(&state, "GET", "/vis/code?file=ghost.rs", b"").status, 404);
         assert_eq!(route(&state, "GET", "/vis/flow?file=lib%2Fmoney.rs", b"").status, 400);
         assert_eq!(route(&state, "GET", "/vis/flow?file=lib%2Fmoney.rs&line=9999", b"").status, 404);
+    }
+
+    // the observed section shows the selection asked for, and says when a cover was only found greedily
+    #[test]
+    fn test_triggers_render_the_observed_selection_asked_for() {
+        let fixture = |name: &str| {
+            json!({"fixture": name, "file": "tests/test_api.py", "line": 3, "kind": "integration", "covers": ["Fee"], "changed": false})
+        };
+        let v = json!({
+            "available": true,
+            "counts": {"changed_functions": 2},
+            "observed": {
+                "records": 4,
+                "sources": [".ccc/observed"],
+                "observed_functions": 1,
+                "safe": {"fixtures": [fixture("test_refund"), fixture("test_soak")], "cost": 458000, "exact": true,
+                         "commands": [{"language": "python", "command": "pytest -k \"test_refund or test_soak\"", "selects": 2, "caveat": ""}]},
+                "minimal": {"fixtures": [fixture("test_refund")], "cost": 8000, "exact": false, "commands": []},
+                "unobserved": [{"file": "svc/a.go", "function": "Spare"}],
+                "errors": [],
+            },
+        });
+        let page = Page::from(&json!({}), 25);
+        let safe = md_triggers(&v, &json!({}), None, page);
+        assert!(safe.contains("## observed - safe") && safe.contains("test_soak"), "{safe}");
+        assert!(safe.contains("$ pytest -k \"test_refund or test_soak\""), "{safe}");
+        assert!(safe.contains("1 changed function(s) no recorded fixture ran"), "{safe}");
+        let minimal = md_triggers(&v, &json!({}), Some("minimal"), page);
+        assert!(minimal.contains("## observed - minimal") && !minimal.contains("test_soak"), "{minimal}");
+        assert!(minimal.contains("found greedily"), "{minimal}");
+        // a report without records has no observed section at all
+        let plain = md_triggers(&json!({"available": true}), &json!({}), None, page);
+        assert!(!plain.contains("observed"), "{plain}");
     }
 
     // Call every analysis tool the way an agent would, and check the two

@@ -20,6 +20,9 @@ struct Cli {
     // parse every file afresh rather than reading back an earlier run's parse - `CCC_CACHE_DIR` moves them
     #[arg(long, global = true)]
     no_parse_cache: bool,
+    // read `ccc-observed/1` records from here too - a file, a directory or a url, repeatable
+    #[arg(long, global = true, value_name = "SRC")]
+    observed: Vec<String>,
 }
 
 const CACHE_DIR: &str = ".ccc";
@@ -445,6 +448,7 @@ fn run() -> Result<ExitCode> {
     if !cli.no_parse_cache {
         codecache::parse_cache::enable();
     }
+    codecache::observed::add_sources(cli.observed.clone());
     match cli.command {
         Command::Scan {
             path,

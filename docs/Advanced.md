@@ -133,7 +133,7 @@ The extension's own page, [`extensions/vscode/README.md`](../extensions/vscode/R
 
 **How the hints are worked out.** The analysis is static. Knowing what it did and didn't establish is the difference between a useful hint and a misleading one.
 
-- **Coverage comes from the call graph, not from running anything.** A test is linked to a change because the graph connects them. A test that reaches code through dynamic dispatch, a table of function pointers or a framework is invisible, so `✗ no test` means "nothing reaches it", not "nothing runs it".
+- **Coverage comes from the call graph, unless a recorded run says more.** A test is linked to a change because the graph connects them. A test that reaches code through dynamic dispatch, a table of function pointers or a framework is invisible to the graph, so without records `✗ no test` means "nothing reaches it", not "nothing runs it". [Observed coverage](CLI.md#observed-coverage) records close that gap: a function a recorded fixture ran counts as tested, and its hover says the run saw it.
 - **A call is tied to a definition only with evidence:** the receiver's declared type, the same file, the same package, an import, or a qualifier naming the defining file. Where that evidence fits more than one definition, nothing is claimed, and a Rust test can never mark a TypeScript function covered. In untyped languages, a bare call to a name defined exactly once still counts, and its hover says it was matched on the name alone. `ccc.hints.minEvidence: evidence` (the default) hides those.
 - **Cross-service hints depend on `.ccc/map.json`.** With a `services` block, a hint sits on the exact call line. Without one, ccc groups by top-level directory and labels the result a module. In a flat project, `ccc.hints.crossServiceMode: auto` hides these hints rather than calling every import a service call. A declared edge with no call site is normal: that's what an HTTP, RPC or queue dependency looks like to static analysis.
 - **"Hot" means central to the call graph, not measured.** Only the top 25 of each ranking are marked, so a function without a flame isn't necessarily cold.
@@ -181,7 +181,8 @@ This repo has a Code Change Capture (ccc) map, served over MCP. Use it as the en
 - no bash, grep or sed usage for exploring the project
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
 - All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, vulnerabilities, deps, security, file, notes, changes, prompts, pr_summary, test_triggers, test_targets, lints, hot, services, search, violations, refresh)
-- ccc is the only writer: make every change through its edit tools - `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` or `edit_text`, then `edit_apply` - never your own Edit/Write tools, `sed -i` or shell redirection.
+- The web, internal docs and portals included, goes through `search`: `query` to search the configured endpoints, `url` to fetch one https page. Never WebFetch, WebSearch, another MCP server's fetch or browser tool, or `curl`/`wget` - ccc can't track those, and `violations` reports each one. If `search` refuses a URL, leave it unreached.
+- ccc is the only writer: make every change through its edit tools - `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` or `edit_text`, then `edit_apply` - never your own Edit/Write tools, `sed -i` or shell redirection. `edit_discard` drops a staged changeset and `edit_revert` undoes an applied one.
 - `edit_apply` rescans the map before it answers; call `refresh` only after a change made outside ccc.
 ```
 

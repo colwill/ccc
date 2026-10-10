@@ -13,6 +13,7 @@ pub mod instance;
 pub mod languages;
 pub mod model;
 pub mod naming;
+pub mod observed;
 mod par;
 pub mod parse_cache;
 pub mod pr_summary;

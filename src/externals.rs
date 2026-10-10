@@ -331,6 +331,11 @@ fn load_surface(root: &Path, location: &str, auth: Option<&str>) -> Result<Surfa
 // fetch over HTTP by shelling out to curl.
 // im not adding a http/tls client just for a few requests
 fn fetch(url: &str, auth: Option<&str>) -> Result<String> {
+    fetch_limited(url, auth, MAX_SURFACE_BYTES)
+}
+
+// `fetch` with a size of its own - observed records run far larger than a surface
+pub(crate) fn fetch_limited(url: &str, auth: Option<&str>, max_bytes: u64) -> Result<String> {
     let token = match auth {
         Some(spec) => Some(read_auth(spec)?),
         None => None,
@@ -344,7 +349,7 @@ fn fetch(url: &str, auth: Option<&str>) -> Result<String> {
         "--max-time",
         &FETCH_TIMEOUT_SECS.to_string(),
         "--max-filesize",
-        &MAX_SURFACE_BYTES.to_string(),
+        &max_bytes.to_string(),
     ]);
     if let Some(token) = &token {
         // via a header argument rather than the URL, so the token cannot end
