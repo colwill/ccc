@@ -260,9 +260,11 @@ pub(crate) fn claude_slug(root: &Path) -> String {
 // The slug is only a hint - this is the fact
 // ccc:skip
 fn transcript_cwd(path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(path).ok()?;
-    for line in raw.lines().take(50) {
-        let v: Value = serde_json::from_str(line).ok()?;
+    use std::io::BufRead;
+    // the cwd is in the first records, and a transcript can run to hundreds of megabytes
+    let file = fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines().take(50) {
+        let v: Value = serde_json::from_str(&line.ok()?).ok()?;
         if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
             return Some(cwd.to_string());
         }

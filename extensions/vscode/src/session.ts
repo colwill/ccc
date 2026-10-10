@@ -269,11 +269,6 @@ export class WorkspaceSession implements vscode.Disposable {
     return this.client.references(symbol);
   }
 
-  get insightsUrl(): string | undefined {
-    const address = this.server.address;
-    return address ? `${address.base}/insights` : undefined;
-  }
-
   get visualiserUrl(): string | undefined {
     const address = this.server.address;
     return address ? `${address.base}/vis` : undefined;

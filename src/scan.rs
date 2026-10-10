@@ -2,7 +2,7 @@
 
 use crate::languages::Language;
 use crate::model::{Counts, FileCache};
-use crate::{extract, naming, render};
+use crate::{extract, naming, parse_cache, render};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -147,6 +147,9 @@ const PARSE_STACK_BYTES: usize = 8 << 20;
 // next file off a shared counter so one large file never stalls a whole batch
 fn parse_all(root: &Path, files: &[PathBuf]) -> Vec<FileCache> {
     let workers = thread::available_parallelism().map_or(1, |n| n.get()).min(files.len());
+    // the largest first, so the file that takes longest starts at once rather than finishing last
+    let mut files: Vec<&PathBuf> = files.iter().collect();
+    files.sort_by_cached_key(|f| std::cmp::Reverse(fs::metadata(f).map_or(0, |m| m.len())));
     let next = AtomicUsize::new(0);
     let drain = || {
         let mut out = Vec::new();
@@ -201,7 +204,11 @@ fn build_one(root: &Path, path: &Path) -> Option<FileCache> {
 // written yet; none for a file in no language ccc reads, or one that will not parse
 pub fn read_one(rel: &Path, src: &str) -> Option<FileCache> {
     let lang = Language::from_path(rel)?;
-    let ex = extract::extract(lang, src)?;
+    // read back when an earlier run already parsed this exact text
+    let ex = match parse_cache::active() {
+        Some(kept) => kept.extract(lang, src)?,
+        None => extract::extract(lang, src)?,
+    };
     let rel = rel.to_path_buf();
     Some(FileCache {
         cache_name: naming::cache_name(&rel),

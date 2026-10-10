@@ -798,8 +798,7 @@ pub fn markdown(r: &DepsReport, base: &str) -> String {
     }
     if !r.changed {
         out.push_str(
-            "\nno manifest or lockfile changed on this branch, so nothing entered, left or moved \
-             version. What the project depends on right now is `vulnerabilities`, not this.\n",
+            "\nno manifest or lockfile changed on this branch.\n",
         );
         return out;
     }

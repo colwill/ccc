@@ -402,16 +402,22 @@ fn positional(lang: Language) -> Option<(usize, usize)> {
 
 pub fn analyse(root: &Path, opts: &TelemetryOptions) -> TelemetryReport {
     let prefix = git_prefix(root);
-    let base = match collect(root, Side::Commit(opts.base_sha), &prefix) {
-        Ok(m) => m,
-        Err(e) => return TelemetryReport::empty(opts.base_sha, opts.head_sha, Some(e)),
-    };
     let head_side = if opts.worktree {
         Side::Worktree
     } else {
         Side::Commit(opts.head_sha)
     };
-    let head = match collect(root, head_side, &prefix) {
+    // each side is its own `git grep` over the whole tree, so both run at once
+    let (base, head) = std::thread::scope(|s| {
+        let head = s.spawn(|| collect(root, head_side, &prefix));
+        let base = collect(root, Side::Commit(opts.base_sha), &prefix);
+        (base, head.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+    });
+    let base = match base {
+        Ok(m) => m,
+        Err(e) => return TelemetryReport::empty(opts.base_sha, opts.head_sha, Some(e)),
+    };
+    let head = match head {
         Ok(m) => m,
         Err(e) => return TelemetryReport::empty(opts.base_sha, opts.head_sha, Some(e)),
     };

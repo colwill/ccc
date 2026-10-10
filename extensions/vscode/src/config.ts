@@ -4,6 +4,7 @@ import type { TraceLevel } from './log';
 export type CrossServiceMode = 'auto' | 'always' | 'off';
 export type MinEvidence = 'any' | 'evidence';
 export type DecorationStyle = 'badge+gutter' | 'badge' | 'gutter';
+export type SearchMode = 'none' | 'allow' | 'block';
 
 export interface Cfg {
   enable: boolean;
@@ -52,6 +53,12 @@ export interface Cfg {
     onWindowFocus: boolean;
     intervalSec: number;
     debounceMs: number;
+  };
+  // what the analyser's `search` tool may reach - `none` any https url, `allow` only the urls listed, `block` all but them
+  search: {
+    mode: SearchMode;
+    urls: string[];
+    endpoints: string[];
   };
   trace: TraceLevel;
 }
@@ -105,6 +112,11 @@ export function readConfig(scope?: vscode.ConfigurationScope): Cfg {
       intervalSec: clampInt(c.get<number>('refresh.intervalSec', 0), 0, 86400, 0),
       debounceMs: clampInt(c.get<number>('refresh.debounceMs', 400), 0, 60000, 400),
     },
+    search: {
+      mode: c.get<SearchMode>('search.mode', 'none'),
+      urls: c.get<string[]>('search.urls', []).filter((u) => typeof u === 'string'),
+      endpoints: c.get<string[]>('search.endpoints', []).filter((e) => typeof e === 'string'),
+    },
     trace: c.get<TraceLevel>('trace', 'off'),
   };
 }
@@ -117,7 +129,8 @@ export function needsServerRestart(a: Cfg, b: Cfg): boolean {
     a.server.port !== b.server.port ||
     a.server.watchIntervalSec !== b.server.watchIntervalSec ||
     a.server.ignoreSkip !== b.server.ignoreSkip ||
-    a.server.extraArgs.join('\u0000') !== b.server.extraArgs.join('\u0000')
+    a.server.extraArgs.join('\u0000') !== b.server.extraArgs.join('\u0000') ||
+    JSON.stringify(a.search) !== JSON.stringify(b.search)
   );
 }
 

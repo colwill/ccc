@@ -4,6 +4,7 @@ use crate::changes::{is_test_fn_name, is_test_path, module_segments, names_proje
 use crate::contracts::ContractIndex;
 use crate::extract::TOP_LEVEL;
 use crate::model::FileCache;
+use crate::par;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -84,6 +85,9 @@ pub struct TestRef {
 // A definition: (index into `caches`, index into that file's `funcs`).
 type DefId = (usize, usize);
 
+// what one test call reaches and the evidence that tied it - `None` when it leaves the project
+type Reached = Option<(Vec<DefId>, Evidence)>;
+
 pub struct CoverageIndex {
     covering: BTreeMap<DefId, Vec<TestRef>>,
     // definitions reached only from a test file's top level. Not a selectable
@@ -152,7 +156,6 @@ pub(crate) fn file_aliases(caches: &[FileCache]) -> Vec<BTreeSet<String>> {
 // `insights::build_graph` for the same reason as `file_aliases`.
 pub(crate) fn imported_names(caches: &[FileCache]) -> Vec<BTreeMap<String, BTreeSet<usize>>> {
     let stems: Vec<&str> = caches.iter().map(stem_of).collect();
-    let mut imported: Vec<BTreeMap<String, BTreeSet<usize>>> = vec![BTreeMap::new(); caches.len()];
     let mut stem_files: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
     for (i, s) in stems.iter().enumerate() {
         stem_files.entry(s).or_default().push(i);
@@ -171,7 +174,9 @@ pub(crate) fn imported_names(caches: &[FileCache]) -> Vec<BTreeMap<String, BTree
             stem_files.entry(dir).or_default().push(i);
         }
     }
-    for (a, c) in caches.iter().enumerate() {
+    // a file's own imports read nothing but the stems, so every file's are worked out at once
+    let mut imported: Vec<BTreeMap<String, BTreeSet<usize>>> = par::map(caches.len(), |a| {
+        let mut own: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
         let files_named = |s: &str| {
             stem_files
                 .get(s)
@@ -181,7 +186,7 @@ pub(crate) fn imported_names(caches: &[FileCache]) -> Vec<BTreeMap<String, BTree
                 .filter(|&b| b != a)
                 .collect::<Vec<usize>>()
         };
-        for imp in &c.imports {
+        for imp in &caches[a].imports {
             let segs: Vec<&str> = module_segments(&imp.module).collect();
             // The last segment names the module the statement actually reaches;
             // the ones before it are the packages on the way there. Preferring
@@ -201,7 +206,7 @@ pub(crate) fn imported_names(caches: &[FileCache]) -> Vec<BTreeMap<String, BTree
             // `from pkg import cli` binds a name that is itself a module
             targets.extend(imp.names.iter().flat_map(|n| files_named(n)));
             for name in &imp.names {
-                imported[a].entry(name.clone()).or_default().extend(&targets);
+                own.entry(name.clone()).or_default().extend(&targets);
             }
             // An import that binds no names is not empty of meaning - it makes
             // a whole file's surface available instead of picking from it. A C
@@ -212,27 +217,37 @@ pub(crate) fn imported_names(caches: &[FileCache]) -> Vec<BTreeMap<String, BTree
             if imp.names.is_empty() {
                 for &b in &targets {
                     for f in &caches[b].funcs {
-                        imported[a].entry(f.name.clone()).or_default().insert(b);
+                        own.entry(f.name.clone()).or_default().insert(b);
                     }
                 }
             }
         }
-    }
+        own
+    });
     // Chase each binding through the facades it passes: the name `__main__.py`
     // imported from `mypkg` is one `mypkg/__init__.py` imported from
     // `mypkg/cli.py`, and the definition is in the latter.
+    // only a binding whose source imports the same name can grow, and rounds add no names - found in parallel up front
+    let growing: Vec<Vec<String>> = par::map(caches.len(), |a| {
+        imported[a]
+            .iter()
+            .filter(|(name, from)| from.iter().any(|&b| imported[b].contains_key(name.as_str())))
+            .map(|(name, _)| name.clone())
+            .collect()
+    });
+    // the rounds keep their file order, so each still sees what earlier files gained within it
     for _ in 0..MAX_FACADE_HOPS {
         let mut grew = false;
-        for a in 0..caches.len() {
-            for name in imported[a].keys().cloned().collect::<Vec<String>>() {
-                let hops: BTreeSet<usize> = imported[a][&name]
+        for (a, names) in growing.iter().enumerate() {
+            for name in names {
+                let hops: BTreeSet<usize> = imported[a][name]
                     .iter()
-                    .filter_map(|&b| imported[b].get(&name))
+                    .filter_map(|&b| imported[b].get(name))
                     .flatten()
                     .copied()
                     .filter(|&b| b != a)
                     .collect();
-                let reached = imported[a].entry(name).or_default();
+                let Some(reached) = imported[a].get_mut(name) else { continue };
                 let before = reached.len();
                 reached.extend(hops);
                 grew |= reached.len() != before;
@@ -249,6 +264,18 @@ fn stem_of(c: &FileCache) -> &str {
     c.rel_path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
 }
 
+// what a qualifier can name and what each file imports from where - built once for the graph and coverage alike
+pub(crate) struct Reach {
+    pub(crate) aliases: Vec<BTreeSet<String>>,
+    pub(crate) imported: Vec<BTreeMap<String, BTreeSet<usize>>>,
+}
+
+impl Reach {
+    pub(crate) fn of(caches: &[FileCache]) -> Reach {
+        Reach { aliases: file_aliases(caches), imported: imported_names(caches) }
+    }
+}
+
 // Build the coverage relation. `project_ids` are the identities declared by
 // manifests (crate name, go module path, npm name), so an integration test
 // calling `mycrate::parse` is understood as staying inside the project.
@@ -257,8 +284,21 @@ pub fn build(
     project_ids: &BTreeSet<String>,
     contracts: &ContractIndex,
 ) -> CoverageIndex {
-    let aliases = file_aliases(caches);
-    let imported = imported_names(caches);
+    let reach = Reach::of(caches);
+    let index = build_over(caches, project_ids, contracts, &reach);
+    // the tables are large and the caller only wants the index
+    std::thread::spawn(move || drop(reach));
+    index
+}
+
+// `build`, through tables the caller already holds
+pub(crate) fn build_over(
+    caches: &[FileCache],
+    project_ids: &BTreeSet<String>,
+    contracts: &ContractIndex,
+    reach: &Reach,
+) -> CoverageIndex {
+    let (aliases, imported) = (&reach.aliases, &reach.imported);
     let alias_any: BTreeSet<&str> = aliases.iter().flatten().map(String::as_str).collect();
 
     let mut by_name: BTreeMap<&str, Vec<DefId>> = BTreeMap::new();
@@ -297,50 +337,63 @@ pub fn build(
                 .unwrap_or_default()
         })
         .collect();
+    let tables = Tables {
+        aliases,
+        alias_any: &alias_any,
+        imported,
+        by_name: &by_name,
+        by_file_name: &by_file_name,
+        by_owner: &by_owner,
+        project_types: &project_types,
+        project_ids,
+        families: &families,
+        dirs: &dirs,
+    };
+    // every file's test calls resolved at once - folding them in below is order-free, sets and a count and a minimum
+    let resolved: Vec<Vec<(usize, Reached)>> = par::map(caches.len(), |a| {
+        let c = &caches[a];
+        let file_is_test = is_test_path(&path_str(&c.rel_path));
+        c.calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| file_is_test || call.test_ctx || is_test_fn_name(&call.caller))
+            .map(|(ci, call)| {
+                // An rpc is the one call that crosses runtime families on
+                // purpose: a python test through the stub exercises the go
+                // handler behind it. Settled before `resolve`, whose family
+                // rule would refuse it.
+                let rpc = contracts
+                    .caller(a, ci)
+                    .map(|link| (contracts.targets(link.contract), Evidence::Rpc));
+                let matched = rpc.or_else(|| resolve(
+                    Site {
+                        file: a,
+                        name: call.name.as_str(),
+                        qualifier: call.qualifier.as_deref(),
+                        recv_type: call.recv_type.as_deref(),
+                        typed: c.language.is_typed(),
+                        package_scoped: c.language.package_scoped(),
+                    },
+                    &tables,
+                ));
+                (ci, matched)
+            })
+            .collect()
+    });
+
     let mut hits: BTreeMap<DefId, BTreeMap<TestSite, Evidence>> = BTreeMap::new();
     let mut touched: BTreeSet<DefId> = BTreeSet::new();
     let mut tests: BTreeSet<(usize, &str)> = BTreeSet::new();
     let mut external_calls = 0usize;
 
-    for (a, c) in caches.iter().enumerate() {
+    for ((a, c), found) in caches.iter().enumerate().zip(resolved) {
         let path = path_str(&c.rel_path);
-        let file_is_test = is_test_path(&path);
-        for (ci, call) in c.calls.iter().enumerate() {
-            if !(file_is_test || call.test_ctx || is_test_fn_name(&call.caller)) {
-                continue;
-            }
+        for (ci, matched) in found {
+            let call = &c.calls[ci];
             let selectable = call.caller != TOP_LEVEL;
             if selectable {
                 tests.insert((a, call.caller.as_str()));
             }
-            // An rpc is the one call that crosses runtime families on purpose:
-            // a python test through the stub exercises the go handler behind
-            // it. Settled before `resolve`, whose family rule would refuse it.
-            let rpc = contracts
-                .caller(a, ci)
-                .map(|link| (contracts.targets(link.contract), Evidence::Rpc));
-            let matched = rpc.or_else(|| resolve(
-                Site {
-                    file: a,
-                    name: call.name.as_str(),
-                    qualifier: call.qualifier.as_deref(),
-                    recv_type: call.recv_type.as_deref(),
-                    typed: c.language.is_typed(),
-                    package_scoped: c.language.package_scoped(),
-                },
-                &Tables {
-                    aliases: &aliases,
-                    alias_any: &alias_any,
-                    imported: &imported,
-                    by_name: &by_name,
-                    by_file_name: &by_file_name,
-                    by_owner: &by_owner,
-                    project_types: &project_types,
-                    project_ids,
-                    families: &families,
-                    dirs: &dirs,
-                },
-            ));
             let Some((defs, evidence)) = matched else {
                 external_calls += 1;
                 continue;

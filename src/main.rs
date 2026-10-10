@@ -17,6 +17,9 @@ struct Cli {
     // mapped, searched, measured and edited like the rest - any command
     #[arg(long, global = true)]
     ignore_skip: bool,
+    // parse every file afresh rather than reading back an earlier run's parse - `CCC_CACHE_DIR` moves them
+    #[arg(long, global = true)]
+    no_parse_cache: bool,
 }
 
 const CACHE_DIR: &str = ".ccc";
@@ -93,9 +96,7 @@ enum Command {
         out: Option<PathBuf>,
     },
     // surface branch changes to a continuous-testing suite: which services
-    // changed, who calls them, and what needs testing (JSON by default).
-    // `surf` was the original name; kept so existing scripts keep working.
-    #[command(alias = "surf")]
+    // changed, who calls them, and what needs testing (JSON by default)
     Changes {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -206,9 +207,28 @@ enum Command {
         #[arg(long)]
         worktree: bool,
     },
+    // where agents broke ccc's rules - writes around its edit tools, exploring with the shell, the web outside `search` - read from their transcripts
+    Violations {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // only calls from the last DAYS days
+        #[arg(long, value_name = "DAYS")]
+        since: Option<u64>,
+        // only this session
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        // only these rules - repeatable
+        #[arg(long = "rule", value_name = "RULE", value_parser = ["writes-outside-ccc", "shell-exploration", "web-outside-search", "blocked-url"])]
+        rules: Vec<String>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        // exit non-zero when any violation is found
+        #[arg(long)]
+        fail: bool,
+    },
     // run the code map over HTTP for AI agents and people: REST endpoints
     // (/find /references /dependencies ...), an MCP endpoint at /mcp, and the
-    // insights UI at /insights. `serve` was the original name; kept so existing
+    // architecture visualiser at /vis. `serve` was the original name; kept so existing
     // scripts and editor integrations keep working
     #[command(alias = "serve")]
     Run {
@@ -226,7 +246,7 @@ enum Command {
         // disable file watching (rescan only via POST /refresh)
         #[arg(long)]
         no_watch: bool,
-        // The insights UI is served either way now. Accepted so the scripts and
+        // The visualiser is served either way. Accepted so the scripts and
         // editor integrations that pass it keep working, but it turns nothing on
         #[arg(long)]
         html: bool,
@@ -239,13 +259,24 @@ enum Command {
         // the system down to one function's logic, served at /vis with the html UI
         #[arg(long, conflicts_with = "no_html")]
         vis: bool,
+        // ask agents to annotate the cross-service calls they come across - `ccc:serves` above a handler,
+        // `ccc:calls` beside a call - so the service map follows calls no parser can
+        #[arg(long)]
+        auto: bool,
+        // what the `search` tool may reach: `allow` only urls matching a --search-url, `block` all but them, `none` any https url
+        #[arg(long, default_value = "none", value_parser = ["none", "allow", "block"])]
+        search_mode: String,
+        // a url pattern (`https://docs.corp/**`) or host pattern (`*.corp.example`) the mode applies to - repeatable
+        #[arg(long = "search-url", value_name = "PATTERN")]
+        search_urls: Vec<String>,
+        // a search page with `{query}` where the words go (`https://wiki.corp/search?q={query}`) - repeatable
+        #[arg(long = "search-endpoint", value_name = "TEMPLATE")]
+        search_endpoints: Vec<String>,
     },
     // analyse the project and emit the insights payload
     Insights {
         #[arg(default_value = ".")]
         path: PathBuf,
-        #[arg(long, value_name = "FILE")]
-        html: Option<PathBuf>,
         // base ref for the test-trigger diff
         #[arg(long)]
         base: Option<String>,
@@ -279,7 +310,7 @@ enum Command {
     // Replays of what agents did on a branch, kept under `refs/ccc/replay/<branch>`
     // - beside the branches, never in them, so a merge cannot carry one to the
     // default branch. Recording is opt-in per repository (`ccc replay enable`);
-    // once on, the pre-push hook `ccc run` installs saves each branch's replay as
+    // once on, the pre-push hook it installs saves each branch's replay as
     // it is pushed, with anything that looks like a secret taken out first.
     Replay {
         #[command(subcommand)]
@@ -411,6 +442,9 @@ fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     // before anything is parsed, so every map this process builds agrees
     codecache::extract::ignore_skips(cli.ignore_skip);
+    if !cli.no_parse_cache {
+        codecache::parse_cache::enable();
+    }
     match cli.command {
         Command::Scan {
             path,
@@ -711,6 +745,19 @@ fn run() -> Result<ExitCode> {
             print!("{}", codecache::pr_summary::markdown(&report, None, 0));
             Ok(ExitCode::SUCCESS)
         }
+        Command::Violations { path, since, session, rules, format, fail } => {
+            let opts = codecache::violations::Options {
+                since_days: since,
+                session,
+                rules: rules.iter().filter_map(|r| codecache::violations::Rule::parse(r)).collect(),
+            };
+            let report = codecache::violations::check(&canonical(&path), &opts);
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+                OutputFormat::Text => print!("{}", codecache::violations::text(&report)),
+            }
+            Ok(if fail && !report.violations.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+        }
         Command::Run {
             path,
             addr,
@@ -721,6 +768,10 @@ fn run() -> Result<ExitCode> {
             no_html,
             deps,
             vis,
+            auto,
+            search_mode,
+            search_urls,
+            search_endpoints,
         } => {
             let watch = if no_watch || watch_interval == 0 {
                 None
@@ -735,13 +786,19 @@ fn run() -> Result<ExitCode> {
                 watch,
                 html: !no_html,
                 vis,
+                auto,
+                search: codecache::search::Policy::new(
+                    codecache::search::Mode::parse(&search_mode).map_err(|e| anyhow!(e))?,
+                    &search_urls,
+                    &search_endpoints,
+                )
+                .map_err(|e| anyhow!(e))?,
             };
             let root = canonical(&path);
-            ask_recording(&root);
             codecache::serve(&root, &opts)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Insights { path, html, base } => {
+        Command::Insights { path, base } => {
             let root = canonical(&path);
             let label = root
                 .file_name()
@@ -749,13 +806,7 @@ fn run() -> Result<ExitCode> {
                 .unwrap_or(".")
                 .to_string();
             let report = codecache::insights::analyse(&root, &label, base.as_deref())?;
-            match html {
-                Some(file) => {
-                    codecache::html::write_insights_html(&file, &label, &report)?;
-                    println!("wrote {}", file.display());
-                }
-                None => println!("{}", serde_json::to_string(&report)?),
-            }
+            println!("{}", serde_json::to_string(&report)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Sast { path, include_tests, min_severity, format } => {
@@ -1386,74 +1437,6 @@ fn dir_on_path(dir: &Path) -> bool {
                 .any(|p| p.canonicalize().unwrap_or(p) == canon)
         })
         .unwrap_or(false)
-}
-
-// The question `ccc run` asks once per repository, on a terminal: record
-// agent sessions as replays beside the branches? What it says depends on who
-// can read the remote, since a replay carries prompts and code. Off a
-// terminal - an editor starting it - nothing is asked and nothing recorded;
-// the editor asks for itself.
-fn ask_recording(root: &Path) {
-    use codecache::replay::{consent, exposure_here, is_repo, set_consent, Consent};
-    use std::io::IsTerminal;
-    if !is_repo(root) || consent(root) != Consent::Unasked {
-        return;
-    }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        eprintln!("ccc: session recording is off for this repository until someone turns it on - `ccc replay enable`");
-        return;
-    }
-    eprintln!(
-        "\nccc can record your agent sessions as replays, kept beside this repository's branches\n\
-         (refs/ccc) and pushed with them, so the team can watch how each change was made.\n\
-         A replay carries your prompts and the code each step touched - anything that looks\n\
-         like a secret is redacted first. For a team on a private repository that is ideal:\n\
-         everyone who can read the code can replay how it was written."
-    );
-    if let Some(e) = exposure_here(root) {
-        match e.public {
-            Some(true) if e.sealed => eprintln!(
-                "\n{} ({}) answers without signing in, but .ccc/map.json encrypts replays to the team's\n\
-                 runccc key, so only the team opens them.",
-                e.remote, e.url
-            ),
-            Some(true) if e.allowed => eprintln!(
-                "\n{} ({}) answers without signing in, and .ccc/map.json allows replays to it.",
-                e.remote, e.url
-            ),
-            Some(true) if e.public_host => eprintln!(
-                "\n{} ({}) can be read by anyone, without signing in. Replays would stay on this\n\
-                 machine - make the repository private to share them with your team.",
-                e.remote, e.url
-            ),
-            Some(true) => eprintln!(
-                "\n{} ({}) answers without signing in, so replays would stay on this machine.\n\
-                 If {} is your company's internal instance, where every repository is readable\n\
-                 company-wide, allow it in .ccc/map.json, where the team sees it: {}",
-                e.remote,
-                e.url,
-                e.host,
-                codecache::replay::ALLOW_PUBLIC
-            ),
-            Some(false) => eprintln!("\n{} needs a sign-in to read, so replays reach only people who can read the code.", e.remote),
-            None => eprintln!("\nccc could not tell whether {} ({}) can be read without signing in.", e.remote, e.url),
-        }
-    }
-    let yes = ask("\nRecord agent sessions for this repository? [y/N] ");
-    match set_consent(root, yes) {
-        Ok(_) if yes => eprintln!("ccc: recording on - `ccc replay disable` turns it off\n"),
-        Ok(_) => eprintln!("ccc: not recording - `ccc replay enable` turns it on later\n"),
-        Err(e) => eprintln!("ccc: could not keep the answer: {e:#}\n"),
-    }
-}
-
-// a yes-or-no on the terminal - anything but yes is no
-fn ask(question: &str) -> bool {
-    use std::io::Write;
-    eprint!("{question}");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn canonical(path: &Path) -> PathBuf {

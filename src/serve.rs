@@ -1,4 +1,4 @@
-//! `ccc run` local REST/MCP endpoints for AI agents, plus the insights UI.
+//! `ccc run` local REST/MCP endpoints for AI agents, plus the architecture visualiser.
 //!
 //! On startup the whole project is parsed into an in-memory map (the same
 //! model `.ccc` is rendered from); every query answers from memory. A watcher
@@ -25,10 +25,14 @@ pub struct ServeOptions {
     pub addr: String,
     pub port: u16,
     pub watch: Option<std::time::Duration>,
-    // serve the human-facing `/insights` UI alongside the agent endpoints
+    // serve the human-facing visualiser at `/vis` alongside the agent endpoints
     pub html: bool,
-    // open the architecture visualiser on start; `/vis` is served with `html`
+    // open the architecture visualiser on start
     pub vis: bool,
+    // ask agents to annotate the cross-service calls they come across with `ccc:serves` / `ccc:calls`
+    pub auto: bool,
+    // what the `search` tool may reach
+    pub search: crate::search::Policy,
 }
 
 impl Default for ServeOptions {
@@ -39,6 +43,8 @@ impl Default for ServeOptions {
             watch: Some(std::time::Duration::from_secs(2)),
             html: true,
             vis: false,
+            auto: false,
+            search: Default::default(),
         }
     }
 }
@@ -56,6 +62,10 @@ struct MapState {
     facade: Option<String>,
     watch_secs: Option<u64>,
     html: bool,
+    // `--auto`: the instructions ask agents to annotate cross-service calls
+    auto: bool,
+    // what `search` may reach - the rules `ccc run` was started with
+    search: crate::search::Policy,
     // a git work tree, so its steps keep their branch and texts for replays
     git: bool,
     origin: String,
@@ -493,6 +503,8 @@ impl MapState {
             facade: cargo_package_name(root),
             watch_secs: None,
             html: true,
+            auto: false,
+            search: Default::default(),
             git: crate::replay::is_repo(root),
             // `--port 0` picks one at runtime
             origin: {
@@ -3051,6 +3063,30 @@ fn mcp_tools() -> Value {
 
         // the write tools - the only way this project is changed
         tool(
+            "search",
+            "USE INSTEAD OF WebFetch, WebSearch, curl or wget for anything on the web - internal docs and portals included. `query` runs a search against the endpoints the user configured (search pages with `{query}` where the words go) and returns each one's results as text, links written `[text](url)`; `url` fetches one https page as text - follow a result's link this way. https only. Every request, redirects included, passes the user's rules: in `allow` mode only listed urls are reachable, in `block` mode listed urls are refused, and with no mode any https url goes. A refusal names the rule that refused it - do not reach the url another way: `violations` reports that to the user. Long pages page: pass `offset` for the rest.",
+            json!({
+                "query": {"type": "string", "description": "words to search the configured endpoints for"},
+                "url": {"type": "string", "description": "one https page to fetch as text, instead of a query"},
+                "endpoint": {"type": "string", "description": "only the endpoints whose template contains this, e.g. `wiki` (optional)"},
+                "offset": {"type": "integer", "description": "lines to skip (default 0)"},
+                "why": {"type": "string", "description": WHY_DOC},
+            }),
+            &[],
+        ),
+        tool(
+            "violations",
+            "ANSWERS whether any agent on this project broke ccc's rules, read from the agents' own transcripts (Claude Code, subagents included): writing project files around ccc's edit tools (Edit/Write, `sed -i`, `>` or `tee`, `cp`/`mv`/`rm`), reading or searching the project with Read/Grep/Glob or the shell (`cat`, `grep`, `rg`, `find`, `sed -n`, `ls`) instead of ccc's tools, reaching the web outside `search` (WebFetch, WebSearch, `curl`, `wget`), and urls `search` refused. Each violation carries its time, session, tool, the command or input, the files or urls it touched, and the ccc tool that does the job instead. Narrow with `rule`, `session` or `since` (days); pages with `offset`.",
+            json!({
+                "rule": {"type": "string", "enum": ["writes-outside-ccc", "shell-exploration", "web-outside-search", "blocked-url"], "description": "only this rule (optional)"},
+                "session": {"type": "string", "description": "only this session id (optional)"},
+                "since": {"type": "integer", "description": "only calls from the last N days (optional)"},
+                "limit": {"type": "integer", "description": "violations per page (default 40)"},
+                "offset": {"type": "integer", "description": "violations to skip (default 0)"},
+            }),
+            &[],
+        ),
+        tool(
             "edit_rename",
             "CHANGES A NAME EVERYWHERE IT IS THE SAME SYMBOL, in one call instead of a read and an edit per file. Pass the `result` handle a `find` or `references` answer ends with, and `to`. A `references` handle renames that exact name; a `find` handle swaps the matched substring inside each identifier and keeps its case shape (`hello_all` -> `hi_all`, `HelloWorld` -> `HiWorld`). Renaming only the definitions would strand their callers, so each name is followed through every file the map ties to it - definitions, calls, usages, imports, re-exports, and lines the map does not index such as a `ccc:skip` body - provided it has exactly one definition and the lookup was not qualified. Only identifiers change: never a comment, a string, or the module segment of a path. Every same-named identifier it did NOT change is listed with the reason, under a new handle that pulls them in when passed back; comments and strings that spell the name are listed too, and a new name that collides with an existing definition is flagged. Stages a changeset and returns its diff - nothing is written until `edit_apply` (or apply=true).",
             json!({
@@ -3137,14 +3173,6 @@ fn mcp_tools() -> Value {
             json!({"changeset": {"type": "string", "description": "the id `edit_apply` reported"}}),
             &["changeset"],
         ),
-
-        // the one tool aimed at the person rather than the agent
-        tool(
-            "insights",
-            "CALL THIS WHEN THE USER ASKS TO SEE the analysis - show me the insights, open the dashboard, what does this codebase look like. Opens the human-facing insights UI (`/insights`) in their browser: the flame graph of the static call tree, hot paths, the service map, this branch's changes, test triggers and targets, lints and per-language totals - the same analysis pass the other tools read, laid out to be looked at rather than parsed. Returns the URL and the headline totals, so you can talk about the page while they read it. Served by default; only `ccc run --no-html` turns it off, and then the tool says so and the data is still at /insights.json.",
-            json!({}),
-            &[],
-        ),
     ];
     // tell a client which tools write, so it can ask before those and not before the rest
     let tools: Vec<Value> = tools
@@ -3166,7 +3194,23 @@ fn mcp_tools() -> Value {
     json!({ "tools": tools })
 }
 
-fn mcp_initialize(params: &Value) -> Value {
+// what `--auto` adds to the instructions - agents mark the calls that leave this process, which no parser can follow
+const CROSSINGS: &str = "\n\n4. CROSS-SERVICE CALLS - annotate every one you identify. A call that \
+    leaves this process - an HTTP or gRPC request to another service, a message published to or \
+    consumed from a queue or topic, a webhook, a CLI or FFI hop - is invisible to the map until a \
+    comment names it. Whenever you read, write or change one, mark each end that is in this project \
+    with a comment in the file's own syntax, staged through the edit tools like any other change: \
+    `ccc:serves <transport> <key>` directly above the handler that answers it (attribute and \
+    decorator lines may sit between), `ccc:calls <transport> <key>` inside the calling function, \
+    beside the call. The key is the contract both ends share, spelled the same on each side - \
+    `POST /v1/refund`, `billing.v1.Charge`, `orders.created` - and the transport is one of grpc, \
+    rest, http, graphql, queue, event, webhook, websocket, ffi, cli, soap, sql or rpc. Call \
+    `services` first: a crossing it already lists needs no comment, and an rpc a `.proto` schema \
+    declares is linked without one. Never annotate a call that stays inside this process, and never \
+    guess a key the code does not show - a `ccc:calls` nothing serves is reported as unanswered, \
+    which is right for a peer outside this repository and wrong for a typo.";
+
+fn mcp_initialize(params: &Value, auto: bool) -> Value {
     let asked = params
         .get("protocolVersion")
         .and_then(|v| v.as_str())
@@ -3176,7 +3220,7 @@ fn mcp_initialize(params: &Value) -> Value {
     } else {
         MCP_LATEST
     };
-    json!({
+    let mut init = json!({
         "protocolVersion": version,
         "capabilities": {"tools": {}, "resources": {}},
         "serverInfo": {
@@ -3250,12 +3294,12 @@ fn mcp_initialize(params: &Value) -> Value {
             resolve to, runtime ones first, `deps` what this branch did to that dependency tree - \
             what entered it, what left, what moved version and which advisories that introduced. \
             `security` syntax-level security findings in this \
-            project's own code - secrets, disabled TLS, injection surfaces. Edits: \
+            project's own code - secrets, disabled TLS, injection surfaces. `search` \
+            is the only way to the web, internal docs included, and `violations` \
+            reports where agents broke these rules. Edits: \
             `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` and `edit_text` \
             stage a changeset, `edit_apply` writes it, `edit_discard` drops it, \
-            `edit_revert` undoes it. For a person rather \
-            than an agent: `insights` opens the UI over that same analysis in their \
-            browser - call it when they ask to *see* the code, not to read about it. \
+            `edit_revert` undoes it. \
             The analysis tools are \
             heuristics over a syntax tree - no type inference, data flow or runtime \
             profile - so each result carries its evidence and limits; read those before \
@@ -3263,7 +3307,12 @@ fn mcp_initialize(params: &Value) -> Value {
             `offset` for the rest.\n\n\
             Results are markdown; the same data is JSON over HTTP (/index, /find, \
             /references, /dependencies, /file, /notes, /insights.json, /deps.json).",
-    })
+    });
+    if auto {
+        let text = format!("{}{CROSSINGS}", init["instructions"].as_str().unwrap_or_default());
+        init["instructions"] = Value::String(text);
+    }
+    init
 }
 
 fn mcp_md(text: &str, is_error: bool) -> Value {
@@ -4718,55 +4767,13 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
         .map_err(|e| format!("{program}: {e}"))
 }
 
-// what `insights` opens the page with - tests dispatch every tool, and must never launch a real browser doing it
+// what `--vis` opens the visualiser with - tests must never launch a real browser
 fn launcher() -> fn(&str) -> Result<(), String> {
     if cfg!(test) {
         |_| Err("not opened - tests never launch a browser".into())
     } else {
         open_in_browser
     }
-}
-
-// open the insights page
-fn q_insights(map: &MapState, open: impl Fn(&str) -> Result<(), String>) -> Result<String, String> {
-    let url = format!("{}/insights", map.origin);
-    if !map.html {
-        return Err(format!(
-            "the insights UI is disabled by `--no-html`; restart the server as `ccc run` to \
-             serve it at {url} (the analysis itself is at {}/insights.json, and the \
-             `changes`, `test_triggers`, `test_targets`, `lints`, `hot` and `services` \
-             tools read the same pass)",
-            map.origin
-        ));
-    }
-    let opened = open(&url);
-    let a = map.analysis(None);
-    let t = &a["totals"];
-    let mut out = format!("# insights\n{url}\n\n");
-    out.push_str(match &opened {
-        Ok(()) => "opened in the user's browser - tell them to look at it.\n",
-        Err(_) => "could not open a browser here; give the user the URL above.\n",
-    });
-    if let Err(e) = &opened {
-        out.push_str(&format!("reason: {e}\n"));
-    }
-    out.push_str(&format!(
-        "\n{} file(s), {} line(s), {} function(s), {} call edge(s), {} root(s)\n\
-         generated {} in {} ms\n",
-        jnum(t, "files"),
-        jnum(t, "lines"),
-        jnum(t, "functions"),
-        jnum(t, "edges"),
-        jnum(t, "roots"),
-        jstr(&a, "generated"),
-        a["took_ns"].as_u64().unwrap_or(0) / 1_000_000,
-    ));
-    out.push_str(
-        "\ntabs: flame (static call tree), hot (call-graph shape), services, changes, \
-         test triggers, test targets, lints, languages. The page reads /insights.json \
-         live and has its own refresh button.\n",
-    );
-    Ok(out)
 }
 
 // `browser` - the request carried an Origin header, which agents never send and a page always does
@@ -4793,6 +4800,33 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Res
             Ok((before, after, ts)) => Ok(mcp_md(&format!("rescanned: {before} -> {after} files (generated {ts})"), false)),
             Err(e) => Ok(mcp_md(&format!("error: {e}"), true)),
         };
+    }
+
+    // the web and the transcripts are an agent's to reach, never a page's - and a slow portal must not hold the map
+    if name == "search" || name == "violations" {
+        if browser {
+            return Ok(mcp_md(&format!("error: `{name}` refuses requests from a browser page - only an agent's MCP client may use it"), true));
+        }
+        let (policy, root) = {
+            let map = state.read().expect("map lock poisoned");
+            (map.search.clone(), map.root.clone())
+        };
+        let num = |k: &str| args.get(k).and_then(|v| v.as_u64());
+        return Ok(if name == "search" {
+            let offset = num("offset").unwrap_or(0) as usize;
+            match crate::search::run(&policy, arg("query").as_deref(), arg("url").as_deref(), arg("endpoint").as_deref(), offset) {
+                Ok(text) => mcp_md(&text, false),
+                Err(e) => mcp_md(&format!("error: {e}"), true),
+            }
+        } else {
+            let opts = crate::violations::Options {
+                since_days: num("since"),
+                session: arg("session"),
+                rules: arg("rule").as_deref().and_then(crate::violations::Rule::parse).into_iter().collect(),
+            };
+            let page = Page::from(&args, 40);
+            mcp_md(&crate::violations::markdown(&crate::violations::check(&root, &opts), page.offset, page.limit), false)
+        });
     }
 
     let map = state.read().expect("map lock poisoned");
@@ -4962,7 +4996,6 @@ fn mcp_tool_call(state: &RwLock<MapState>, params: &Value, browser: bool) -> Res
                 Page::from(&args, 25),
             ))
         }
-        "insights" => q_insights(&map, launcher()),
         _ => return Err((-32602, format!("unknown tool '{name}'"))),
     };
     // an agent's reads are its looks - a page reading for itself is not
@@ -5155,7 +5188,7 @@ fn mcp_handle_from(state: &RwLock<MapState>, msg: &Value, browser: bool) -> Opti
     }
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     let result: Result<Value, (i64, String)> = match method {
-        "initialize" => Ok(mcp_initialize(&params)),
+        "initialize" => Ok(mcp_initialize(&params, state.read().expect("map lock poisoned").auto)),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(mcp_tools()),
         "tools/call" => mcp_tool_call(state, &params, browser),
@@ -5439,7 +5472,6 @@ const ENDPOINTS: &[&str] = &[
     "GET /health",
     "GET /prompts[?base=<ref>] (which claude/copilot request produced each change)",
     "GET /insights.json[?base=<ref>] (the whole analysis payload)",
-    "GET /insights (human UI over the same data; off with --no-html)",
     "GET /vis.json | /vis/code?file=<path> | /vis/flow?file=<path>&line=<n> (architecture levels)",
     "GET /vis/events?since=<n> | /vis/event?seq=<n> | /vis/asks (edit timeline: each step the edit tools took, and the ask behind it)",
     "GET /vis (architecture visualiser; off with --no-html, opened by --vis)",
@@ -5564,21 +5596,8 @@ fn route_from(state: &RwLock<MapState>, method: &str, url: &str, body: &[u8], or
             let map = state.read().expect("map lock poisoned");
             ok((*map.analysis(get("base"))).clone())
         }
-        // human-facing insights UI; on unless `ccc run --no-html`
-        ("GET", "/insights") => {
-            let map = state.read().expect("map lock poisoned");
-            if !map.html {
-                return bad(
-                    404,
-                    "insights UI is disabled by `--no-html`; restart with `ccc run` \
-                     (the data is at /insights.json either way)",
-                );
-            }
-            html_ok(crate::html::render_insights_html(&map.root_label, None))
-        }
-        // the architecture visualiser: the page goes with the insights UI and
-        // `--vis` opens it; the data behind it answers either way, the way
-        // /insights.json outlives --no-html
+        // the architecture visualiser: on unless `ccc run --no-html`, and
+        // `--vis` opens it; the data behind it answers either way
         ("GET", "/vis") => {
             let map = state.read().expect("map lock poisoned");
             if !map.html {
@@ -5788,6 +5807,8 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
         let mut map = state.write().expect("map lock poisoned");
         map.watch_secs = opts.watch.map(|d| d.as_secs());
         map.html = opts.html;
+        map.auto = opts.auto;
+        map.search = opts.search.clone();
         // only the page's timeline reads the texts kept for changes by hand
         if !map.html {
             *map.seen.get_mut().unwrap_or_else(|p| p.into_inner()) = None;
@@ -5803,12 +5824,6 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     if !stopped.is_empty() {
         let pids: Vec<String> = stopped.iter().map(u32::to_string).collect();
         println!("stopped {} other ccc instance(s) serving this project (pid {})", stopped.len(), pids.join(", "));
-    }
-    // each branch pushed carries its replay with it
-    match crate::replay::install_hook(root) {
-        Ok(hook @ (crate::replay::Hook::Installed(_) | crate::replay::Hook::Foreign(_))) => println!("{}", hook.describe()),
-        Ok(_) => {}
-        Err(e) => eprintln!("ccc: the replay hook was not installed: {e:#}"),
     }
     let bind = format!("{}:{}", opts.addr, opts.port);
     let server = tiny_http::Server::http(&bind)
@@ -5831,8 +5846,9 @@ pub fn serve(root: &Path, opts: &ServeOptions) -> Result<()> {
     }
     println!("listening on http://{addr}  (MCP endpoint: http://{addr}/mcp)");
     println!("endpoints: {}", ENDPOINTS.join(" | "));
-    if opts.html {
-        println!("insights UI: http://{addr}/insights");
+    println!("search: {}", opts.search.describe());
+    if opts.html && !opts.vis {
+        println!("visualiser: http://{addr}/vis");
     }
     if opts.vis {
         let url = format!("{}/vis", state.read().expect("map lock poisoned").origin);
@@ -7073,16 +7089,35 @@ mod tests {
 
     #[test]
     fn mcp_initialize_negotiates_version() {
-        let known = mcp_initialize(&json!({"protocolVersion": "2024-11-05"}));
+        let known = mcp_initialize(&json!({"protocolVersion": "2024-11-05"}), false);
         assert_eq!(known["protocolVersion"], "2024-11-05");
-        let unknown = mcp_initialize(&json!({"protocolVersion": "1999-01-01"}));
+        let unknown = mcp_initialize(&json!({"protocolVersion": "1999-01-01"}), false);
         assert_eq!(unknown["protocolVersion"], MCP_LATEST);
         assert_eq!(known["serverInfo"]["name"], "ccc");
     }
 
+    // `ccc run --auto` asks every agent that connects to mark the calls leaving this process, on top of the usual instructions
+    #[test]
+    fn auto_asks_agents_to_annotate_cross_service_calls() {
+        let text = |auto| mcp_initialize(&json!({}), auto)["instructions"].as_str().unwrap().to_string();
+        assert!(!text(false).contains("ccc:serves"), "only --auto asks");
+        let asked = text(true);
+        assert!(asked.starts_with(&text(false)), "the usual instructions stay whole");
+        for said in ["CROSS-SERVICE CALLS", "`ccc:serves <transport> <key>`", "`ccc:calls <transport> <key>`", "`services`"] {
+            assert!(asked.contains(said), "{said} missing: {asked}");
+        }
+
+        let (_dir, state) = scratch("auto", &[("src/a.rs", "pub fn a() {}\n")]);
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let answer = |state: &RwLock<MapState>| mcp_handle_from(state, &init, false).unwrap()["result"]["instructions"].clone();
+        assert_eq!(answer(&state), text(false));
+        state.write().unwrap().auto = true;
+        assert_eq!(answer(&state), asked);
+    }
+
     #[test]
     fn the_instructions_cover_search_editing_and_every_tool() {
-        let text = mcp_initialize(&json!({}))["instructions"]
+        let text = mcp_initialize(&json!({}), false)["instructions"]
             .as_str()
             .unwrap()
             .to_string();
@@ -7146,6 +7181,8 @@ mod tests {
                 "lints",
                 "hot",
                 "services",
+                "search",
+                "violations",
                 "edit_rename", // the only writers
                 "edit_replace",
                 "edit_delete",
@@ -7154,7 +7191,6 @@ mod tests {
                 "edit_apply",
                 "edit_discard",
                 "edit_revert",
-                "insights", // for user only
             ]
         );
         // a client can tell the writers from the readers without knowing the names
@@ -7369,8 +7405,7 @@ mod tests {
         assert_eq!(pre.status, 204);
     }
 
-    // The page goes with the insights UI; the data behind it always answers,
-    // the way /insights.json outlives --no-html.
+    // The page goes with --no-html; the data behind it always answers.
     #[test]
     fn the_visualiser_page_goes_with_the_html_ui_and_its_data_does_not() {
         let state = RwLock::new(fixture());
@@ -7495,25 +7530,12 @@ mod tests {
         assert_ne!(route(&state, "GET", "/deps.json", b"").status, 404);
     }
 
+    // there is no insights page; the payload answers whether or not the
+    // visualiser is served
     #[test]
-    fn the_insights_ui_is_served_unless_it_is_refused() {
+    fn the_insights_payload_answers_with_the_html_ui_off() {
         let state = RwLock::new(fixture());
-        // off only when asked: the error names the flag that turned it off and
-        // the JSON way in, which stays open either way
         state.write().unwrap().html = false;
-        let off = route(&state, "GET", "/insights", b"");
-        assert_eq!(off.status, 404);
-        assert!(json_of(&off)["error"].as_str().unwrap().contains("--no-html"));
-        assert_eq!(route(&state, "GET", "/insights.json", b"").status, 200);
-
-        state.write().unwrap().html = true;
-        let page = route(&state, "GET", "/insights", b"");
-        assert_eq!(page.status, 200);
-        let ReplyBody::Html(body) = &page.body else {
-            panic!("the UI must be served as HTML");
-        };
-        assert!(body.contains("ccc insights"));
-        assert!(body.contains("/insights.json"));
 
         let data = route(&state, "GET", "/insights.json", b"");
         assert_eq!(data.status, 200);
@@ -7522,63 +7544,32 @@ mod tests {
         // the fixture's cross-file call resolves, so the graph is not empty
         assert!(v["totals"]["functions"].as_u64().unwrap() >= 5);
         assert!(v["totals"]["edges"].as_u64().unwrap() >= 1);
-        // every tab the page renders has a section to render from
+        // every section the extension and the tools read is there
         for key in ["flame", "hot", "services", "lints", "languages"] {
             assert!(!v[key].is_null(), "insights payload missing {key}");
         }
-        // findings never ship without the caveat the UI prints beside them
+        // findings never ship without their caveat
         assert!(v["lints"]["note"].as_str().unwrap().contains("heuristics"));
-        // the page reports how long the analysis took, beside when it ran
+        // the payload says how long the analysis took, beside when it ran
         assert!(v["took_ns"].as_u64().unwrap() > 0);
         assert!(!v["generated"].as_str().unwrap().is_empty());
         // the flame view is grouped, so per-service trees have somewhere to go
         assert!(!v["flame"]["groups"].as_array().unwrap().is_empty());
     }
 
-    // The `insights` tool is the one that acts on the user's machine, so the
-    // browser call is injected: these assertions must never launch anything.
+    // a page could aim `search` at an intranet and read the answer, and the
+    // transcripts hold every prompt - both are an agent's alone
     #[test]
-    fn the_insights_tool_hands_the_user_a_reachable_url() {
-        let mut map = fixture();
-        map.origin = "http://127.0.0.1:7788".into();
-
-        // disabled UI: the error names the flag and the JSON way in, and no
-        // browser is opened for a page that would 404
-        map.html = false;
-        let err = q_insights(&map, |_| panic!("must not open a browser with --no-html"))
-            .expect_err("the UI was turned off above");
-        assert!(err.contains("--no-html"), "{err}");
-        assert!(err.contains("http://127.0.0.1:7788/insights.json"), "{err}");
-
-        map.html = true;
-        let asked = Mutex::new(Vec::new());
-        let out = q_insights(&map, |url| {
-            asked.lock().unwrap().push(url.to_string());
-            Ok(())
-        })
-        .expect("the UI is enabled");
-        assert_eq!(
-            asked.into_inner().unwrap(),
-            vec!["http://127.0.0.1:7788/insights".to_string()]
-        );
-        assert!(out.contains("http://127.0.0.1:7788/insights"), "{out}");
-        assert!(out.contains("opened in the user's browser"), "{out}");
-        // the headline figures the agent talks about while they read
-        assert!(out.contains("function(s)"), "{out}");
-        assert!(out.contains("call edge(s)"), "{out}");
-
-        // a headless box has nothing to open: still an answer, with the URL and
-        // the reason, not an error
-        let headless = q_insights(&map, |_| Err("xdg-open: not found".into()))
-            .expect("a missing browser is not a failed tool call");
-        assert!(headless.contains("give the user the URL"), "{headless}");
-        assert!(headless.contains("xdg-open: not found"), "{headless}");
-        assert!(headless.contains("http://127.0.0.1:7788/insights"), "{headless}");
-
-        // dispatched the way an agent calls it, a test run still opens nothing
+    fn search_and_violations_refuse_a_browser_page() {
         let state = RwLock::new(fixture());
-        let (err, out) = tool(&state, "insights", json!({}));
-        assert!(!err && out.contains("tests never launch a browser"), "{out}");
+        for (name, args) in [("search", json!({"url": "https://example.com/"})), ("violations", json!({}))] {
+            let out = mcp_tool_call(&state, &json!({"name": name, "arguments": args}), true).unwrap();
+            assert_eq!(out["isError"], true, "{name}");
+            assert!(out["content"][0]["text"].as_str().unwrap().contains("browser page"), "{name}");
+        }
+        // an agent asking for plain http is refused before anything is fetched
+        let out = mcp_tool_call(&state, &json!({"name": "search", "arguments": {"url": "http://example.com/"}}), false).unwrap();
+        assert!(out["content"][0]["text"].as_str().unwrap().contains(crate::search::REFUSED));
     }
 
     #[test]
