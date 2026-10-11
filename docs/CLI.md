@@ -11,7 +11,7 @@ claude mcp add --transport http ccc http://127.0.0.1:6767/mcp   # Claude Code
 copilot mcp add --transport http ccc http://127.0.0.1:6767/mcp  # Copilot
 ```
 
-Then tell your agent to use the `ccc` MCP tools. [Advanced.md](Advanced.md#agents) has an `AGENTS.md` block that does this.
+Then tell your agent to use the `ccc` MCP tools. [Developers And Agents](Advanced.md#agents) has an `AGENTS.md` block that does this.
 
 ## Commands
 
@@ -22,6 +22,7 @@ Then tell your agent to use the `ccc` MCP tools. [Advanced.md](Advanced.md#agent
 | [`ccc run`](#ccc-run) | Serving the map to agents (MCP) and people (the visualiser) |
 | [`ccc changes`](#ccc-changes) | What a branch changed, function by function, and which services it puts at risk |
 | [`ccc insights`](#ccc-insights) | The full analysis as JSON, including which tests to run for the branch |
+| [`ccc probe`](#ccc-probe) | A copy of the project that records which tests ran which functions |
 | [`ccc deps`](#ccc-deps) | What a branch did to the dependency tree |
 | [`ccc audit`](#ccc-audit) | Known vulnerabilities in your locked dependencies |
 | [`ccc sast`](#ccc-sast) | Security risks in your own source |
@@ -183,23 +184,58 @@ Each line of a record file is one JSON object, `ccc-observed/1`: one fixture, as
  "run": "nightly-4812",
  "service": {"name": "billing", "commit": "3f2a9c1e"},
  "duration_ms": 1840,
- "files": [{"path": "internal/billing/fee.go", "functions": [{"name": "(*Server).ApplyFee", "line": 88}]}]}
+ "files": [{"path": "internal/billing/fee.go", "functions": [{"name": "(*Server).ApplyFee", "line": 88, "calls": 3}]}]}
 ```
 
-- `fixture.name` is what the test runner selects it by. `kind` is `unit`, `contract`, `interop`, `integration` or `smoke`.
+- `fixture.name` is what the test runner selects it by. `kind` is `unit`, `contract`, `interop`, `integration`, `smoke` or `load`.
 - `files[].path` is relative to the repository root. An absolute path is matched by its tail, so a CI checkout's paths work. A relative path the map doesn't hold belongs to another repository, and is counted as unmatched.
 - A function is matched by name, then by owner, then by the nearest line, so a recording keeps matching after the code moves. A probe that sees lines rather than functions can send `"lines": [[start, end], ...]` instead. Those are used only while the file is unchanged since `service.commit`.
+- `calls` is how many times the fixture ran the function in that process. It is optional. A function listed without it still counts as run, just without a count. The counts from every service in one `run` are added together. When a fixture appears in several runs, ccc keeps its highest total, so a rerun doesn't double it.
 
 With records:
 
 - A function a fixture ran counts as tested. The fixture is listed first among the tests that cover it, with evidence `observed`.
 - `test_triggers.observed` lists the fixtures that ran the branch's changed functions, two ways, each with its own run commands:
   - `safe`, the default: every fixture that ran a changed function.
-  - `minimal`: the cheapest fixtures that still run each changed function once. A fixture costs its recorded duration, weighted by kind: unit 1, contract 2, interop 3, integration 4, smoke 5. The set is the cheapest possible unless `exact` is `false`.
+  - `minimal`: the cheapest fixtures that still run each changed function once. A fixture costs its recorded duration, weighted by kind: unit 1, contract 2, interop 3, integration 4, smoke 5, load 6. The set is the cheapest possible unless `exact` is `false`.
+- Each chosen fixture lists the changed functions it ran under `ran`, with the `calls` the records gave each one. A tested-by row with evidence `observed` carries `calls` too. The `test_triggers` tool prints them as `Checksum ×2`, and the VS Code hover says how many times the run saw each test execute the function. The counts don't change which fixtures are chosen.
 - `test_triggers.observed.unobserved` lists the changed functions no fixture ran. The static `run` list is all there is for those.
 - The static `run` list stays as it was. A test written since the recording exists only in the source.
 
 Agents get the same from the `test_triggers` tool. `select: "minimal"` asks for the cheaper set.
+
+[`ccc probe`](#ccc-probe) produces records. What they change on the example projects is in [Instrumentation.md](Instrumentation.md).
+
+## ccc probe
+
+Writes a copy of the project with ccc's runtime probes in. One run of your suites in the copy records which tests executed which functions, across every service and language the tests reach. Those records are what [observed coverage](#observed-coverage) reads. The project itself is never changed.
+
+```sh
+ccc probe go . --out /tmp/probed                                    # one language
+ccc probe go,python . --out /tmp/probed                             # several, into one copy
+ccc probe rust services/billing --out /tmp/billing --kind 'tests/e2e/**=smoke'
+```
+
+In the copy:
+
+- Every function the map holds counts its runs, under the name and owner the map gives it.
+- Every test names itself a fixture: Go `TestXxx`, Rust `#[test]` and its kin, pytest tests and unittest methods, `it` and `test` callbacks, and gtest, Catch2, doctest and Boost.Test macros.
+- Servers, clients and work handed to other threads carry the fixture, between processes as a W3C `baggage` header or gRPC metadata.
+- The runtime goes in `.ccc-probe/`, or in `node_modules/ccc-probe` for TypeScript, and the build files that need to find it are edited.
+
+Probes go in on the line they belong to, so the copy keeps every line number. Python is the exception, for a function that opens with a block statement. [Instrumentation.md](Instrumentation.md#instrumenting-a-project) lists what each language covers.
+
+The probes record nothing until `CCC_OBSERVED_DIR` names a directory. `CCC_SERVICE` names the process in its records, `CCC_RUN` names the run, and `CCC_COMMIT` overrides the commit the copy was made from.
+
+| Option | Default | What it does |
+|---|---|---|
+| `LANG` | required | `go`, `rust`, `cpp` (or `c++`), `typescript` (or `ts`) or `python` (or `py`). Comma-separate several to probe them into one copy. |
+| `PATH` | `.` | The project, or the part of it, to instrument. |
+| `--out DIR` | required | Where the copy goes. |
+| `--kind GLOB=KIND` | from the path | The fixture kind of the tests a glob matches: `unit`, `contract`, `interop`, `integration`, `smoke` or `load`. Repeatable, and the first match wins. Without one, the kind comes from the test file's name, then its directories, innermost first. |
+| `--root DIR` | the nearest `.ccc` or `.git` above `PATH` | The directory record paths are relative to. Records match the map only when this is the directory ccc runs in. |
+| `--force` | off | Write into an `--out` that already holds files. |
+| `--format FMT` | `text` | `json` prints the report as one object. |
 
 ## ccc deps
 
@@ -315,7 +351,7 @@ Copilot's chat log keeps no record of tool calls, so only Claude Code sessions a
 
 ## ccc replay
 
-Manages replays: the story of what agents did on a branch, kept under `refs/ccc/replay/<branch>`. They sit beside your branches, never in them, so a merge can't carry one into the default branch. Recording is opt-in per repository. [Advanced.md](Advanced.md#replays) covers how replays are kept private.
+Manages replays: the story of what agents did on a branch, kept under `refs/ccc/replay/<branch>`. They sit beside your branches, never in them, so a merge can't carry one into the default branch. Recording is opt-in per repository. [Developers And Agents](Advanced.md#replays) covers how replays are kept private.
 
 ### ccc replay enable
 

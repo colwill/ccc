@@ -2874,7 +2874,7 @@ const INTENT_DOC: &str = "required - why THIS change, in one terse line specific
 // what a read tool's `why` asks for
 const WHY_DOC: &str = "why you are looking, in one terse line (`find where the retry is set`) - shown on the visualiser's timeline so a person watching follows your reasoning (optional)";
 // the edit tools that stage a change, each of which must say why
-const STAGING: &[&str] = &["edit_rename", "edit_replace", "edit_delete", "edit_insert", "edit_text"];
+const STAGING: &[&str] = &["edit_rename", "edit_replace", "edit_delete", "edit_insert", "edit_text", "edit_move"];
 
 fn mcp_tools() -> Value {
     let tool = |name: &str, desc: &str, props: Value, required: &[&str]| {
@@ -3144,7 +3144,7 @@ fn mcp_tools() -> Value {
         ),
         tool(
             "edit_text",
-            "EVERY OTHER WRITE TO THIS PROJECT - lines inside a function, a config or doc file, a new file, a removed file. With `old`: replaces that exact text in `path`; it must occur once unless all=true, whitespace and indentation included. Without `old`: writes `new` as the whole file, creating it and its directories if needed. delete=true removes the file. The path stays inside the project root - no `..`, no symlinked directory or file, never `.git`, and under `.ccc` only map.json and surface.json. Stages a changeset and returns its diff; pass apply=true to write it in the same call when the diff would tell you nothing new.",
+            "EVERY OTHER WRITE TO THIS PROJECT - lines inside a function, a config or doc file, a new file, a removed file. With `old`: replaces that exact text in `path`; it must occur once unless all=true, whitespace and indentation included. Without `old`: writes `new` as the whole file, creating it and its directories if needed. delete=true removes the file, and any directory that leaves empty. To move or rename a file or directory, use `edit_move`. The path stays inside the project root - no `..`, no symlinked directory or file, never `.git`, and under `.ccc` only map.json and surface.json. Stages a changeset and returns its diff; pass apply=true to write it in the same call when the diff would tell you nothing new.",
             json!({
                 "path": {"type": "string", "description": "project-relative path"},
                 "old": {"type": "string", "description": "exact text to replace (omit to write the whole file)"},
@@ -3156,6 +3156,18 @@ fn mcp_tools() -> Value {
                 "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
             }),
             &["path", "intent"],
+        ),
+        tool(
+            "edit_move",
+            "MOVES OR RENAMES A FILE OR A WHOLE DIRECTORY in one call, instead of writing each file again at its new path and removing the old one. `from` is a file or a directory; `to` is the path it becomes, which must be free (an empty directory may stand there). A directory goes with every file under it, hidden ones included; each file's text goes over as it is, and a directory the move empties is removed. Refuses a symlink inside, a file that is not text, a move into itself, and the paths `edit_text` refuses - outside the root, in `.git`, or under `.ccc` other than map.json and surface.json. The diff gives one `rename old -> new` line per file rather than its text. Nothing that refers to the old path is changed - `find` those and fix them with `edit_text`, in the same changeset if you like. Stages a changeset and returns its diff.",
+            json!({
+                "from": {"type": "string", "description": "project-relative file or directory to move"},
+                "to": {"type": "string", "description": "the project-relative path it becomes"},
+                "changeset": {"type": "string", "description": "stage into this pending changeset instead of opening a new one"},
+                "intent": {"type": "string", "description": INTENT_DOC},
+                "apply": {"type": "boolean", "description": "write it in this same call (default false)"},
+            }),
+            &["from", "to", "intent"],
         ),
         tool(
             "edit_apply",
@@ -3260,7 +3272,8 @@ fn mcp_initialize(params: &Value, auto: bool) -> Value {
             whole definition at each site, `edit_delete` removes definitions, statement \
             calls, imports or notes and refuses while anything still names what it removes, \
             `edit_insert` adds code beside a site. For anything else - lines inside a \
-            function, config, docs, a new or removed file - `edit_text`. Each stages a \
+            function, config, docs, a new or removed file - `edit_text`; to move or rename \
+            a file or a whole directory, `edit_move`, never `mv`. Each stages a \
             changeset and shows its diff: read it, then `edit_apply` it (or pass apply=true \
             when the diff would tell you nothing new); `edit_discard` drops one, \
             `edit_revert` undoes an applied one. Every staging call needs `intent`, one \
@@ -3305,8 +3318,8 @@ fn mcp_initialize(params: &Value, auto: bool) -> Value {
             project's own code - secrets, disabled TLS, injection surfaces. `search` \
             is the only way to the web, internal portals included, and `violations` \
             reports where agents broke these rules. Edits: \
-            `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` and `edit_text` \
-            stage a changeset, `edit_apply` writes it, `edit_discard` drops it, \
+            `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert`, `edit_text` and \
+            `edit_move` stage a changeset, `edit_apply` writes it, `edit_discard` drops it, \
             `edit_revert` undoes it. \
             The analysis tools are \
             heuristics over a syntax tree - no type inference, data flow or runtime \
@@ -4361,14 +4374,21 @@ fn md_observed(v: &Value, select: Option<&str>) -> Option<(String, String)> {
     );
     body.push_str(&md_commands(&jarr(sel, "commands"), &format!("test_triggers.observed.{mode}.commands")));
     for f in &fixtures {
-        let covers: Vec<String> = jarr(f, "covers").iter().filter_map(|c| c.as_str().map(str::to_string)).collect();
+        // each changed function it ran - with how many times, when its probe counted
+        let ran: Vec<String> = jarr(f, "ran")
+            .iter()
+            .map(|r| match r["calls"].as_u64() {
+                Some(n) => format!("{} ×{n}", jstr(r, "function")),
+                None => jstr(r, "function").to_string(),
+            })
+            .collect();
         let place = if jstr(f, "file").is_empty() { "(outside this repo)".to_string() } else { at(f) };
         body.push_str(&format!(
             "[{}] {} {} - ran {}{}\n",
             jstr(f, "kind"),
             place,
             jstr(f, "fixture"),
-            if covers.is_empty() { "nothing that changed".to_string() } else { covers.join(", ") },
+            if ran.is_empty() { "nothing that changed".to_string() } else { ran.join(", ") },
             if jbool(f, "changed") { " - and changed itself" } else { "" },
         ));
     }
@@ -5149,6 +5169,7 @@ fn edit_tool_call(state: &RwLock<MapState>, name: &str, args: &Value) -> Value {
                     &stage,
                 )
             }),
+            "edit_move" => need("from").and_then(|f| need("to").and_then(|t| edit::move_path(&ctx, store, &f, &t, &stage))),
             "edit_apply" => need("changeset").and_then(|c| edit::apply(&map.root, store, &c)),
             "edit_discard" => edit::discard(store, s("changeset").as_deref()),
             "edit_revert" => need("changeset").and_then(|c| edit::revert(&map.root, store, &c)),
@@ -7239,6 +7260,7 @@ mod tests {
                 "edit_delete",
                 "edit_insert",
                 "edit_text",
+                "edit_move",
                 "edit_apply",
                 "edit_discard",
                 "edit_revert",
@@ -7486,8 +7508,9 @@ mod tests {
     // the observed section shows the selection asked for, and says when a cover was only found greedily
     #[test]
     fn test_triggers_render_the_observed_selection_asked_for() {
-        let fixture = |name: &str| {
-            json!({"fixture": name, "file": "tests/test_api.py", "line": 3, "kind": "integration", "covers": ["Fee"], "changed": false})
+        let fixture = |name: &str, calls: Value| {
+            json!({"fixture": name, "file": "tests/test_api.py", "line": 3, "kind": "integration", "covers": ["Fee"],
+                   "ran": [{"function": "Fee", "file": "svc/a.go", "calls": calls}], "changed": false})
         };
         let v = json!({
             "available": true,
@@ -7496,9 +7519,9 @@ mod tests {
                 "records": 4,
                 "sources": [".ccc/observed"],
                 "observed_functions": 1,
-                "safe": {"fixtures": [fixture("test_refund"), fixture("test_soak")], "cost": 458000, "exact": true,
+                "safe": {"fixtures": [fixture("test_refund", json!(2)), fixture("test_soak", json!(400))], "cost": 458000, "exact": true,
                          "commands": [{"language": "python", "command": "pytest -k \"test_refund or test_soak\"", "selects": 2, "caveat": ""}]},
-                "minimal": {"fixtures": [fixture("test_refund")], "cost": 8000, "exact": false, "commands": []},
+                "minimal": {"fixtures": [fixture("test_refund", Value::Null)], "cost": 8000, "exact": false, "commands": []},
                 "unobserved": [{"file": "svc/a.go", "function": "Spare"}],
                 "errors": [],
             },
@@ -7508,9 +7531,12 @@ mod tests {
         assert!(safe.contains("## observed - safe") && safe.contains("test_soak"), "{safe}");
         assert!(safe.contains("$ pytest -k \"test_refund or test_soak\""), "{safe}");
         assert!(safe.contains("1 changed function(s) no recorded fixture ran"), "{safe}");
+        assert!(safe.contains("test_soak - ran Fee ×400") && safe.contains("test_refund - ran Fee ×2"), "{safe}");
         let minimal = md_triggers(&v, &json!({}), Some("minimal"), page);
         assert!(minimal.contains("## observed - minimal") && !minimal.contains("test_soak"), "{minimal}");
         assert!(minimal.contains("found greedily"), "{minimal}");
+        // a probe that does not count leaves the bare name
+        assert!(minimal.contains("test_refund - ran Fee\n"), "{minimal}");
         // a report without records has no observed section at all
         let plain = md_triggers(&json!({"available": true}), &json!({}), None, page);
         assert!(!plain.contains("observed"), "{plain}");
@@ -8529,6 +8555,22 @@ mod tests {
         // the ledger `prompts` reads back holds what was applied, and stays out of git
         assert!(fs::read_to_string(dir.0.join(".ccc").join(edit::LEDGER_NAME)).unwrap().contains("docs/new.md"));
         assert!(read(&dir, ".gitignore").contains(&format!("/.ccc/{}", edit::LEDGER_NAME)));
+    }
+
+    #[test]
+    fn edit_move_carries_a_directory_and_the_map_follows() {
+        let (dir, state) = scratch("move", &[("src/lib.rs", "pub fn a() {}\n"), ("src/util/b.rs", "pub fn helper() {}\n")]);
+        let (err, staged) = tool(&state, "edit_move", json!({"from": "src/util", "to": "src/helpers"}));
+        assert!(!err && staged.contains("rename src/util/b.rs -> src/helpers/b.rs"), "{staged}");
+        let (err, out) = tool(&state, "edit_apply", json!({"changeset": id_after(&staged, "changeset `")}));
+        assert!(!err && out.contains("src/helpers/b.rs (moved from src/util/b.rs)"), "{out}");
+        assert_eq!(read(&dir, "src/helpers/b.rs"), "pub fn helper() {}\n");
+        assert!(!dir.0.join("src/util").exists(), "the emptied directory is gone");
+        // the rescanned map finds the function at its new path
+        let (_, found) = tool(&state, "find", json!({"query": "helper"}));
+        assert!(found.contains("src/helpers/b.rs"), "{found}");
+        let (err, out) = tool(&state, "edit_move", json!({"from": "src/lib.rs"}));
+        assert!(err && out.contains("missing `to`"), "{out}");
     }
 
     #[test]

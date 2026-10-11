@@ -1,7 +1,7 @@
 
 <p align="center" style="width:100%"><a href="https://github.com/colwill/ccc" target="_blank"><img src="../visual.png" alt="Code Change Capture Visualiser Example"></a></p>
 
-# Advanced
+# Developers And Agents
 
 Ways to see and review what changed, beyond the command line:
 
@@ -23,7 +23,7 @@ ccc run --vis
 
 | Level | Boxes | Arrows |
 |---|---|---|
-| Context | the system; peer repositories from `externals` in `.ccc/map.json`; endpoints nothing in the map answers | `ccc:calls` / `ccc:serves` crossings, by transport |
+| Context | the system; peer repositories from `externals` in `.ccc/map.json`; endpoints nothing in the map answers |  cross-calls, by transport |
 | Containers | services from `.ccc/map.json`, or top-level directories without one | resolved and declared calls between services |
 | Components | the files in one container; other containers it touches sit outside the boundary | file-to-file calls |
 | Code | the functions in one file, each with an input pin and one output pin per function it calls | resolved calls; functions in other files as stand-ins |
@@ -103,7 +103,6 @@ To build only the extension: `cd extensions/vscode && npm install && npm run pac
 | `▲ 37 callers` | A hot path: among the most called, most complex or widest fan-out. |
 | `↻ cycle of 3` | The function is in a call cycle. |
 | `↑ calls billing in acme/billing` | The call leaves the repository. Opens the handler when that peer is checked out locally. |
-| `? billing.v1.Charge unanswered` | A `ccc:calls` whose key nothing serves: a typo at one end, or a peer missing from `externals`. |
 
 Test, coverage and service-boundary hints are based on the diff. A file identical to the base ref has none, by design. Hot paths and cycles come from the call graph alone, so they show on any file. Every function also shows its complexity as a circled number from 1 to 10 between its name and signature, coloured from grey to red as it climbs.
 
@@ -182,7 +181,7 @@ This repo has a Code Change Capture (ccc) map, served over MCP. Use it as the en
 - Every interaction: use `ccc` tool calls to gather information about the source of this project.
 - All thinking, navigation, and questions about the codebase go through the MCP server tools: (index, find, references, dependencies, vulnerabilities, deps, security, file, notes, changes, prompts, pr_summary, test_triggers, test_targets, lints, hot, services, search, violations, refresh)
 - The web, internal docs and portals included, goes through `search`: `query` to search the configured endpoints, `url` to fetch one https page. Never WebFetch, WebSearch, another MCP server's fetch or browser tool, or `curl`/`wget` - ccc can't track those, and `violations` reports each one. If `search` refuses a URL, leave it unreached.
-- ccc is the only writer: make every change through its edit tools - `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert` or `edit_text`, then `edit_apply` - never your own Edit/Write tools, `sed -i` or shell redirection. `edit_discard` drops a staged changeset and `edit_revert` undoes an applied one.
+- ccc is the only writer: make every change through its edit tools - `edit_rename`, `edit_replace`, `edit_delete`, `edit_insert`, `edit_text` or `edit_move`, then `edit_apply` - never your own Edit/Write tools, `sed -i`, `mv` or shell redirection. `edit_discard` drops a staged changeset and `edit_revert` undoes an applied one.
 - `edit_apply` rescans the map before it answers; call `refresh` only after a change made outside ccc.
 ```
 

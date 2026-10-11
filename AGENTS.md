@@ -22,5 +22,6 @@ to pick the new one up.
     - a symbol: take the handle a `find` / `references` answer ends with and pass it to `edit_rename`,
       `edit_replace`, `edit_delete` or `edit_insert`
     - anything else (lines inside a function, docs, config, a new or removed file): `edit_text`
+    - a moved or renamed file or directory: `edit_move`, never `mv`
     - read the staged diff, then `edit_apply`; `edit_discard` drops a changeset, `edit_revert` undoes an applied one
 - `edit_apply` rescans the map before it answers; call `refresh` only after a change made outside ccc.

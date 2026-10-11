@@ -1,0 +1,19 @@
+# ccc's rust probe - written into an instrumented copy by `ccc probe rust`, never published
+[package]
+name = "ccc_probe"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.70"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[features]
+# a tower layer for axum and tonic servers - turned on for packages that depend on either
+tower = ["dep:http", "dep:tower-layer", "dep:tower-service"]
+
+[dependencies]
+http = { version = "1", optional = true }
+tower-layer = { version = "0.3", optional = true }
+tower-service = { version = "0.3", optional = true }

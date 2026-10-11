@@ -71,6 +71,8 @@ export interface TestLink {
   confidence: TestConfidence;
   // how the analyser tied this test to the function - absent on legacy payloads
   evidence?: string;
+  // how many times a recorded run saw the test run the function
+  calls?: number;
 }
 
 export type CoverageStatus = 'tested' | 'untested' | 'test-code';
@@ -665,6 +667,7 @@ function linkTests(
         reason: run ? str(run.reason) || undefined : undefined,
         confidence: 'exact',
         evidence: str(site.evidence) || undefined,
+        calls: num(site.calls, -1) >= 0 ? num(site.calls) : undefined,
       };
     });
     links.sort((a, b) => (a.distance ?? 99) - (b.distance ?? 99) || a.name.localeCompare(b.name));

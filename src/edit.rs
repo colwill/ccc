@@ -34,6 +34,8 @@ const CCC_WRITABLE: &[&str] = &["map.json", "surface.json"];
 const CALL_WRAPPERS: &[&str] = &["await_expression", "await", "try_expression", "parenthesized_expression"];
 // the phrase an applied changeset is reported with - `prompts` reads it out of transcripts
 const APPLIED_PHRASE: &str = "applied changeset ";
+// files one move carries - each is held as text until it is written
+const MAX_MOVE: usize = 5000;
 
 // one place a `find` or `references` answer pointed at
 #[derive(Debug, Clone)]
@@ -152,6 +154,8 @@ pub struct Changeset {
     files: BTreeMap<String, FileChange>,
     // identifiers renamed old to new - counted again once applied
     renames: BTreeMap<String, String>,
+    // files moved whole, new path to old - told as a move rather than a removal and a new file
+    moved: BTreeMap<String, String>,
     // why, one terse line per staging call that gave one - for the timeline
     intents: Vec<String>,
     // each staging call's own change, in the order they came - so the
@@ -236,6 +240,7 @@ impl Store {
                     ops: Vec::new(),
                     files: BTreeMap::new(),
                     renames: BTreeMap::new(),
+                    moved: BTreeMap::new(),
                     intents: Vec::new(),
                     calls: Vec::new(),
                 })
@@ -300,6 +305,14 @@ pub struct FileText {
 }
 
 impl Changeset {
+    // where a file this changeset moved came from - only while the old path stays removed and the new one holds text
+    fn origin(&self, rel: &str) -> Option<&str> {
+        let old = self.moved.get(rel)?;
+        let gone = self.files.get(old).is_some_and(|fc| fc.before.is_some() && fc.after.is_none());
+        let here = self.files.get(rel).is_some_and(|fc| fc.after.is_some());
+        (gone && here).then_some(old.as_str())
+    }
+
     // the files this changeset moves, as one step; a revert runs the change
     // backwards, so its before and after swap
     fn activity(&self, status: &'static str) -> Activity {
@@ -346,6 +359,15 @@ impl Changeset {
 
 // a project-relative path resolved inside the root - no `..`, no symlink on the way, never `.git`, only hand-edited `.ccc` files
 pub fn confine(root: &Path, raw: &str) -> Result<(String, PathBuf), String> {
+    let (rel, abs) = confine_path(root, raw)?;
+    if abs.is_dir() {
+        return Err(format!("`{rel}` is a directory, not a file"));
+    }
+    Ok((rel, abs))
+}
+
+// the same checks for a path that may name a directory - what a move carries
+fn confine_path(root: &Path, raw: &str) -> Result<(String, PathBuf), String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains('\0') {
         return Err("an empty path names no file".into());
@@ -401,11 +423,7 @@ pub fn confine(root: &Path, raw: &str) -> Result<(String, PathBuf), String> {
             Err(e) => return Err(format!("`{rel_str}`: {e}")),
         }
     }
-    let abs = root.join(&clean);
-    if abs.is_dir() {
-        return Err(format!("`{rel_str}` is a directory, not a file"));
-    }
-    Ok((rel_str, abs))
+    Ok((rel_str, root.join(&clean)))
 }
 
 // file text
@@ -1700,6 +1718,116 @@ pub fn text(
     })
 }
 
+// moves a file, or a directory with every file under it, to a new path - each text goes over as it is and the old path is removed
+pub fn move_path(ctx: &Ctx, store: &mut Store, from: &str, to: &str, stage: &Stage) -> Result<Outcome, String> {
+    staged(ctx, store, stage, |ctx, _, cs| {
+        let (src, _) = confine_path(ctx.root, from)?;
+        let (dst, dst_abs) = confine_path(ctx.root, to)?;
+        if src == dst {
+            return Err(format!("`{src}` is already there - nothing to move"));
+        }
+        if dst.starts_with(&format!("{src}/")) {
+            return Err(format!("`{dst}` is inside `{src}` - nothing can move into itself"));
+        }
+        // a file moves alone, a directory with every file under it
+        let is_file = match cs.files.get(&src) {
+            Some(fc) => fc.after.is_some(),
+            None => ctx.root.join(&src).is_file(),
+        };
+        let olds: Vec<String> = if is_file {
+            vec![src.clone()]
+        } else {
+            files_under(ctx.root, cs, &src)?.into_iter().collect()
+        };
+        if olds.is_empty() {
+            return Err(format!("`{src}` does not exist - nothing to move"));
+        }
+        if olds.len() > MAX_MOVE {
+            return Err(format!(
+                "`{src}` holds {} files - one move carries at most {MAX_MOVE}, so move its parts one by one",
+                olds.len()
+            ));
+        }
+        // the path it becomes must be free - an empty directory may stand there
+        let inside = format!("{dst}/");
+        let taken = match cs.files.get(&dst) {
+            Some(fc) => fc.after.is_some(),
+            None => dst_abs.is_file() || fs::read_dir(&dst_abs).is_ok_and(|mut d| d.next().is_some()),
+        } || cs.files.iter().any(|(rel, fc)| fc.after.is_some() && rel.starts_with(&inside));
+        if taken {
+            return Err(format!("`{dst}` already exists - `to` is the path `{src}` becomes, so it must be free"));
+        }
+        for old in &olds {
+            let (new, _) = confine(ctx.root, &format!("{dst}{}", &old[src.len()..]))?;
+            let text = match cs.files.get(old) {
+                Some(fc) => fc.after.clone(),
+                None => {
+                    let (_, abs) = confine(ctx.root, old)?;
+                    match fs::read_to_string(&abs) {
+                        Ok(t) => Some(t),
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            return Err(format!("`{old}` is not text - the edit tools carry text only, so nothing was moved"));
+                        }
+                        Err(e) => return Err(format!("reading {old}: {e}")),
+                    }
+                }
+            };
+            if text_of(ctx.root, cs, &new)?.is_some() {
+                return Err(format!("`{new}` already exists - nothing was moved"));
+            }
+            put(ctx.root, cs, &new, text)?;
+            put(ctx.root, cs, old, None)?;
+            // a file moved twice keeps where it first came from
+            let first = cs.moved.remove(old).unwrap_or_else(|| old.clone());
+            if first != new {
+                cs.moved.insert(new, first);
+            }
+        }
+        let n = olds.len();
+        cs.ops.push(format!("move {src} -> {dst} ({n} file(s))"));
+        Ok(format!(
+            "# edit_move {src} -> {dst} ({n} file(s)) -> changeset `{}` (staged, nothing written yet)\n",
+            cs.id
+        ))
+    })
+}
+
+// every file under a directory as this changeset leaves it - a symlink inside is refused, since moving it could carry a write outside the project
+fn files_under(root: &Path, cs: &Changeset, dir: &str) -> Result<BTreeSet<String>, String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![root.join(dir)];
+    while let Some(at) = stack.pop() {
+        let entries = match fs::read_dir(&at) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("reading {}: {e}", at.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("reading {}: {e}", at.display()))?;
+            let path = entry.path();
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let kind = entry.file_type().map_err(|e| format!("reading {rel}: {e}"))?;
+            if kind.is_symlink() {
+                return Err(format!("`{rel}` is a symlink - a move could carry a write outside the project, so nothing was moved"));
+            }
+            if kind.is_dir() {
+                stack.push(path);
+            } else {
+                out.insert(rel);
+            }
+        }
+    }
+    let prefix = format!("{dir}/");
+    for (rel, fc) in cs.files.iter().filter(|(rel, _)| rel.starts_with(&prefix)) {
+        if fc.after.is_some() {
+            out.insert(rel.clone());
+        } else {
+            out.remove(rel);
+        }
+    }
+    Ok(out)
+}
+
 // writing
 
 // every file of a changeset written or none - each checked against what is expected there, swapped in through a temp file
@@ -1774,7 +1902,23 @@ fn write_all(root: &Path, cs: &Changeset, forward: bool) -> Result<Vec<String>, 
         }
         done.push((abs, *expect));
     }
+    for (i, (_, abs, _, _)) in plan.iter().enumerate() {
+        if temps[i].is_none() {
+            prune_empty(root, abs);
+        }
+    }
     Ok(plan.into_iter().map(|p| p.0).collect())
+}
+
+// the directories above a removed file that it left empty, up to the root - `remove_dir` takes only an empty one
+fn prune_empty(root: &Path, file: &Path) {
+    let mut dir = file.parent();
+    while let Some(d) = dir.filter(|d| *d != root && d.starts_with(root)) {
+        if fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
 }
 
 // writes a pending changeset, then checks every renamed name is gone
@@ -1794,14 +1938,23 @@ pub fn apply(root: &Path, store: &mut Store, id: &str) -> Result<Outcome, String
             return Err(format!("{e}\nchangeset `{id}` is still pending - `edit_discard` it and stage again"));
         }
     };
-    let mut out = format!("# edit_apply - {APPLIED_PHRASE}`{id}`\n{} file(s) written:\n", written.len());
-    for rel in &written {
+    // a move is told at its new path - the old one is the other half of it
+    let vacated: BTreeSet<&str> = written.iter().filter_map(|rel| cs.origin(rel)).collect();
+    let listed: Vec<&String> = written.iter().filter(|rel| !vacated.contains(rel.as_str())).collect();
+    let mut out = format!("# edit_apply - {APPLIED_PHRASE}`{id}`\n{} file(s) written:\n", listed.len());
+    for rel in listed {
         let fc = &cs.files[rel];
-        let (adds, dels) = counts(fc.before.as_deref(), fc.after.as_deref());
-        let what = match (&fc.before, &fc.after) {
-            (None, _) => "new file".to_string(),
-            (_, None) => "removed".to_string(),
-            _ => format!("+{adds} -{dels}"),
+        let what = match (cs.origin(rel), &fc.before, &fc.after) {
+            (Some(old), _, _) => match counts(cs.files[old].before.as_deref(), fc.after.as_deref()) {
+                (0, 0) => format!("moved from {old}"),
+                (adds, dels) => format!("moved from {old}, +{adds} -{dels}"),
+            },
+            (None, None, _) => "new file".to_string(),
+            (None, _, None) => "removed".to_string(),
+            (None, before, after) => {
+                let (adds, dels) = counts(before.as_deref(), after.as_deref());
+                format!("+{adds} -{dels}")
+            }
         };
         out.push_str(&format!("  {rel} ({what})\n"));
     }
@@ -1812,6 +1965,7 @@ pub fn apply(root: &Path, store: &mut Store, id: &str) -> Result<Outcome, String
             ops: Vec::new(),
             files: BTreeMap::new(),
             renames: BTreeMap::new(),
+            moved: BTreeMap::new(),
             intents: Vec::new(),
             calls: Vec::new(),
         };
@@ -1901,9 +2055,18 @@ fn ledger_entry(cs: &Changeset) -> Value {
         .iter()
         .filter(|(_, fc)| fc.before != fc.after)
         .map(|(rel, fc)| {
-            let written = added_lines(fc.before.as_deref(), fc.after.as_deref());
+            // a moved file wrote only what differs from the text it moved from
+            let origin = cs.origin(rel);
+            let since = match origin {
+                Some(old) => cs.files[old].before.as_deref(),
+                None => fc.before.as_deref(),
+            };
+            let written = added_lines(since, fc.after.as_deref());
             let written: String = written.chars().take(LEDGER_TEXT_CAP).collect();
-            json!({"path": rel, "written": written})
+            match origin {
+                Some(old) => json!({"path": rel, "written": written, "from": old}),
+                None => json!({"path": rel, "written": written}),
+            }
         })
         .collect();
     json!({
@@ -2282,8 +2445,21 @@ pub(crate) fn unified(rel: &str, before: Option<&str>, after: Option<&str>) -> V
 // the whole changeset as a diff, capped
 fn preview(cs: &Changeset) -> String {
     let mut lines: Vec<String> = Vec::new();
-    for (rel, fc) in cs.files.iter().filter(|(_, fc)| fc.before != fc.after) {
-        lines.extend(unified(rel, fc.before.as_deref(), fc.after.as_deref()));
+    // a move is told once, at its new path - not as its whole text removed and written again
+    let vacated: BTreeSet<&str> = cs.files.keys().filter_map(|rel| cs.origin(rel)).collect();
+    for (rel, fc) in cs.files.iter().filter(|(rel, fc)| fc.before != fc.after && !vacated.contains(rel.as_str())) {
+        match cs.origin(rel) {
+            Some(old) => {
+                let was = cs.files[old].before.as_deref();
+                lines.push(format!("rename {old} -> {rel}"));
+                if was != fc.after.as_deref() {
+                    let mut diff = unified(rel, was, fc.after.as_deref());
+                    diff[0] = format!("--- a/{old}");
+                    lines.extend(diff);
+                }
+            }
+            None => lines.extend(unified(rel, fc.before.as_deref(), fc.after.as_deref())),
+        }
     }
     if lines.is_empty() {
         return "the changeset leaves every file as it is\n".into();
@@ -2432,6 +2608,7 @@ mod tests {
                 ("c.rs".to_string(), file(Some("x\n"), Some("x\n"))),
             ]),
             renames: BTreeMap::new(),
+            moved: BTreeMap::new(),
             intents: Vec::new(),
             calls: Vec::new(),
         };
@@ -2490,6 +2667,84 @@ mod tests {
         assert_eq!(intents, ["add b", "call b"]);
         assert_eq!(reverted[0].files[0].after.as_deref(), Some("fn a() { b(); }\n"));
         assert_eq!(reverted[1].files[0].after.as_deref(), Some("fn a() {}\n"));
+    }
+
+    // A directory moves as one change - told file by file as moves, written all
+    // at once, its emptied tree removed, and put back whole by a revert.
+    #[test]
+    fn a_directory_moves_whole_and_leaves_no_empty_directory_behind() {
+        let dir = Dir::new("move");
+        let root = &dir.0;
+        fs::create_dir_all(root.join("old/deep")).unwrap();
+        fs::write(root.join("old/a.rs"), "fn a() {}\n").unwrap();
+        fs::write(root.join("old/deep/b.md"), "# b\n").unwrap();
+        fs::write(root.join("old/.hidden"), "h\n").unwrap();
+        let caches = Vec::new();
+        let ctx = Ctx { root, caches: &caches };
+        let mut store = Store::new();
+        let stage = Stage { intent: Some("rename the project".into()), ..Default::default() };
+        let staged = move_path(&ctx, &mut store, "old", "new", &stage).unwrap();
+        // each file is one line, not its text removed and written again
+        assert!(staged.text.contains("rename old/a.rs -> new/a.rs"), "{}", staged.text);
+        assert!(!staged.text.contains("+fn a() {}"), "{}", staged.text);
+        let id = staged.activity[0].changeset.clone();
+
+        let done = apply(root, &mut store, &id).unwrap();
+        assert!(done.text.contains("3 file(s) written"), "{}", done.text);
+        assert!(done.text.contains("new/deep/b.md (moved from old/deep/b.md)"), "{}", done.text);
+        assert_eq!(fs::read_to_string(root.join("new/deep/b.md")).unwrap(), "# b\n");
+        assert_eq!(fs::read_to_string(root.join("new/.hidden")).unwrap(), "h\n");
+        assert!(!root.join("old").exists(), "the emptied tree goes with its files");
+        // the ledger keeps the move, not the moved text as new writing
+        let ledger = fs::read_to_string(root.join(".ccc").join(LEDGER_NAME)).unwrap();
+        assert!(ledger.contains(r#""from":"old/a.rs""#), "{ledger}");
+        assert!(!ledger.contains("fn a() {}"), "{ledger}");
+
+        revert(root, &mut store, &id).unwrap();
+        assert_eq!(fs::read_to_string(root.join("old/deep/b.md")).unwrap(), "# b\n");
+        assert!(!root.join("new").exists());
+    }
+
+    #[test]
+    fn a_move_refuses_a_taken_path_itself_and_a_file_that_is_not_text() {
+        let dir = Dir::new("move-refuse");
+        let root = &dir.0;
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("a/x.txt"), "x\n").unwrap();
+        fs::write(root.join("a/logo.png"), [0x89u8, 0x50, 0xff, 0xfe]).unwrap();
+        fs::write(root.join("b.txt"), "b\n").unwrap();
+        let caches = Vec::new();
+        let ctx = Ctx { root, caches: &caches };
+        let mut store = Store::new();
+        let stage = Stage { intent: Some("tidy".into()), ..Default::default() };
+        let mut try_move = |from: &str, to: &str| move_path(&ctx, &mut store, from, to, &stage).map(|o| o.text);
+        assert!(try_move("a", "a/inner").unwrap_err().contains("into itself"));
+        assert!(try_move("a/x.txt", "b.txt").unwrap_err().contains("already exists"));
+        assert!(try_move("missing", "c").unwrap_err().contains("does not exist"));
+        assert!(try_move("a", "c").unwrap_err().contains("not text"), "one file that is not text stops the whole move");
+        assert!(try_move("b.txt", "../out.txt").is_err());
+        assert!(try_move("b.txt", ".git/b.txt").is_err());
+        // an empty directory may stand where a directory lands
+        fs::remove_file(root.join("a/logo.png")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        assert!(try_move("a", "c").unwrap().contains("rename a/x.txt -> c/x.txt"));
+        assert!(root.join("a/x.txt").exists(), "staged, nothing written yet");
+    }
+
+    #[test]
+    fn removing_the_last_file_of_a_directory_removes_the_directory() {
+        let dir = Dir::new("prune");
+        let root = &dir.0;
+        fs::create_dir_all(root.join("docs/old")).unwrap();
+        fs::write(root.join("docs/old/a.md"), "a\n").unwrap();
+        fs::write(root.join("docs/keep.md"), "k\n").unwrap();
+        let caches = Vec::new();
+        let ctx = Ctx { root, caches: &caches };
+        let mut store = Store::new();
+        let stage = Stage { intent: Some("drop the old page".into()), apply: true, ..Default::default() };
+        text(&ctx, &mut store, "docs/old/a.md", None, None, false, true, &stage).unwrap();
+        assert!(!root.join("docs/old").exists());
+        assert!(root.join("docs/keep.md").exists(), "a directory that still holds a file stays");
     }
 
     #[test]

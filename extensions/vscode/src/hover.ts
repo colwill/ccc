@@ -151,7 +151,7 @@ function testList(tests: TestLink[]): string[] {
             ? ' — direct'
             : ` — ${test.distance} call ${test.distance === 1 ? 'hop' : 'hops'} away`;
       out.push(
-        `- ${locationLink(test.name, test.file, test.line, true)} \`${where}\`${hops}${evidenceNote(test.evidence)}`,
+        `- ${locationLink(test.name, test.file, test.line, true)} \`${where}\`${hops}${evidenceNote(test.evidence, test.calls)}`,
       );
     } else {
       out.push(`- ${code(test.name)} — _not in the trigger set, so no location was recorded_`);
@@ -161,8 +161,11 @@ function testList(tests: TestLink[]): string[] {
 }
 
 // the weak tie and the run-observed one are worth a word - the rest are what "covered by" already implies
-function evidenceNote(evidence: string | undefined): string {
-  if (evidence === 'observed') return ' _(a recorded run saw it execute this)_';
+function evidenceNote(evidence: string | undefined, calls?: number): string {
+  if (evidence === 'observed') {
+    if (calls === undefined) return ' _(a recorded run saw it execute this)_';
+    return ` _(a recorded run saw it execute this ${calls === 1 ? 'once' : `${calls} times`})_`;
+  }
   return evidence === 'name-only' ? ' _(matched on the name alone)_' : '';
 }
 
