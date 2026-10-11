@@ -310,6 +310,30 @@ enum Command {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+    // a copy of the project with ccc's runtime probes in - every function counts its runs, every test names itself a
+    // fixture and every server and client carries that fixture, so one recorded run says which tests ran which code
+    Probe {
+        // go, rust, cpp (c++), typescript (ts) or python (py) - several, comma-separated, probe into one copy
+        #[arg(value_name = "LANG")]
+        langs: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        // where the instrumented copy goes - the project itself is never touched
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        // GLOB=KIND - the fixture kind of the tests a glob matches, over what their path says (unit, contract,
+        // interop, integration, smoke, load) - repeatable
+        #[arg(long = "kind", value_name = "GLOB=KIND")]
+        kinds: Vec<String>,
+        // write into an --out that already holds files
+        #[arg(long)]
+        force: bool,
+        // the directory records name files from - the nearest ccc project or repository above PATH by default
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+    },
     // Replays of what agents did on a branch, kept under `refs/ccc/replay/<branch>`
     // - beside the branches, never in them, so a merge cannot carry one to the
     // default branch. Recording is opt-in per repository (`ccc replay enable`);
@@ -853,6 +877,16 @@ fn run() -> Result<ExitCode> {
             };
             Ok(if gating > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
         }
+        Command::Probe { langs, path, out, kinds, force, root, format } => {
+            let targets = langs.split(',').map(|l| parse_target(l.trim())).collect::<std::result::Result<Vec<_>, _>>().map_err(|e| anyhow!(e))?;
+            let opts = codecache::probe::Options { targets, src: path, out, kinds, force, root };
+            let report = codecache::probe::probe(&opts)?;
+            match format {
+                OutputFormat::Text => print!("{}", report.describe()),
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Replay { action } => match action {
             ReplayCommand::Save { path, branch, remote, no_push, default_branch, quiet } => {
                 let opts = codecache::replay::SaveOptions { branch, remote, push: !no_push, default_branch };
@@ -984,6 +1018,10 @@ fn run() -> Result<ExitCode> {
         }
         Command::Install { path, dir, force } => run_install(path.or(dir), force),
     }
+}
+
+fn parse_target(s: &str) -> std::result::Result<codecache::probe::Target, String> {
+    codecache::probe::Target::parse(s).ok_or_else(|| format!("'{s}' is not a language ccc probes - go, rust, cpp, typescript or python"))
 }
 
 // shared by `prompts` and `pr-summary`

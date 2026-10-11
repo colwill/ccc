@@ -59,7 +59,7 @@ impl Rule {
     // the ccc tool that does the job instead
     pub fn instead(self) -> &'static str {
         match self {
-            Rule::WritesOutsideCcc => "edit_text, or edit_rename / edit_replace / edit_delete / edit_insert on a find or references handle, then edit_apply",
+            Rule::WritesOutsideCcc => "edit_text, edit_move for a moved or renamed file or directory, or edit_rename / edit_replace / edit_delete / edit_insert on a find or references handle, then edit_apply",
             Rule::ShellExploration => "index, find, references, file, dependencies or notes",
             Rule::WebOutsideSearch => "search",
             Rule::BlockedUrl => "nothing - the user's search rules refuse it",

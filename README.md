@@ -24,7 +24,7 @@ Because the static analyser provides an overwhelming amount of data; I've added 
 - **Controls** - All replays are encrypted by default for repo owners [runccc teams](https://teams.runccc.dev)
 - **Info Sec** - Search can be restricted to allow/block list
 - **Info Sec** - Bash/terminal use is disabled
-- **Audit** - Violations are tracked by ccc and reported on for the engineer
+- **Audit** - Violations reported for human review
 
 ## Install
 
@@ -46,8 +46,14 @@ Run ccc from a terminal or a pipeline. Serve the map to your agents, see what a 
 
 **[CLI.md](docs/CLI.md)** has one section per command: the command, its options, and what it is for.
 
-### 2. Advanced
+### 2. Developers And Agents
 
 Watch and review the work. Explore the project in the architecture visualiser, get hints in VS Code, and replay how an agent made a change.
 
-**[Advanced.md](docs/Advanced.md)** has one section each for the visualiser, IDEs and replays.
+**[Developers And Agents](docs/Advanced.md)** has one section each for the visualiser, IDEs and replays.
+
+### 3. Runtime Instrumentation
+
+Record one run of your test suites with ccc's probes in, and ccc knows which tests actually ran which functions, across every service and language they passed through. For any change, it picks the tests that ran the changed code. In the [examples](examples), changes that would otherwise run the whole 50-test suite need between 1 and 5 tests.
+
+**[Instrumentation.md](docs/Instrumentation.md)** covers what the examples prove, how tests and services are instrumented, and how to record in CI.

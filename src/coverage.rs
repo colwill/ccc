@@ -83,6 +83,8 @@ pub struct TestSite {
 pub struct TestRef {
     pub site: TestSite,
     pub evidence: Evidence,
+    // how many times a recorded run saw the test run the definition - `None` for static evidence and uncounted records
+    pub calls: Option<u64>,
 }
 
 // A definition: (index into `caches`, index into that file's `funcs`).
@@ -133,7 +135,7 @@ impl CoverageIndex {
         for (&def, fixtures) in &observed.ran {
             let mut refs: Vec<TestRef> = fixtures
                 .iter()
-                .map(|&f| TestRef { site: observed.fixtures[f].site(), evidence: Evidence::Observed })
+                .map(|&f| TestRef { site: observed.fixtures[f].site(), evidence: Evidence::Observed, calls: observed.calls(def, f) })
                 .collect();
             refs.sort_by(|x, y| (&x.site.file, &x.site.name).cmp(&(&y.site.file, &y.site.name)));
             self.observed.insert(def, refs);
@@ -458,7 +460,7 @@ pub(crate) fn build_over(
         .map(|(def, sites)| {
             let mut refs: Vec<TestRef> = sites
                 .into_iter()
-                .map(|(site, evidence)| TestRef { site, evidence })
+                .map(|(site, evidence)| TestRef { site, evidence, calls: None })
                 .collect();
             refs.sort_by(|x, y| {
                 (x.evidence, &x.site.file, &x.site.name).cmp(&(y.evidence, &y.site.file, &y.site.name))

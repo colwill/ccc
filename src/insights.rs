@@ -1743,7 +1743,7 @@ fn test_triggers(report: &changes::ChangesReport, trig: &Triggered, targets: &Va
 fn observed_triggers(report: &changes::ChangesReport, caches: &[FileCache], observed: &Observed) -> Value {
     let by_path: BTreeMap<String, usize> =
         caches.iter().enumerate().map(|(i, c)| (changes::path_str(&c.rel_path), i)).collect();
-    let mut changed: Vec<(DefId, &str)> = Vec::new();
+    let mut changed: Vec<(DefId, &str, &str)> = Vec::new();
     let mut unobserved = Vec::new();
     // a changed test that a record names is a fixture to rerun whatever else is chosen
     let mut rerun: BTreeSet<usize> = BTreeSet::new();
@@ -1755,12 +1755,12 @@ fn observed_triggers(report: &changes::ChangesReport, caches: &[FileCache], obse
         rerun.extend(observed.fixture_at(&c.file, &c.function));
         let is_test = changes::is_test_path(&c.file) || caches[fi].funcs[ki].test_ctx || changes::is_test_fn_name(&c.function);
         if observed.ran.contains_key(&(fi, ki)) {
-            changed.push(((fi, ki), c.function.as_str()));
+            changed.push(((fi, ki), c.function.as_str(), c.file.as_str()));
         } else if !is_test {
             unobserved.push(json!({"file": c.file, "function": c.function, "lines": c.lines}));
         }
     }
-    let defs: Vec<DefId> = changed.iter().map(|(d, _)| *d).collect();
+    let defs: Vec<DefId> = changed.iter().map(|(d, _, _)| *d).collect();
     let chosen = |sel: Selection| -> Value {
         let picked: Vec<usize> = sel.fixtures.iter().chain(&rerun).copied().collect::<BTreeSet<_>>().into_iter().collect();
         let mut by_lang: BTreeMap<&str, Vec<TestSite>> = BTreeMap::new();
@@ -1781,8 +1781,14 @@ fn observed_triggers(report: &changes::ChangesReport, caches: &[FileCache], obse
             .iter()
             .map(|&f| {
                 let fx = &observed.fixtures[f];
-                let covers: Vec<&str> =
-                    changed.iter().filter(|(d, _)| observed.ran[d].contains(&f)).map(|(_, name)| *name).take(8).collect();
+                let covered: Vec<&(DefId, &str, &str)> =
+                    changed.iter().filter(|(d, _, _)| observed.ran[d].contains(&f)).take(8).collect();
+                let covers: Vec<&str> = covered.iter().map(|(_, name, _)| *name).collect();
+                // how many times it ran each one - null from a probe that does not count
+                let ran: Vec<Value> = covered
+                    .iter()
+                    .map(|&&(d, name, file)| json!({"function": name, "file": file, "calls": observed.calls(d, f)}))
+                    .collect();
                 json!({
                     "fixture": fx.name,
                     "file": fx.file,
@@ -1794,6 +1800,7 @@ fn observed_triggers(report: &changes::ChangesReport, caches: &[FileCache], obse
                     "runs": fx.runs,
                     "services": fx.services,
                     "covers": covers,
+                    "ran": ran,
                     // the fixture is itself one of the changed functions
                     "changed": rerun.contains(&f),
                 })
@@ -3139,12 +3146,12 @@ pub fn helper() -> u64 { 1 }
         );
         let d = dir.path();
         std::fs::create_dir_all(d.join(".ccc/observed")).unwrap();
-        let record = |name: &str, kind: &str, ms: u64| {
-            format!(r#"{{"schema":"ccc-observed/1","fixture":{{"name":"{name}","kind":"{kind}","file":"tests/test_api.py","language":"python"}},"run":"nightly-7","duration_ms":{ms},"files":[{{"path":"svc/fee.go","functions":[{{"name":"Fee"}}]}}]}}"#)
+        let record = |name: &str, kind: &str, ms: u64, calls: u64| {
+            format!(r#"{{"schema":"ccc-observed/1","fixture":{{"name":"{name}","kind":"{kind}","file":"tests/test_api.py","language":"python"}},"run":"nightly-7","duration_ms":{ms},"files":[{{"path":"svc/fee.go","functions":[{{"name":"Fee","calls":{calls}}}]}}]}}"#)
         };
         std::fs::write(
             d.join(".ccc/observed/nightly.jsonl"),
-            [record("test_refund", "integration", 2_000), record("test_soak", "smoke", 90_000)].join("\n"),
+            [record("test_refund", "integration", 2_000, 2), record("test_soak", "smoke", 90_000, 400)].join("\n"),
         )
         .unwrap();
         run_git(d, &["init", "-q", "-b", "main"]);
@@ -3170,6 +3177,9 @@ pub fn helper() -> u64 { 1 }
         assert_eq!(o["minimal"]["exact"], true);
         let cmd = o["minimal"]["commands"][0]["command"].as_str().unwrap();
         assert_eq!(cmd, "pytest -k \"test_refund\"");
+        // each fixture says how many times it ran the changed function
+        let soak = &o["safe"]["fixtures"][1];
+        assert_eq!(soak["ran"], json!([{"function": "Fee", "file": "svc/fee.go", "calls": 400}]), "{soak}");
 
         // the change report names the fixtures as what tests `Fee`, strongest evidence first
         let fee = v["changes"]["changed_functions"]
@@ -3181,6 +3191,7 @@ pub fn helper() -> u64 { 1 }
         assert_eq!(fee["tested"], true);
         assert_eq!(fee["tested_by_sites"][0]["evidence"], "observed");
         assert_eq!(fee["tested_by_sites"][0]["test"], "test_refund");
+        assert_eq!(fee["tested_by_sites"][0]["calls"], 2);
         // and no gap is reported for a function a run saw executed
         assert!(v["test_triggers"]["add"].as_array().unwrap().is_empty(), "{}", v["test_triggers"]["add"]);
         drop(dir);

@@ -48,6 +48,8 @@ pub enum Kind {
     Interop,
     Integration,
     Smoke,
+    // performance under load - the dearest run there is
+    Load,
 }
 
 impl Kind {
@@ -58,6 +60,7 @@ impl Kind {
             Kind::Interop => "interop",
             Kind::Integration => "integration",
             Kind::Smoke => "smoke",
+            Kind::Load => "load",
         }
     }
 
@@ -69,6 +72,7 @@ impl Kind {
             Kind::Interop => 3,
             Kind::Integration => 4,
             Kind::Smoke => 5,
+            Kind::Load => 6,
         }
     }
 }
@@ -148,6 +152,9 @@ struct FuncIn {
     owner: Option<String>,
     #[serde(default)]
     line: Option<usize>,
+    // how many times it ran - absent from a probe that only notes that it ran
+    #[serde(default)]
+    calls: Option<u64>,
 }
 
 // one fixture across every record that names it
@@ -194,6 +201,8 @@ pub struct Observed {
     pub fixtures: Vec<Fixture>,
     // the fixtures that ran each definition
     pub ran: BTreeMap<DefId, BTreeSet<usize>>,
+    // how many times a fixture ran a definition - summed over the services of one run, the busiest run of several
+    pub calls: BTreeMap<(DefId, usize), u64>,
     // record paths no file in the map holds - another repository's, usually
     pub unmatched_files: BTreeSet<String>,
     // functions and line ranges a record names that the map no longer has
@@ -217,6 +226,11 @@ impl Observed {
     // the fixture a test function is, when a record names it
     pub fn fixture_at(&self, file: &str, name: &str) -> Option<usize> {
         self.fixtures.iter().position(|f| f.file.as_deref() == Some(file) && f.name == name)
+    }
+
+    // how many times `fixture` ran `def` - `None` when its records ran it without a count
+    pub fn calls(&self, def: DefId, fixture: usize) -> Option<u64> {
+        self.calls.get(&(def, fixture)).copied()
     }
 
     pub fn cost_of(&self, fixtures: &[usize]) -> u64 {
@@ -428,6 +442,8 @@ fn tie(root: &Path, caches: &[FileCache], records: &[Record], out: &mut Observed
     let mut located: BTreeMap<&str, Option<usize>> = BTreeMap::new();
     let mut moved: BTreeMap<&str, Option<BTreeSet<String>>> = BTreeMap::new();
     let mut keys: BTreeMap<(Option<&str>, Option<&str>, &str), usize> = BTreeMap::new();
+    // call counts by run - every service of one run adds to the same count, a rerun does not
+    let mut per_run: BTreeMap<(DefId, usize, Option<&str>), u64> = BTreeMap::new();
     for r in records {
         let fx = &r.fixture;
         let key = (fx.language.as_deref(), fx.file.as_deref(), fx.name.as_str());
@@ -473,6 +489,11 @@ fn tie(root: &Path, caches: &[FileCache], records: &[Record], out: &mut Observed
             for want in &file.functions {
                 let found = function(funcs, want, lines_hold);
                 out.unmatched += usize::from(found.is_empty());
+                if let Some(n) = want.calls {
+                    for &k in &found {
+                        *per_run.entry(((fi, k), at, r.run.as_deref())).or_default() += n;
+                    }
+                }
                 hits.extend(found);
             }
             // line ranges stand in for functions only when the record names none
@@ -487,6 +508,10 @@ fn tie(root: &Path, caches: &[FileCache], records: &[Record], out: &mut Observed
                 out.ran.entry((fi, k)).or_default().insert(at);
             }
         }
+    }
+    for ((def, at, _), n) in per_run {
+        let most = out.calls.entry((def, at)).or_default();
+        *most = (*most).max(n);
     }
 }
 
@@ -674,6 +699,30 @@ mod tests {
         assert_eq!(f.duration_ms, Some(1200));
         assert_eq!(f.services, BTreeSet::from(["billing".to_string(), "ledger".to_string()]));
         assert_eq!(f.cost(), 1200 * 4);
+    }
+
+    #[test]
+    fn call_counts_add_up_across_a_runs_services_and_a_rerun_does_not_double_them() {
+        let (dir, caches) = project("calls", &[("billing/server.go", BILLING)]);
+        let fee = def(&caches, "billing/server.go", "fee");
+        let rec = |name: &str, run: &str, service: &str, funcs: &str| {
+            format!(r#"{{"schema":"ccc-observed/1","fixture":{{"name":"{name}","kind":"integration","language":"go"}},"run":"{run}","service":{{"name":"{service}"}},"files":[{{"path":"billing/server.go","functions":[{funcs}]}}]}}"#)
+        };
+        let lines = [
+            // two processes of one run each ran fee for the same fixture
+            rec("TestRefund", "ci-1", "billing", r#"{"name":"fee","calls":3}"#),
+            rec("TestRefund", "ci-1", "ledger", r#"{"name":"fee","calls":4}"#),
+            // a quieter rerun of the same fixture
+            rec("TestRefund", "ci-2", "billing", r#"{"name":"fee","calls":5}"#),
+            // a probe that notes only that it ran
+            rec("TestFee", "ci-1", "billing", r#"{"name":"fee"}"#),
+        ];
+        let o = observed(&dir.0, &caches, &lines.iter().map(String::as_str).collect::<Vec<_>>());
+        let refund = o.fixtures.iter().position(|f| f.name == "TestRefund").unwrap();
+        let unit = o.fixtures.iter().position(|f| f.name == "TestFee").unwrap();
+        assert_eq!(o.calls(fee, refund), Some(7));
+        assert_eq!(o.calls(fee, unit), None);
+        assert_eq!(o.ran[&fee], BTreeSet::from([refund, unit]), "a fixture with no count still ran it");
     }
 
     #[test]

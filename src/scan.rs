@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 // don't scan these dirs even with `.gitignore`
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".ccc",
     ".git",
     ".hg",
@@ -29,7 +29,7 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 // skip lage files
-const MAX_FILE_BYTES: u64 = 2_000_000;
+pub(crate) const MAX_FILE_BYTES: u64 = 2_000_000;
 
 pub struct ScanReport {
     pub files: usize,

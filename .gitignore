@@ -1,6 +1,7 @@
 /target
 *.bin
 /example/
+/examples
 bench/
 /dist
 

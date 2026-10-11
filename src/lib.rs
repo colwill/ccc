@@ -17,6 +17,7 @@ pub mod observed;
 mod par;
 pub mod parse_cache;
 pub mod pr_summary;
+pub mod probe;
 pub mod prompts;
 pub mod render;
 pub mod replay;

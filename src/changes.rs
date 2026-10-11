@@ -176,8 +176,11 @@ pub struct TestedBySite {
     pub file: String,
     pub line: usize,
     pub language: String,
-    // receiver-type | same-file | import | qualifier | name-only, weakest last
+    // observed | receiver-type | same-file | import | qualifier | name-only, weakest last
     pub evidence: String,
+    // how many times a recorded run saw the test run this function - only on observed rows from a probe that counts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calls: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -604,6 +607,7 @@ pub(crate) fn assemble(
                     line: r.site.line,
                     language: r.site.language.to_string(),
                     evidence: r.evidence.label().to_string(),
+                    calls: r.calls,
                 })
                 .collect();
             let called_from: Vec<String> = symbol_callers

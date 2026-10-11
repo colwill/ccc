@@ -82,6 +82,8 @@ export interface TestedBySite {
   language: string;
   // observed | receiver-type | same-file | same-package | import | qualifier | rpc | name-only
   evidence: string;
+  // how many times a recorded run saw the test run the function - observed rows from a probe that counts
+  calls?: number;
 }
 
 export interface ChangedFile {

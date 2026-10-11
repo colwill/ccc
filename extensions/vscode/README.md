@@ -66,7 +66,7 @@ For hints about services and other repositories, describe your services in `.ccc
 - `ccc.binaryPath` and `ccc.autoInstall`: use your own `ccc`, or stop the extension downloading one.
 - `ccc.server.*`: how the analyser runs. `ccc.server.extraArgs` passes extra `ccc run` options.
 
-How the hints are worked out, every setting in detail, and troubleshooting are in the [Advanced guide](../../docs/Advanced.md#ides).
+How the hints are worked out, every setting in detail, and troubleshooting are in the [Developers And Agents guide](../../docs/Advanced.md#ides).
 
 ## License
 
